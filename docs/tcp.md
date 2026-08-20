@@ -3,11 +3,13 @@
 ## Current support
 
 Passive three-way handshake, single-segment in-order application data
-transfer with a built-in echo demonstration, bounded timeout-based
-retransmission of SYN-ACK/data/FIN, passive/active/simultaneous close with
-a deterministic TIME_WAIT, and acceptable-inbound-RST/closed-port-RST
-handling, over IPv4, on a single fixed listening port (8080). No active
-open, no segmentation, no reassembly, no congestion control.
+transfer, bounded timeout-based retransmission of SYN-ACK/data/FIN,
+passive/active/simultaneous close with a deterministic TIME_WAIT, and
+acceptable-inbound-RST/closed-port-RST handling, over IPv4, on a single
+fixed listening port (8080). No active open, no segmentation, no
+reassembly, no congestion control. Port 8080 now hosts the minimal
+HTTP/1.0 demonstration described in [docs/http.md](http.md), not a raw
+byte echo -- this file covers only TCP itself.
 
 `TcpSegment` holds source/destination ports, sequence/acknowledgment
 numbers, flags, window size, urgent pointer, and the raw `options` and
@@ -148,19 +150,15 @@ wraparound-safe signed-difference check, under the assumption that the
 tracked send/receive window stays under half of the 32-bit sequence
 space.
 
-### Echo demonstration
+### Application layering
 
 Wirestack's TCP layer has no knowledge of any application or close
-policy -- `TcpReceiveResult::peer_closed` is reported, not acted on,
-inside `tcp_connection.cpp`. `main.cpp` implements the smallest possible
-policy on port 8080: whatever payload is accepted (from `Established` or
-`CloseWait`) is passed unmodified to `makeOutgoingData` and sent back;
-once that echo has been sent, an accepted peer FIN triggers
-`beginClose`, initiating Wirestack's own close after the echo, never
-before or instead of it -- so a FIN arriving together with a final
-payload still gets that payload echoed. This is a TCP echo demonstration,
-not an HTTP server -- Wirestack does not parse or understand HTTP
-requests sent to port 8080.
+policy -- `TcpReceiveResult::peer_closed` and `::accepted_payload` are
+reported, not acted on, inside `tcp_connection.cpp`. `main.cpp` hands
+both to the HTTP layer (see [docs/http.md](http.md)), which owns request
+buffering, parsing, response selection, and deciding when to call
+`beginClose`. TCP itself never parses HTTP and never decides when a
+connection should close.
 
 ## Retransmission
 
@@ -212,7 +210,7 @@ stored sequence start, flags, and (already-trimmed) payload; for data,
 the acknowledgment field is refreshed to the connection's *current*
 `rcv_nxt` (the client may have sent more data since the original send).
 It never advances `snd_nxt` or `snd_una`, and never re-delivers
-application data to the echo policy -- a retransmission is not a new
+application data to the layer above TCP -- a retransmission is not a new
 logical send. A duplicate incoming SYN re-arms the pending SYN-ACK's
 deadline from the duplicate's arrival time without consuming any of the
 5-retransmission budget.
@@ -344,22 +342,17 @@ ping -c1 10.0.0.2   # confirm ARP + ICMP still work first
 sudo tcpdump -eni wire0 'tcp port 8080'
 
 # terminal 4
-nc 10.0.0.2 8080
-# type: hello wirestack
+curl --http1.0 -v http://10.0.0.2:8080/
 ```
 
 Expected in tcpdump: `Flags [S]` from the client, `Flags [S.]` from
 Wirestack, `Flags [.]` from the client -- a complete three-way handshake
--- followed by the client's data segment, Wirestack's `Flags [P.]`
-carrying the identical bytes back plus the acknowledgment, and the
-client's final ACK. In the terminal running `nc`, the typed line should
-be echoed back immediately. Do not use `curl`: HTTP is not implemented,
-and echoing an HTTP request back is not a valid HTTP response.
-
-To exercise close: in the `nc` terminal, close stdin (e.g. Ctrl-D). Expect
-`Flags [F.]` from the client, Wirestack's `Flags [.]` ACKing it, then
-Wirestack's own `Flags [F.]`, and the client's final `Flags [.]`. To
-exercise reset generation, connect to an unbound port instead:
+-- followed by the client's GET request, Wirestack's `Flags [P.]`
+carrying the HTTP response, Wirestack's own `Flags [F.]`, and the
+client's final ACK/FIN exchange. See [docs/http.md](http.md) for the
+exact expected response bytes and additional HTTP-level test cases
+(`/missing`, `--http1.1`). To exercise reset generation, connect to an
+unbound port instead:
 
 ```bash
 nc 10.0.0.2 8081
@@ -388,10 +381,10 @@ device with no other traffic.
   ACK), never combined into a receive buffer.
 - No segmentation -- one accepted input segment produces at most one
   outgoing segment; larger transfers are not split.
-- Single built-in echo endpoint on port 8080; no general application
-  registration.
+- Single application on port 8080 (the HTTP/1.0 demonstration, see
+  [docs/http.md](http.md)); no general application registration.
 
 ## Next TCP work
 
-Minimal HTTP/1.0 GET parsing and a static response over the now-verified
-TCP lifecycle.
+TCP segmentation, out-of-order receive reassembly, and bounded send/receive
+windows.

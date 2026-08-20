@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 8 (TCP connection
-close and reset handling):
+Milestone 0 (project foundation) through Milestone 9 (minimal HTTP/1.0
+GET handling):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,8 +18,8 @@ close and reset handling):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake, single-segment in-order echo, bounded timeout retransmission, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
-| HTTP        | not implemented                                                   |
+| TCP         | passive handshake, single-segment in-order data transfer, bounded timeout retransmission, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
+| HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented and deterministically tested; live curl verification still required |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
 - Ethernet II frame parsing and serialization
@@ -34,31 +34,36 @@ close and reset handling):
   4-tuple `TcpConnectionTable`, a passive handshake (LISTEN implicit /
   SYN_RECEIVED / ESTABLISHED), sequence-space tracking, single in-order
   data segment receive with duplicate/out-of-order/overlap rejection,
-  cumulative ACK processing, a built-in TCP echo demonstration (not HTTP)
-  on a fixed listening port 8080, bounded timeout-based retransmission of
+  cumulative ACK processing, bounded timeout-based retransmission of
   SYN-ACK/data/FIN with cumulative/partial ACK retirement, passive/active/
   simultaneous close (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a
   deterministic 60-second TIME_WAIT, acceptable-inbound-RST handling, and
   closed-port RST generation
+- A bounded, stateless HTTP/1.0 request parser (`wirestack::http`) layered
+  above TCP: GET-only, `/` -> 200 with a fixed body, any other valid path
+  -> 404, unsupported method -> 405, unsupported version -> 505,
+  malformed/oversized/incomplete-at-EOF requests -> 400; one request per
+  connection, response and close sent through the existing TCP
+  retransmission/FIN machinery
 - `wirestack` executable: opens a TAP interface with a configured local
   IPv4/MAC, decodes incoming Ethernet frames, answers ARP requests, ICMP
-  Echo Requests, UDP datagrams to its echo endpoint, and TCP handshakes and
-  echoed data on its listening port
+  Echo Requests, UDP datagrams to its echo endpoint, and serves the
+  HTTP/1.0 demonstration on its TCP listening port
 - `tools/tap_send`: writes one fixed Ethernet frame out through a TAP
   interface, to verify the transmit path
 
 See [docs/tap.md](docs/tap.md), [docs/arp.md](docs/arp.md),
 [docs/ipv4.md](docs/ipv4.md), [docs/icmp.md](docs/icmp.md),
-[docs/udp.md](docs/udp.md), and [docs/tcp.md](docs/tcp.md) for setup,
-permissions, and how to test. Real Linux interoperability (ARP resolution,
-`ping` receiving Echo Replies, UDP echo, a completed TCP handshake and
-echoed data) is manually verifiable but has not been exercised in every
-development environment this project has run in — see those docs for exact
-commands.
+[docs/udp.md](docs/udp.md), [docs/tcp.md](docs/tcp.md), and
+[docs/http.md](docs/http.md) for setup, permissions, and how to test. Real
+Linux interoperability (ARP resolution, `ping` receiving Echo Replies, UDP
+echo, a completed TCP handshake, and a `curl --http1.0` request) is
+manually verifiable but has not been exercised in every development
+environment this project has run in — see those docs for exact commands.
 
 Not implemented: TCP segmentation/reassembly/active-open/congestion
-control/RTT estimation/fast retransmit, HTTP, IPv4 options, fragmentation,
-routing.
+control/RTT estimation/fast retransmit, HTTP/1.1/keep-alive/pipelining/
+request bodies/chunked encoding/TLS, IPv4 options, fragmentation, routing.
 
 ## Structure
 
@@ -97,5 +102,6 @@ sudo ./build/wirestack wire0 10.0.0.2 02:00:00:00:00:02
 See [docs/tap.md](docs/tap.md) for host-side interface configuration and how
 to observe frames with `tcpdump`, [docs/arp.md](docs/arp.md) for testing ARP
 resolution end to end, [docs/udp.md](docs/udp.md) for testing the UDP echo
-endpoint (port 9000), and [docs/tcp.md](docs/tcp.md) for testing the TCP
-handshake and echo demonstration (port 8080).
+endpoint (port 9000), [docs/tcp.md](docs/tcp.md) for the TCP handshake and
+close/reset behavior, and [docs/http.md](docs/http.md) for testing the
+HTTP/1.0 demonstration on port 8080 with `curl`.
