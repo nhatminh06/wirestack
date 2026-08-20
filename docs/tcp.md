@@ -3,10 +3,11 @@
 ## Current support
 
 Passive three-way handshake, single-segment in-order application data
-transfer with a built-in echo demonstration, and bounded timeout-based
-retransmission of SYN-ACK and echoed data, over IPv4, on a single fixed
-listening port (8080). No connection close, no active open, no
-segmentation, no reassembly, no congestion control.
+transfer with a built-in echo demonstration, bounded timeout-based
+retransmission of SYN-ACK/data/FIN, passive/active/simultaneous close with
+a deterministic TIME_WAIT, and acceptable-inbound-RST/closed-port-RST
+handling, over IPv4, on a single fixed listening port (8080). No active
+open, no segmentation, no reassembly, no congestion control.
 
 `TcpSegment` holds source/destination ports, sequence/acknowledgment
 numbers, flags, window size, urgent pointer, and the raw `options` and
@@ -21,14 +22,24 @@ semantics.
 ## Current state machine
 
 ```text
-(no entry)  --SYN-->  SYN_RECEIVED  --valid ACK-->  ESTABLISHED
+(no entry) --SYN--> SYN_RECEIVED --valid ACK--> ESTABLISHED
+
+ESTABLISHED --app FIN--> FIN_WAIT_1 --ACK of FIN--> FIN_WAIT_2 --peer FIN--> TIME_WAIT
+FIN_WAIT_1 --peer FIN (not ACKing local FIN)--> CLOSING --ACK of FIN--> TIME_WAIT
+FIN_WAIT_1 --peer FIN that also ACKs local FIN--> TIME_WAIT
+
+ESTABLISHED --peer FIN--> CLOSE_WAIT --app FIN--> LAST_ACK --ACK of FIN--> (removed)
+
+TIME_WAIT --60s elapsed--> (removed)
+any synchronized state --acceptable RST--> (removed)
 ```
 
 LISTEN is implicit: a connection key with no table entry is either
 unbound or simply hasn't received a SYN yet. No `TcpState::Listen` or
-`TcpState::Closed` object is stored. No further states exist -- an
-Established connection stays Established for the rest of this milestone
-(no FIN handling).
+`TcpState::Closed` tombstone object is stored -- a connection that closes
+cleanly or resets is erased from the table, not marked closed. `TcpState`
+has eight values: `SynReceived`, `Established`, `FinWait1`, `FinWait2`,
+`CloseWait`, `Closing`, `LastAck`, `TimeWait`.
 
 ## Checksum behavior
 
@@ -139,12 +150,17 @@ space.
 
 ### Echo demonstration
 
-Wirestack's TCP layer has no knowledge of any application. `main.cpp`
-implements the smallest possible policy on port 8080: whatever payload is
-accepted from an Established connection is passed unmodified to
-`makeOutgoingData` and sent back. This is a TCP echo demonstration, not
-an HTTP server -- Wirestack does not parse or understand HTTP requests
-sent to port 8080.
+Wirestack's TCP layer has no knowledge of any application or close
+policy -- `TcpReceiveResult::peer_closed` is reported, not acted on,
+inside `tcp_connection.cpp`. `main.cpp` implements the smallest possible
+policy on port 8080: whatever payload is accepted (from `Established` or
+`CloseWait`) is passed unmodified to `makeOutgoingData` and sent back;
+once that echo has been sent, an accepted peer FIN triggers
+`beginClose`, initiating Wirestack's own close after the echo, never
+before or instead of it -- so a FIN arriving together with a final
+payload still gets that payload echoed. This is a TCP echo demonstration,
+not an HTTP server -- Wirestack does not parse or understand HTTP
+requests sent to port 8080.
 
 ## Retransmission
 
@@ -219,6 +235,98 @@ has aged out of relevance. If no mapping is known, the retransmission
 attempt is skipped (logged) but still counts toward the 5-retry budget --
 otherwise a persistently-unreachable peer would retry forever.
 
+## Connection close
+
+### FIN sequence accounting
+
+FIN consumes exactly one sequence number, on top of any payload in the
+same segment: `sequence consumption = payload.size() + (SYN?1:0) +
+(FIN?1:0)`. RST and a pure ACK consume none. A locally-sent FIN is queued
+through the same `PendingTransmission` mechanism as SYN-ACK and data (a
+`bool is_fin` flag alongside the existing `is_syn`), so it is
+retransmitted, cumulatively/partially ACK-retired, and backed off exactly
+like any other queued segment -- no separate FIN-ACK arithmetic exists.
+FIN and SYN both occupy a 1-wide sequence range, so neither can ever be
+partially ACKed; only a data entry's payload is ever trimmed.
+
+### Peer-initiated (passive) close
+
+A valid in-order FIN (`segment.sequence_number == rcv_nxt`) is accepted
+exactly like in-order data, then additionally consumes one more sequence
+number and exposes peer EOF (`TcpReceiveResult::peer_closed`) exactly
+once -- a duplicate or out-of-order FIN is indistinguishable from
+duplicate/out-of-order data and gets the same duplicate-ACK treatment,
+never a second `peer_closed`. `Established` moves to `CloseWait`. The
+connection is not removed and its pending queue is untouched: the
+application may still call `makeOutgoingData` (now also valid in
+`CloseWait`, not just `Established`) before initiating its own close --
+half-close, matching what a future request/response protocol needs. When
+the application is ready, `beginClose` sends the local FIN and moves
+`CloseWait -> LastAck`; the peer's ACK of that FIN removes the connection
+silently (no reply, no application event). An ACK that doesn't cover the
+FIN leaves the connection in `LastAck` unchanged.
+
+### Application-initiated (active) close
+
+`TcpConnectionTable::beginClose(key, now)` builds a `FIN|ACK` segment
+(`sequence_number = snd_nxt`, `acknowledgment_number = rcv_nxt`, no
+payload), queues it, advances `snd_nxt` by one, and moves `Established ->
+FinWait1`. It rejects (returns `nullopt`, no state change) every other
+state, including a second call in `FinWait1` itself -- calling it twice
+never creates a second FIN. The peer's ACK of the local FIN moves
+`FinWait1 -> FinWait2`; the peer's subsequent FIN in `FinWait2` is
+accepted, ACKed, and enters `TimeWait`.
+
+### Simultaneous close
+
+If the peer's FIN arrives in `FinWait1` without also acknowledging the
+local FIN, the connection moves to `Closing`; a later ACK of the local FIN
+then moves `Closing -> TimeWait`. If a single segment received in
+`FinWait1` both carries an acceptable FIN and validly ACKs the local FIN,
+the connection reaches `TimeWait` directly in one call -- this requires no
+special-case code: the ACK-driven `FinWait1 -> FinWait2` transition and
+the FIN-driven `FinWait2 -> TimeWait` transition are both evaluated (in
+that order) within the same `handle()` call, and simply compose.
+
+### TIME_WAIT
+
+A fixed, non-adaptive 60-second duration (`wirestack::kTimeWaitDuration`),
+timed on the same `TcpClock` (`steady_clock`) as retransmission, and
+included in `nextRetransmissionDeadline()` so the TAP event loop's
+`poll()` still wakes up for expiry with no packets arriving. A
+retransmitted peer FIN received while in `TimeWait` (same sequence number
+as the original) does not re-signal EOF, does not change any sequence
+state, and is not queued -- it gets a freshly built pure ACK and restarts
+the 60-second deadline. Any other traffic in `TimeWait` (a SYN, a
+non-empty payload, an ordinary ACK) is dropped. When the deadline expires,
+the connection is removed with no further traffic.
+
+## Reset handling
+
+### Inbound RST
+
+Accepted only when its sequence number exactly matches what the
+connection currently expects: `rcv_nxt` in every synchronized state
+(`Established`, `FinWait1`, `FinWait2`, `CloseWait`, `Closing`, `LastAck`,
+`TimeWait`), or `remote_isn + 1` (the outstanding SYN-ACK's expected ACK)
+in `SynReceived`. An accepted RST removes the connection immediately,
+discards its pending queue, delivers no payload, and never produces a
+response -- Wirestack never replies to an RST with another RST, and never
+implements challenge ACKs. An unacceptable RST changes nothing.
+
+### Closed-port RST
+
+Generated for a segment addressed to an unbound local port, or a bound
+port with no matching connection where the segment is not a valid new
+SYN (an ACK, payload, FIN, or SYN|ACK against an unknown four-tuple).
+Standard narrow construction: if the incoming segment has ACK set, the
+reset carries `sequence_number = incoming.acknowledgment_number` and RST
+only; otherwise `sequence_number = 0`, `acknowledgment_number =
+incoming.sequence_number + payload.size() + (SYN?1:0) + (FIN?1:0)` (plain
+wraparound `uint32_t` addition), and RST|ACK. Never generated in response
+to an incoming RST, and never creates connection state or a retransmission
+entry.
+
 ## Manual verification procedure
 
 Opening a TAP device requires `CAP_NET_ADMIN`:
@@ -248,6 +356,21 @@ client's final ACK. In the terminal running `nc`, the typed line should
 be echoed back immediately. Do not use `curl`: HTTP is not implemented,
 and echoing an HTTP request back is not a valid HTTP response.
 
+To exercise close: in the `nc` terminal, close stdin (e.g. Ctrl-D). Expect
+`Flags [F.]` from the client, Wirestack's `Flags [.]` ACKing it, then
+Wirestack's own `Flags [F.]`, and the client's final `Flags [.]`. To
+exercise reset generation, connect to an unbound port instead:
+
+```bash
+nc 10.0.0.2 8081
+```
+
+Expect a `Flags [S]` from the client immediately followed by `Flags [R.]`
+from Wirestack; `nc` should report the connection refused/reset. Do not
+apply loss injection (`tc`, network namespaces, iptables rules) against a
+shared or production interface -- this procedure assumes an isolated TAP
+device with no other traffic.
+
 ## Known limitations
 
 - No RTT sampling or smoothing -- the RTO policy is a fixed
@@ -256,9 +379,8 @@ and echoing an HTTP request back is not a valid HTTP response.
   retransmission.
 - No congestion control.
 - No dynamic receive window (fixed value only).
-- No FIN / connection close path.
 - No active open (Wirestack never initiates a connection).
-- No RST generation for closed ports or invalid segments.
+- No challenge ACK; an unacceptable RST is simply dropped.
 - No TCP option negotiation or interpretation (MSS, window scale, SACK,
   timestamps are all safely skipped, never acted on).
 - No out-of-order buffering, overlap merging, or reassembly -- duplicate,
@@ -271,5 +393,5 @@ and echoing an HTTP request back is not a valid HTTP response.
 
 ## Next TCP work
 
-TCP FIN state transitions, graceful close, timeout cleanup, and reset
-handling.
+Minimal HTTP/1.0 GET parsing and a static response over the now-verified
+TCP lifecycle.

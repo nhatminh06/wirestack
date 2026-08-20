@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 7 (TCP timeout-based
-retransmission):
+Milestone 0 (project foundation) through Milestone 8 (TCP connection
+close and reset handling):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,7 +18,7 @@ retransmission):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake, single-segment in-order echo, and bounded timeout retransmission implemented and deterministically tested; live TAP verification still required |
+| TCP         | passive handshake, single-segment in-order echo, bounded timeout retransmission, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
 | HTTP        | not implemented                                                   |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -35,8 +35,11 @@ retransmission):
   SYN_RECEIVED / ESTABLISHED), sequence-space tracking, single in-order
   data segment receive with duplicate/out-of-order/overlap rejection,
   cumulative ACK processing, a built-in TCP echo demonstration (not HTTP)
-  on a fixed listening port 8080, and bounded timeout-based retransmission
-  of SYN-ACK and echoed data with cumulative/partial ACK retirement
+  on a fixed listening port 8080, bounded timeout-based retransmission of
+  SYN-ACK/data/FIN with cumulative/partial ACK retirement, passive/active/
+  simultaneous close (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a
+  deterministic 60-second TIME_WAIT, acceptable-inbound-RST handling, and
+  closed-port RST generation
 - `wirestack` executable: opens a TAP interface with a configured local
   IPv4/MAC, decodes incoming Ethernet frames, answers ARP requests, ICMP
   Echo Requests, UDP datagrams to its echo endpoint, and TCP handshakes and
@@ -53,8 +56,9 @@ echoed data) is manually verifiable but has not been exercised in every
 development environment this project has run in — see those docs for exact
 commands.
 
-Not implemented: TCP segmentation/reassembly/close/active-open/congestion
-control/RTT estimation, HTTP, IPv4 options, fragmentation, routing.
+Not implemented: TCP segmentation/reassembly/active-open/congestion
+control/RTT estimation/fast retransmit, HTTP, IPv4 options, fragmentation,
+routing.
 
 ## Structure
 
