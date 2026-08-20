@@ -65,3 +65,7 @@ add_test(NAME test_tcp_handshake_path COMMAND test_tcp_handshake_path)
 add_executable(test_tcp_data_path test_tcp_data_path.cpp)
 target_link_libraries(test_tcp_data_path PRIVATE wirestack_core)
 add_test(NAME test_tcp_data_path COMMAND test_tcp_data_path)
+
+add_executable(test_tcp_retransmission_path test_tcp_retransmission_path.cpp)
+target_link_libraries(test_tcp_retransmission_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_retransmission_path COMMAND test_tcp_retransmission_path)
