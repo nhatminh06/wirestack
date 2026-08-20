@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 6 (TCP single-segment
-data transfer + echo):
+Milestone 0 (project foundation) through Milestone 7 (TCP timeout-based
+retransmission):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,7 +18,7 @@ data transfer + echo):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake and single-segment in-order echo data path implemented and unit-tested; live TAP verification still required |
+| TCP         | passive handshake, single-segment in-order echo, and bounded timeout retransmission implemented and deterministically tested; live TAP verification still required |
 | HTTP        | not implemented                                                   |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -34,8 +34,9 @@ data transfer + echo):
   4-tuple `TcpConnectionTable`, a passive handshake (LISTEN implicit /
   SYN_RECEIVED / ESTABLISHED), sequence-space tracking, single in-order
   data segment receive with duplicate/out-of-order/overlap rejection,
-  cumulative ACK processing, and a built-in TCP echo demonstration (not
-  HTTP) on a fixed listening port 8080
+  cumulative ACK processing, a built-in TCP echo demonstration (not HTTP)
+  on a fixed listening port 8080, and bounded timeout-based retransmission
+  of SYN-ACK and echoed data with cumulative/partial ACK retirement
 - `wirestack` executable: opens a TAP interface with a configured local
   IPv4/MAC, decodes incoming Ethernet frames, answers ARP requests, ICMP
   Echo Requests, UDP datagrams to its echo endpoint, and TCP handshakes and
@@ -52,8 +53,8 @@ echoed data) is manually verifiable but has not been exercised in every
 development environment this project has run in — see those docs for exact
 commands.
 
-Not implemented: TCP retransmission/segmentation/reassembly/close, HTTP,
-IPv4 options, fragmentation, routing.
+Not implemented: TCP segmentation/reassembly/close/active-open/congestion
+control/RTT estimation, HTTP, IPv4 options, fragmentation, routing.
 
 ## Structure
 
