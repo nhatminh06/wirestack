@@ -69,3 +69,11 @@ add_test(NAME test_tcp_data_path COMMAND test_tcp_data_path)
 add_executable(test_tcp_retransmission_path test_tcp_retransmission_path.cpp)
 target_link_libraries(test_tcp_retransmission_path PRIVATE wirestack_core)
 add_test(NAME test_tcp_retransmission_path COMMAND test_tcp_retransmission_path)
+
+add_executable(test_tcp_close_path test_tcp_close_path.cpp)
+target_link_libraries(test_tcp_close_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_close_path COMMAND test_tcp_close_path)
+
+add_executable(test_tcp_reset_path test_tcp_reset_path.cpp)
+target_link_libraries(test_tcp_reset_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_reset_path COMMAND test_tcp_reset_path)
