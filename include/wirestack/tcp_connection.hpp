@@ -68,6 +68,13 @@ struct TcpReceiveResult {
     // True exactly on the call whose acceptable inbound RST removed the
     // connection. No reply is ever sent for an RST.
     bool connection_reset = false;
+
+    // True exactly on the call whose valid final ACK gracefully removed
+    // the connection via the passive-close LastAck transition. Distinct
+    // from connection_reset, which covers RST removal -- callers that
+    // key their own state off this connection (e.g. an application
+    // buffer) can use either flag to know the connection is gone.
+    bool connection_closed = false;
 };
 
 // Monotonic clock used for retransmission scheduling. steady_clock (not
