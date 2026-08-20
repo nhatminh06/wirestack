@@ -39,6 +39,11 @@ public:
 
     std::string_view name() const noexcept { return name_; }
 
+    // Blocks until the descriptor is readable or `timeout_ms` elapses
+    // (negative blocks indefinitely, 0 polls without blocking). Returns
+    // false on timeout, true if readable. EINTR is retried internally.
+    std::variant<bool, std::string> waitReadable(int timeout_ms);
+
     // Blocking single read. IFF_NO_PI means one read() yields exactly one
     // Ethernet frame, so no internal loop is needed here.
     std::variant<std::size_t, std::string> read(std::span<std::byte> buffer);
