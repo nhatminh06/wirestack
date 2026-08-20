@@ -208,15 +208,16 @@ int main() {
     CHECK(received.accepted_payload == payload_text);
 
     auto echo = connections.makeOutgoingData(key, received.accepted_payload, data_time);
-    CHECK(echo.has_value()); // obtained, but never "delivered" -- simulated loss
-    if (!echo) return wirestack::test::failureCount() == 0 ? 0 : 1;
+    CHECK(!echo.segments.empty()); // obtained, but never "delivered" -- simulated loss
+    if (echo.segments.empty()) return wirestack::test::failureCount() == 0 ? 0 : 1;
+    const auto& echo_segment = echo.segments.front();
 
     auto data_deadline = data_time + kInitialRto;
     auto data_due = connections.pollRetransmissions(data_deadline);
     CHECK(data_due.retransmissions.size() == 1);
     if (data_due.retransmissions.size() == 1) {
         CHECK(data_due.retransmissions[0].key == key);
-        CHECK(data_due.retransmissions[0].segment.sequence_number == echo->sequence_number);
+        CHECK(data_due.retransmissions[0].segment.sequence_number == echo_segment.sequence_number);
         CHECK(data_due.retransmissions[0].segment.payload == payload_text);
 
         auto retransmit_frame_bytes = buildFrame(data_due.retransmissions[0].segment, local_ip,
@@ -243,7 +244,7 @@ int main() {
                     CHECK(parsed_segment2->flags.psh);
                     CHECK(parsed_segment2->flags.ack);
                     CHECK(parsed_segment2->payload == payload_text);
-                    CHECK(parsed_segment2->sequence_number == echo->sequence_number);
+                    CHECK(parsed_segment2->sequence_number == echo_segment.sequence_number);
                     CHECK(parsed_segment2->acknowledgment_number ==
                           syn->sequence_number + 1 + payload_text.size());
                 }
@@ -258,7 +259,7 @@ int main() {
     ack_of_echo.sequence_number =
         syn->sequence_number + 1 + static_cast<std::uint32_t>(payload_text.size());
     ack_of_echo.acknowledgment_number =
-        echo->sequence_number + static_cast<std::uint32_t>(echo->payload.size());
+        echo_segment.sequence_number + static_cast<std::uint32_t>(echo_segment.payload.size());
     ack_of_echo.flags.ack = true;
     ack_of_echo.window_size = 65535;
     ack_of_echo.urgent_pointer = 0;

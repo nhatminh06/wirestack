@@ -163,15 +163,16 @@ int main() {
 
     // Echo policy: send the accepted bytes back, unmodified.
     auto echo = connections.makeOutgoingData(key, result.accepted_payload, t0);
-    CHECK(echo.has_value());
-    if (!echo) return wirestack::test::failureCount() == 0 ? 0 : 1;
-    CHECK(echo->sequence_number == server_isn + 1);
-    CHECK(echo->acknowledgment_number == syn->sequence_number + 1 + payload_text.size());
-    CHECK(echo->flags.psh);
-    CHECK(echo->flags.ack);
-    CHECK(echo->payload == payload_text);
+    CHECK(!echo.segments.empty());
+    if (echo.segments.empty()) return wirestack::test::failureCount() == 0 ? 0 : 1;
+    const auto& echo_segment = echo.segments.front();
+    CHECK(echo_segment.sequence_number == server_isn + 1);
+    CHECK(echo_segment.acknowledgment_number == syn->sequence_number + 1 + payload_text.size());
+    CHECK(echo_segment.flags.psh);
+    CHECK(echo_segment.flags.ack);
+    CHECK(echo_segment.payload == payload_text);
 
-    auto echo_frame_bytes = buildFrame(*echo, local_ip, clientIp(), local_mac, clientMac());
+    auto echo_frame_bytes = buildFrame(echo_segment, local_ip, clientIp(), local_mac, clientMac());
 
     // Re-parse the fully composed echo reply -- both checksums must
     // validate, or these parses would fail with BadChecksum.
@@ -225,8 +226,8 @@ int main() {
     ack_of_echo.source_port = syn->source_port;
     ack_of_echo.destination_port = syn->destination_port;
     ack_of_echo.sequence_number = syn->sequence_number + 1 + static_cast<std::uint32_t>(payload_text.size());
-    ack_of_echo.acknowledgment_number = echo->sequence_number +
-                                         static_cast<std::uint32_t>(echo->payload.size());
+    ack_of_echo.acknowledgment_number = echo_segment.sequence_number +
+                                         static_cast<std::uint32_t>(echo_segment.payload.size());
     ack_of_echo.flags.ack = true;
     ack_of_echo.window_size = 65535;
     ack_of_echo.urgent_pointer = 0;

@@ -163,9 +163,10 @@ int main() {
         // Echo the accepted bytes back, then initiate the local close --
         // exactly what main.cpp's handleTcp does.
         auto echo = connections.makeOutgoingData(key, result.accepted_payload, t0);
-        CHECK(echo.has_value());
-        if (!echo) return wirestack::test::failureCount() == 0 ? 0 : 1;
-        CHECK(echo->acknowledgment_number ==
+        CHECK(!echo.segments.empty());
+        if (echo.segments.empty()) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        const auto& echo_segment = echo.segments.front();
+        CHECK(echo_segment.acknowledgment_number ==
               hs->syn.sequence_number + 1 + payload_text.size() + 1); // covers payload + FIN
 
         auto local_fin = connections.beginClose(key, t0);
@@ -175,7 +176,7 @@ int main() {
 
         // Serialize and re-parse both outgoing segments to independently
         // prove addressing, flags, and checksums.
-        auto echo_frame = buildFrame(*echo, local_ip, clientIp(), local_mac, clientMac());
+        auto echo_frame = buildFrame(echo_segment, local_ip, clientIp(), local_mac, clientMac());
         auto parsed_echo = parseFrame(echo_frame);
         CHECK(parsed_echo.has_value());
         if (parsed_echo) {

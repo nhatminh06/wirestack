@@ -383,9 +383,12 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                 session.responded = true;
                 auto response_bytes = wirestack::serializeHttpResponse(*response);
                 auto sent = connections.makeOutgoingData(key, response_bytes, now);
-                if (sent) {
-                    sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *sent);
-                    // Never close before the response segment was
+                if (!sent.segments.empty()) {
+                    for (const auto& response_segment : sent.segments) {
+                        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame,
+                                     response_segment);
+                    }
+                    // Never close before the response segment(s) were
                     // successfully constructed above.
                     auto fin = connections.beginClose(key, now);
                     if (fin) {

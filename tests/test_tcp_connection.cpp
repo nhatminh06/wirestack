@@ -348,14 +348,15 @@ int main() {
 
         auto snapshot_before = table.snapshotOf(key);
         auto payload = toBytes("echoed data");
-        auto segment = table.makeOutgoingData(key, payload, t0);
-        CHECK(segment.has_value());
-        if (segment && snapshot_before) {
-            CHECK(segment->sequence_number == snapshot_before->snd_nxt);
-            CHECK(segment->acknowledgment_number == snapshot_before->rcv_nxt);
-            CHECK(segment->flags.psh);
-            CHECK(segment->flags.ack);
-            CHECK(segment->payload == payload);
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty() && snapshot_before) {
+            const auto& segment = sent.segments.front();
+            CHECK(segment.sequence_number == snapshot_before->snd_nxt);
+            CHECK(segment.acknowledgment_number == snapshot_before->rcv_nxt);
+            CHECK(segment.flags.psh);
+            CHECK(segment.flags.ack);
+            CHECK(segment.payload == payload);
         }
 
         auto snapshot_after = table.snapshotOf(key);
@@ -369,16 +370,16 @@ int main() {
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey unknown_key{localIp(), 8080, remoteIp(), 11111};
-        CHECK(!table.makeOutgoingData(unknown_key, toBytes("x"), t0).has_value());
+        CHECK(table.makeOutgoingData(unknown_key, toBytes("x"), t0).segments.empty());
 
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         table.handle(key, makeSyn(8080, 54321, 1000), t0); // SynReceived, not yet Established
-        CHECK(!table.makeOutgoingData(key, toBytes("x"), t0).has_value());
+        CHECK(table.makeOutgoingData(key, toBytes("x"), t0).segments.empty());
         CHECK(table.stateOf(key) == TcpState::SynReceived);
 
         establish(table, key, 1000);
         auto snapshot_before = table.snapshotOf(key);
-        CHECK(!table.makeOutgoingData(key, {}, t0).has_value()); // empty payload
+        CHECK(table.makeOutgoingData(key, {}, t0).segments.empty()); // empty payload
         auto snapshot_after = table.snapshotOf(key);
         CHECK(snapshot_before.has_value() && snapshot_after.has_value());
         if (snapshot_before && snapshot_after) {
@@ -395,7 +396,7 @@ int main() {
 
         auto payload = toBytes("echoed data");
         auto sent = table.makeOutgoingData(key, payload, t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
 
         auto ack_result = table.handle(
             key, makeAck(8080, 54321, 1001, server_isn + 1 + static_cast<std::uint32_t>(payload.size())), t0);
@@ -468,7 +469,11 @@ int main() {
     }
 
     // overlapping payload: sequence number behind rcv_nxt but extends
-    // past it -- no partial delivery, rcv_nxt unchanged
+    // past it -- the already-delivered prefix is trimmed and discarded,
+    // and the new suffix (starting exactly at rcv_nxt) is delivered
+    // immediately since nothing precedes it. Milestone 10 replaces the
+    // earlier whole-segment overlap rejection with this prefix-trimming
+    // policy (see docs/tcp.md).
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
@@ -476,16 +481,18 @@ int main() {
 
         table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("hello")), t0);
         // rcv_nxt is now 1006; this segment starts at 1003 (before
-        // rcv_nxt) but its 10-byte payload would extend to 1013.
+        // rcv_nxt) but its 10-byte payload extends to 1013 -- bytes
+        // 1003..1005 are already-delivered duplicates (trimmed away),
+        // bytes 1006..1012 are new and delivered.
         auto overlap_payload = toBytes("XXXXXXXXXX");
         auto result =
             table.handle(key, makeData(8080, 54321, 1003, server_isn + 1, overlap_payload), t0);
-        CHECK(result.accepted_payload.empty());
+        CHECK(result.accepted_payload == toBytes("XXXXXXX")); // 7 trailing bytes, prefix trimmed
 
         auto snapshot = table.snapshotOf(key);
         CHECK(snapshot.has_value());
         if (snapshot) {
-            CHECK(snapshot->rcv_nxt == 1006);
+            CHECK(snapshot->rcv_nxt == 1013);
         }
     }
 
@@ -527,10 +534,10 @@ int main() {
         CHECK(result.accepted_payload.size() == 6);
 
         auto echoed = table.makeOutgoingData(key, result.accepted_payload, t0);
-        CHECK(echoed.has_value());
-        if (echoed) {
-            CHECK(echoed->payload == payload);
-            CHECK(echoed->payload.size() == 6);
+        CHECK(!echoed.segments.empty());
+        if (!echoed.segments.empty()) {
+            CHECK(echoed.segments.front().payload == payload);
+            CHECK(echoed.segments.front().payload.size() == 6);
         }
     }
 
@@ -569,7 +576,7 @@ int main() {
         // Drain snd_nxt close to the wraparound boundary with one send.
         std::vector<std::byte> filler(10, std::byte{0});
         auto first_send = table.makeOutgoingData(key2, filler, t0);
-        CHECK(first_send.has_value());
+        CHECK(!first_send.segments.empty());
         auto snap2 = table.snapshotOf(key2);
         CHECK(snap2.has_value());
         if (snap2) {
@@ -584,11 +591,11 @@ int main() {
         establish(table, key3, 0xffffffff - 10);
         std::vector<std::byte> small_payload(20, std::byte{0xaa});
         auto wrap_send = table.makeOutgoingData(key3, small_payload, t0); // crosses the boundary
-        CHECK(wrap_send.has_value());
+        CHECK(!wrap_send.segments.empty());
         auto snap3 = table.snapshotOf(key3);
         CHECK(snap3.has_value());
-        if (snap3 && wrap_send) {
-            CHECK(snap3->snd_nxt == wrap_send->sequence_number + small_payload.size());
+        if (snap3 && !wrap_send.segments.empty()) {
+            CHECK(snap3->snd_nxt == wrap_send.segments.front().sequence_number + small_payload.size());
         }
         // Acknowledge exactly up to the new (wrapped) snd_nxt.
         auto ack_result =
@@ -659,7 +666,7 @@ int main() {
         CHECK(received.accepted_payload == client_payload);
 
         auto echo = table.makeOutgoingData(key, received.accepted_payload, t0);
-        CHECK(echo.has_value());
+        CHECK(!echo.segments.empty());
         auto snapshot_before = table.snapshotOf(key);
         CHECK(snapshot_before.has_value());
         if (snapshot_before) {
@@ -671,9 +678,10 @@ int main() {
 
         auto due = table.pollRetransmissions(t0 + kInitialRto);
         CHECK(due.retransmissions.size() == 1);
-        if (due.retransmissions.size() == 1 && echo) {
+        if (due.retransmissions.size() == 1 && !echo.segments.empty()) {
             CHECK(due.retransmissions[0].segment.payload == client_payload);
-            CHECK(due.retransmissions[0].segment.sequence_number == echo->sequence_number);
+            CHECK(due.retransmissions[0].segment.sequence_number ==
+                  echo.segments.front().sequence_number);
             CHECK(due.retransmissions[0].segment.flags.psh);
             CHECK(due.retransmissions[0].segment.flags.ack);
         }
@@ -683,11 +691,12 @@ int main() {
             CHECK(snapshot_after_retransmit->snd_nxt == snapshot_before->snd_nxt);
         }
 
-        if (echo) {
+        if (!echo.segments.empty()) {
+            const auto& echo_segment = echo.segments.front();
             table.handle(key,
                          makeAck(8080, 54321, 1001 + static_cast<std::uint32_t>(client_payload.size()),
-                                 echo->sequence_number +
-                                     static_cast<std::uint32_t>(echo->payload.size())),
+                                 echo_segment.sequence_number +
+                                     static_cast<std::uint32_t>(echo_segment.payload.size())),
                          t0 + kInitialRto);
         }
         auto final_snapshot = table.snapshotOf(key);
@@ -824,13 +833,14 @@ int main() {
         establish(table, data_key_b, 200, t0);
         auto sent_a = table.makeOutgoingData(data_key_a, toBytes("a-data"), t0);
         table.makeOutgoingData(data_key_b, toBytes("b-data"), t0);
-        CHECK(sent_a.has_value());
+        CHECK(!sent_a.segments.empty());
 
-        if (sent_a) {
+        if (!sent_a.segments.empty()) {
+            const auto& sent_a_segment = sent_a.segments.front();
             table.handle(data_key_a,
                          makeAck(8080, 20001, 101,
-                                 sent_a->sequence_number +
-                                     static_cast<std::uint32_t>(sent_a->payload.size())),
+                                 sent_a_segment.sequence_number +
+                                     static_cast<std::uint32_t>(sent_a_segment.payload.size())),
                          t0);
         }
         auto snap_a = table.snapshotOf(data_key_a);
@@ -869,7 +879,7 @@ int main() {
         auto a = table.makeOutgoingData(key, toBytes("AAA"), t0);
         auto b = table.makeOutgoingData(key, toBytes("BB"), t0);
         auto c = table.makeOutgoingData(key, toBytes("C"), t0);
-        CHECK(a.has_value() && b.has_value() && c.has_value());
+        CHECK(!a.segments.empty() && !b.segments.empty() && !c.segments.empty());
 
         auto snapshot = table.snapshotOf(key);
         CHECK(snapshot.has_value());
@@ -877,21 +887,24 @@ int main() {
             CHECK(snapshot->pending_count == 3);
         }
 
-        if (b) {
+        if (!b.segments.empty()) {
+            const auto& b_segment = b.segments.front();
             std::uint32_t ack_through_b =
-                b->sequence_number + static_cast<std::uint32_t>(b->payload.size());
+                b_segment.sequence_number + static_cast<std::uint32_t>(b_segment.payload.size());
             auto result = table.handle(key, makeAck(8080, 54321, 1001, ack_through_b), t0);
             CHECK(!result.reply.has_value());
         }
 
         auto after = table.snapshotOf(key);
         CHECK(after.has_value());
-        if (after && b && c) {
+        if (after && !b.segments.empty() && !c.segments.empty()) {
+            const auto& b_segment = b.segments.front();
+            const auto& c_segment = c.segments.front();
             CHECK(after->pending_count == 1);
             CHECK(after->snd_una ==
-                  b->sequence_number + static_cast<std::uint32_t>(b->payload.size()));
+                  b_segment.sequence_number + static_cast<std::uint32_t>(b_segment.payload.size()));
             CHECK(after->snd_nxt ==
-                  c->sequence_number + static_cast<std::uint32_t>(c->payload.size()));
+                  c_segment.sequence_number + static_cast<std::uint32_t>(c_segment.payload.size()));
         }
     }
 
@@ -903,16 +916,17 @@ int main() {
         establish(table, key, 1000, t0);
 
         auto sent = table.makeOutgoingData(key, toBytes("abcdef"), t0);
-        CHECK(sent.has_value());
-        if (sent) {
-            std::uint32_t partial_ack = sent->sequence_number + 2; // acks "ab"
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty()) {
+            const auto& sent_segment = sent.segments.front();
+            std::uint32_t partial_ack = sent_segment.sequence_number + 2; // acks "ab"
             table.handle(key, makeAck(8080, 54321, 1001, partial_ack), t0);
 
             auto snapshot = table.snapshotOf(key);
             CHECK(snapshot.has_value());
             if (snapshot) {
                 CHECK(snapshot->snd_una == partial_ack);
-                CHECK(snapshot->snd_nxt == sent->sequence_number + 6);
+                CHECK(snapshot->snd_nxt == sent_segment.sequence_number + 6);
                 CHECK(snapshot->pending_count == 1);
             }
 
@@ -933,9 +947,9 @@ int main() {
 
         auto payload = toBytes({0xaa, 0x00, 0xbb, 0xcc, 0xdd});
         auto sent = table.makeOutgoingData(key, payload, t0);
-        CHECK(sent.has_value());
-        if (sent) {
-            std::uint32_t partial_ack = sent->sequence_number + 2; // acks {0xaa, 0x00}
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty()) {
+            std::uint32_t partial_ack = sent.segments.front().sequence_number + 2; // acks {0xaa, 0x00}
             table.handle(key, makeAck(8080, 54321, 1001, partial_ack), t0);
 
             auto due = table.pollRetransmissions(t0 + kInitialRto);
@@ -952,10 +966,11 @@ int main() {
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         establish(table, key, 1000, t0);
         auto sent = table.makeOutgoingData(key, toBytes("full"), t0);
-        CHECK(sent.has_value());
-        if (sent) {
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty()) {
+            const auto& sent_segment = sent.segments.front();
             std::uint32_t full_ack =
-                sent->sequence_number + static_cast<std::uint32_t>(sent->payload.size());
+                sent_segment.sequence_number + static_cast<std::uint32_t>(sent_segment.payload.size());
             table.handle(key, makeAck(8080, 54321, 1001, full_ack), t0);
             auto snapshot = table.snapshotOf(key);
             CHECK(snapshot.has_value());
@@ -971,7 +986,7 @@ int main() {
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         establish(table, key, 1000, t0);
         auto sent = table.makeOutgoingData(key, toBytes("data"), t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
         auto before = table.snapshotOf(key);
         CHECK(before.has_value());
         if (before) {
@@ -1070,7 +1085,7 @@ int main() {
         CHECK(first.accepted_payload == payload);
 
         auto echo = table.makeOutgoingData(key, first.accepted_payload, t0);
-        CHECK(echo.has_value());
+        CHECK(!echo.segments.empty());
 
         auto duplicate = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, payload), t0);
         CHECK(duplicate.accepted_payload.empty());
@@ -1089,9 +1104,10 @@ int main() {
         auto snapshot_before = table.snapshotOf(key);
         auto due = table.pollRetransmissions(t0 + kInitialRto);
         CHECK(due.retransmissions.size() == 1);
-        if (due.retransmissions.size() == 1 && echo) {
+        if (due.retransmissions.size() == 1 && !echo.segments.empty()) {
             CHECK(due.retransmissions[0].segment.payload == payload);
-            CHECK(due.retransmissions[0].segment.sequence_number == echo->sequence_number);
+            CHECK(due.retransmissions[0].segment.sequence_number ==
+                  echo.segments.front().sequence_number);
         }
         auto snapshot_after = table.snapshotOf(key);
         CHECK(snapshot_before.has_value() && snapshot_after.has_value());
@@ -1099,11 +1115,12 @@ int main() {
             CHECK(snapshot_after->snd_nxt == snapshot_before->snd_nxt);
         }
 
-        if (echo) {
+        if (!echo.segments.empty()) {
+            const auto& echo_segment = echo.segments.front();
             table.handle(key,
                          makeAck(8080, 54321, 1001 + static_cast<std::uint32_t>(payload.size()),
-                                 echo->sequence_number +
-                                     static_cast<std::uint32_t>(echo->payload.size())),
+                                 echo_segment.sequence_number +
+                                     static_cast<std::uint32_t>(echo_segment.payload.size())),
                          t0 + kInitialRto);
         }
         auto final_snapshot = table.snapshotOf(key);
@@ -1282,18 +1299,19 @@ int main() {
 
         auto payload = toBytes("still here");
         auto sent = table.makeOutgoingData(key, payload, t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
         auto snapshot = table.snapshotOf(key);
         CHECK(snapshot.has_value());
         if (snapshot) {
             CHECK(snapshot->pending_count == 1);
         }
 
-        if (sent) {
+        if (!sent.segments.empty()) {
+            const auto& sent_segment = sent.segments.front();
             table.handle(key,
                          makeAck(8080, 54321, 1002,
-                                 sent->sequence_number +
-                                     static_cast<std::uint32_t>(sent->payload.size())),
+                                 sent_segment.sequence_number +
+                                     static_cast<std::uint32_t>(sent_segment.payload.size())),
                          t0);
         }
         auto after = table.snapshotOf(key);
