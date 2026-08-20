@@ -301,8 +301,10 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                     static_cast<unsigned int>(segment.source_port), segment.sequence_number);
     }
 
+    auto now = wirestack::TcpClock::now();
+
     auto state_before = connections.stateOf(key);
-    auto result = connections.handle(key, segment);
+    auto result = connections.handle(key, segment, now);
     auto state_after = connections.stateOf(key);
 
     if (state_before == wirestack::TcpState::SynReceived &&
@@ -316,7 +318,7 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                     static_cast<unsigned int>(segment.source_port),
                     result.accepted_payload.size());
 
-        auto echo = connections.makeOutgoingData(key, result.accepted_payload);
+        auto echo = connections.makeOutgoingData(key, result.accepted_payload, now);
         if (echo) {
             sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *echo);
         }

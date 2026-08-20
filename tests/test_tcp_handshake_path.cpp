@@ -50,6 +50,7 @@ int main() {
     auto local_ip = *Ipv4Address::parse("10.0.0.2");
     auto local_mac = *MacAddress::parse("02:00:00:00:00:02");
     TcpConnectionTable connections(8080);
+    constexpr TcpClock::time_point t0{};
 
     auto eth_result = parseEthernetFrame(knownSynFrame());
     CHECK(std::holds_alternative<EthernetFrame>(eth_result));
@@ -80,7 +81,7 @@ int main() {
     CHECK(syn->destination_port == 8080);
 
     TcpConnectionKey key{local_ip, syn->destination_port, ip_packet->source, syn->source_port};
-    auto reply = connections.handle(key, *syn).reply;
+    auto reply = connections.handle(key, *syn, t0).reply;
     CHECK(reply.has_value());
     if (!reply) {
         return wirestack::test::failureCount() == 0 ? 0 : 1;
@@ -156,7 +157,7 @@ int main() {
     final_ack.window_size = 65535;
     final_ack.urgent_pointer = 0;
 
-    auto no_reply = connections.handle(key, final_ack).reply;
+    auto no_reply = connections.handle(key, final_ack, t0).reply;
     CHECK(!no_reply.has_value());
     CHECK(connections.stateOf(key) == TcpState::Established);
 

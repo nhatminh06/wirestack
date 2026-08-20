@@ -1,5 +1,7 @@
 #include "wirestack/tcp_connection.hpp"
 
+#include <algorithm>
+
 namespace wirestack {
 
 namespace {
@@ -53,6 +55,33 @@ TcpSegment TcpConnectionTable::makePureAck(const TcpConnectionKey& key,
     return reply;
 }
 
+void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_t ack) {
+    if (!sequenceGreater(ack, connection.snd_una)) {
+        return; // duplicate or stale ACK -- queue and snd_una both unchanged
+    }
+    connection.snd_una = ack;
+
+    auto& pending = connection.pending;
+    while (!pending.empty()) {
+        auto& entry = pending.front();
+        if (sequenceLessOrEqual(entry.sequenceEnd(), ack)) {
+            pending.erase(pending.begin());
+            continue;
+        }
+        if (sequenceGreater(ack, entry.sequence_start)) {
+            // Partial ACK lands inside this entry. SYN's 1-byte range
+            // can never satisfy this (no integer lies strictly between
+            // sequence_start and sequence_start + 1), so this only ever
+            // trims a data entry's payload.
+            std::uint32_t trimmed = ack - entry.sequence_start;
+            entry.payload.erase(entry.payload.begin(),
+                                 entry.payload.begin() + trimmed);
+            entry.sequence_start = ack;
+        }
+        break; // TCP is send-ordered: no later entry can be (partially) acked yet
+    }
+}
+
 TcpReceiveResult TcpConnectionTable::handleEstablished(const TcpConnectionKey& key,
                                                          Connection& connection,
                                                          const TcpSegment& segment) {
@@ -71,12 +100,7 @@ TcpReceiveResult TcpConnectionTable::handleEstablished(const TcpConnectionKey& k
     if (!sequenceLessOrEqual(segment.acknowledgment_number, connection.snd_nxt)) {
         return {};
     }
-    // A stale ACK (behind snd_una) never moves state backward; a
-    // duplicate ACK (== snd_una) leaves it unchanged too. Only an
-    // acknowledgment strictly ahead of snd_una advances it.
-    if (sequenceGreater(segment.acknowledgment_number, connection.snd_una)) {
-        connection.snd_una = segment.acknowledgment_number;
-    }
+    retireAcknowledged(connection, segment.acknowledgment_number);
 
     if (segment.payload.empty()) {
         // Ack information already processed above; an ordinary ACK-only
@@ -101,7 +125,8 @@ TcpReceiveResult TcpConnectionTable::handleEstablished(const TcpConnectionKey& k
 }
 
 TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
-                                             const TcpSegment& segment) {
+                                             const TcpSegment& segment,
+                                             TcpClock::time_point now) {
     if (key.local_port != listen_port_) {
         return {};
     }
@@ -118,8 +143,17 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
         connection.remote_isn = segment.sequence_number;
         connection.local_isn = nextIsn();
         auto [inserted_it, _] = connections_.emplace(key, connection);
+
         TcpReceiveResult result;
         result.reply = makeSynAck(key, inserted_it->second);
+
+        PendingTransmission pending;
+        pending.sequence_start = inserted_it->second.local_isn;
+        pending.is_syn = true;
+        pending.flags = result.reply->flags;
+        pending.last_sent = now;
+        inserted_it->second.pending.push_back(std::move(pending));
+
         return result;
     }
 
@@ -132,8 +166,13 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
     // SynReceived.
     if (segment.flags.syn && !segment.flags.ack) {
         // Duplicate SYN: retransmit the same SYN-ACK from stored state,
-        // not a freshly drawn ISN.
+        // not a freshly drawn ISN. Re-arm the pending deadline from this
+        // response without consuming the retry budget -- the peer
+        // retransmitting its SYN is not a Wirestack timeout.
         if (segment.sequence_number == connection.remote_isn) {
+            if (!connection.pending.empty()) {
+                connection.pending.front().last_sent = now;
+            }
             TcpReceiveResult result;
             result.reply = makeSynAck(key, connection);
             return result;
@@ -147,8 +186,9 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
             connection.state = TcpState::Established;
             // SYN consumed one sequence number in each direction.
             connection.rcv_nxt = connection.remote_isn + 1;
-            connection.snd_una = connection.local_isn + 1;
+            connection.snd_una = connection.local_isn; // pre-ack; retireAcknowledged advances it
             connection.snd_nxt = connection.local_isn + 1;
+            retireAcknowledged(connection, connection.local_isn + 1); // drains the pending SYN-ACK
         }
         return {};
     }
@@ -172,11 +212,12 @@ std::optional<TcpConnectionSnapshot> TcpConnectionTable::snapshotOf(
     }
     const Connection& connection = it->second;
     return TcpConnectionSnapshot{connection.state, connection.rcv_nxt, connection.snd_una,
-                                  connection.snd_nxt};
+                                  connection.snd_nxt, connection.pending.size()};
 }
 
 std::optional<TcpSegment> TcpConnectionTable::makeOutgoingData(const TcpConnectionKey& key,
-                                                                 std::vector<std::byte> payload) {
+                                                                 std::vector<std::byte> payload,
+                                                                 TcpClock::time_point now) {
     if (payload.empty() || payload.size() > kMaxTcpSegmentLength - 20) {
         return std::nullopt;
     }
@@ -198,9 +239,75 @@ std::optional<TcpSegment> TcpConnectionTable::makeOutgoingData(const TcpConnecti
     segment.urgent_pointer = 0;
     segment.payload = std::move(payload);
 
+    PendingTransmission pending;
+    pending.sequence_start = connection.snd_nxt;
+    pending.is_syn = false;
+    pending.flags = segment.flags;
+    pending.payload = segment.payload; // owns an independent copy
+    pending.last_sent = now;
+    connection.pending.push_back(std::move(pending));
+
     connection.snd_nxt += static_cast<std::uint32_t>(segment.payload.size());
 
     return segment;
+}
+
+TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_point now) {
+    TcpTimeoutPollResult result;
+
+    for (auto it = connections_.begin(); it != connections_.end();) {
+        Connection& connection = it->second;
+        if (connection.pending.empty()) {
+            ++it;
+            continue;
+        }
+
+        PendingTransmission& oldest = connection.pending.front();
+        if (now < oldest.last_sent + oldest.rto) {
+            ++it;
+            continue;
+        }
+
+        if (oldest.retransmit_count >= kMaxRetransmits) {
+            result.timed_out.push_back(it->first);
+            it = connections_.erase(it);
+            continue;
+        }
+
+        TcpSegment segment;
+        segment.source_port = it->first.local_port;
+        segment.destination_port = it->first.remote_port;
+        segment.sequence_number = oldest.sequence_start;
+        segment.acknowledgment_number =
+            oldest.is_syn ? connection.remote_isn + 1 : connection.rcv_nxt;
+        segment.flags = oldest.flags;
+        segment.window_size = 65535;
+        segment.urgent_pointer = 0;
+        segment.payload = oldest.payload;
+
+        oldest.retransmit_count += 1;
+        oldest.last_sent = now;
+        oldest.rto = std::min<TcpClock::duration>(oldest.rto * 2, kMaxRto);
+
+        result.retransmissions.push_back({it->first, std::move(segment)});
+        ++it;
+    }
+
+    return result;
+}
+
+std::optional<TcpClock::time_point> TcpConnectionTable::nextRetransmissionDeadline() const {
+    std::optional<TcpClock::time_point> earliest;
+    for (const auto& [key, connection] : connections_) {
+        if (connection.pending.empty()) {
+            continue;
+        }
+        auto deadline = connection.pending.front().last_sent + connection.pending.front().rto;
+        if (!earliest || deadline < *earliest) {
+            earliest = deadline;
+        }
+    }
+    return earliest;
 }
 
 } // namespace wirestack

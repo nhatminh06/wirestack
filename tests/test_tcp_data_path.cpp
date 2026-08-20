@@ -89,6 +89,7 @@ int main() {
     auto local_ip = *Ipv4Address::parse("10.0.0.2");
     auto local_mac = *MacAddress::parse("02:00:00:00:00:02");
     TcpConnectionTable connections(8080);
+    constexpr TcpClock::time_point t0{};
 
     // Establish the connection using the real handshake path.
     auto eth_result = parseEthernetFrame(knownSynFrame());
@@ -107,7 +108,7 @@ int main() {
     if (syn == nullptr) return wirestack::test::failureCount() == 0 ? 0 : 1;
 
     TcpConnectionKey key{local_ip, syn->destination_port, ip_packet->source, syn->source_port};
-    auto syn_ack = connections.handle(key, *syn).reply;
+    auto syn_ack = connections.handle(key, *syn, t0).reply;
     CHECK(syn_ack.has_value());
     if (!syn_ack) return wirestack::test::failureCount() == 0 ? 0 : 1;
     std::uint32_t server_isn = syn_ack->sequence_number;
@@ -120,7 +121,7 @@ int main() {
     final_ack.flags.ack = true;
     final_ack.window_size = 65535;
     final_ack.urgent_pointer = 0;
-    connections.handle(key, final_ack);
+    connections.handle(key, final_ack, t0);
     CHECK(connections.stateOf(key) == TcpState::Established);
 
     // Build a real Ethernet client-data frame carrying "hello wirestack".
@@ -156,12 +157,12 @@ int main() {
     CHECK(parsed_segment != nullptr);
     if (parsed_segment == nullptr) return wirestack::test::failureCount() == 0 ? 0 : 1;
 
-    auto result = connections.handle(key, *parsed_segment);
+    auto result = connections.handle(key, *parsed_segment, t0);
     CHECK(result.accepted_payload == payload_text);
     CHECK(!result.reply.has_value());
 
     // Echo policy: send the accepted bytes back, unmodified.
-    auto echo = connections.makeOutgoingData(key, result.accepted_payload);
+    auto echo = connections.makeOutgoingData(key, result.accepted_payload, t0);
     CHECK(echo.has_value());
     if (!echo) return wirestack::test::failureCount() == 0 ? 0 : 1;
     CHECK(echo->sequence_number == server_isn + 1);
@@ -209,7 +210,7 @@ int main() {
     // Duplicate-packet-path proof: re-feed the identical client data
     // frame. The application must not be echoed twice.
     auto rcv_nxt_before_duplicate = connections.snapshotOf(key)->rcv_nxt;
-    auto duplicate_result = connections.handle(key, *parsed_segment);
+    auto duplicate_result = connections.handle(key, *parsed_segment, t0);
     CHECK(duplicate_result.accepted_payload.empty());
     CHECK(duplicate_result.reply.has_value());
     if (duplicate_result.reply) {
@@ -230,7 +231,7 @@ int main() {
     ack_of_echo.window_size = 65535;
     ack_of_echo.urgent_pointer = 0;
 
-    auto final_ack_result = connections.handle(key, ack_of_echo);
+    auto final_ack_result = connections.handle(key, ack_of_echo, t0);
     CHECK(!final_ack_result.reply.has_value());
 
     auto snapshot = connections.snapshotOf(key);
