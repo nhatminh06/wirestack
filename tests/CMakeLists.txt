@@ -1,0 +1,67 @@
+add_executable(test_mac_address test_mac_address.cpp)
+target_link_libraries(test_mac_address PRIVATE wirestack_core)
+add_test(NAME test_mac_address COMMAND test_mac_address)
+
+add_executable(test_ethernet test_ethernet.cpp)
+target_link_libraries(test_ethernet PRIVATE wirestack_core)
+add_test(NAME test_ethernet COMMAND test_ethernet)
+
+add_executable(test_tap_device test_tap_device.cpp)
+target_link_libraries(test_tap_device PRIVATE wirestack_core)
+add_test(NAME test_tap_device COMMAND test_tap_device)
+
+add_executable(test_ipv4_address test_ipv4_address.cpp)
+target_link_libraries(test_ipv4_address PRIVATE wirestack_core)
+add_test(NAME test_ipv4_address COMMAND test_ipv4_address)
+
+add_executable(test_arp test_arp.cpp)
+target_link_libraries(test_arp PRIVATE wirestack_core)
+add_test(NAME test_arp COMMAND test_arp)
+
+add_executable(test_arp_cache test_arp_cache.cpp)
+target_link_libraries(test_arp_cache PRIVATE wirestack_core)
+add_test(NAME test_arp_cache COMMAND test_arp_cache)
+
+add_executable(test_checksum test_checksum.cpp)
+target_link_libraries(test_checksum PRIVATE wirestack_core)
+add_test(NAME test_checksum COMMAND test_checksum)
+
+add_executable(test_ipv4 test_ipv4.cpp)
+target_link_libraries(test_ipv4 PRIVATE wirestack_core)
+add_test(NAME test_ipv4 COMMAND test_ipv4)
+
+add_executable(test_icmp test_icmp.cpp)
+target_link_libraries(test_icmp PRIVATE wirestack_core)
+add_test(NAME test_icmp COMMAND test_icmp)
+
+add_executable(test_packet_path test_packet_path.cpp)
+target_link_libraries(test_packet_path PRIVATE wirestack_core)
+add_test(NAME test_packet_path COMMAND test_packet_path)
+
+add_executable(test_udp test_udp.cpp)
+target_link_libraries(test_udp PRIVATE wirestack_core)
+add_test(NAME test_udp COMMAND test_udp)
+
+add_executable(test_udp_endpoint test_udp_endpoint.cpp)
+target_link_libraries(test_udp_endpoint PRIVATE wirestack_core)
+add_test(NAME test_udp_endpoint COMMAND test_udp_endpoint)
+
+add_executable(test_udp_packet_path test_udp_packet_path.cpp)
+target_link_libraries(test_udp_packet_path PRIVATE wirestack_core)
+add_test(NAME test_udp_packet_path COMMAND test_udp_packet_path)
+
+add_executable(test_tcp test_tcp.cpp)
+target_link_libraries(test_tcp PRIVATE wirestack_core)
+add_test(NAME test_tcp COMMAND test_tcp)
+
+add_executable(test_tcp_connection test_tcp_connection.cpp)
+target_link_libraries(test_tcp_connection PRIVATE wirestack_core)
+add_test(NAME test_tcp_connection COMMAND test_tcp_connection)
+
+add_executable(test_tcp_handshake_path test_tcp_handshake_path.cpp)
+target_link_libraries(test_tcp_handshake_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_handshake_path COMMAND test_tcp_handshake_path)
+
+add_executable(test_tcp_data_path test_tcp_data_path.cpp)
+target_link_libraries(test_tcp_data_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_data_path COMMAND test_tcp_data_path)
