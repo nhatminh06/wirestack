@@ -2,10 +2,11 @@
 
 ## Current support
 
-Passive three-way handshake, plus single-segment in-order application
-data transfer with a built-in echo demonstration, over IPv4, on a single
-fixed listening port (8080). No connection close, no active open, no
-retransmission, no segmentation, no reassembly.
+Passive three-way handshake, single-segment in-order application data
+transfer with a built-in echo demonstration, and bounded timeout-based
+retransmission of SYN-ACK and echoed data, over IPv4, on a single fixed
+listening port (8080). No connection close, no active open, no
+segmentation, no reassembly, no congestion control.
 
 `TcpSegment` holds source/destination ports, sequence/acknowledgment
 numbers, flags, window size, urgent pointer, and the raw `options` and
@@ -145,13 +146,78 @@ accepted from an Established connection is passed unmodified to
 an HTTP server -- Wirestack does not parse or understand HTTP requests
 sent to port 8080.
 
-### Loss and retransmission
+## Retransmission
 
-Lost outgoing data (SYN-ACK, ACK, or echoed application data) is not
-retransmitted -- there is no timer, no retransmission queue, no RTT
-estimation. A duplicate incoming SYN still triggers a SYN-ACK
-retransmission (unchanged from Milestone 5); duplicate incoming data
-triggers only an ACK, never a repeated echo.
+### What is queued
+
+Every outgoing segment that consumes TCP sequence space -- the SYN-ACK,
+and each `PSH|ACK` data segment from `makeOutgoingData` -- is registered
+in a per-connection pending queue, in the order sent, each entry owning
+its own copy of the payload bytes. Pure ACKs (generated for
+duplicate/out-of-order/overlapping data) consume no sequence space and
+are never queued or timed.
+
+### Cumulative and partial ACK retirement
+
+A valid ACK (`snd_una < ack <= snd_nxt`, using the same wraparound-safe
+comparison as the rest of sequence-space tracking) retires every pending
+entry it fully covers, in order, from the front of the queue. If the ACK
+lands inside the oldest remaining entry, that entry is trimmed in place:
+its sequence start advances to the ACK value and its payload is trimmed
+to the unacknowledged suffix -- already-acknowledged bytes are never
+retransmitted. A duplicate (`ack == snd_una`) or stale (behind `snd_una`)
+ACK leaves the queue untouched; an ACK beyond `snd_nxt` is rejected
+entirely (no state change) before retirement is even considered.
+
+### Clock and RTO policy
+
+Retransmission timing uses `std::chrono::steady_clock`
+(`wirestack::TcpClock`) so it is unaffected by wall-clock changes.
+`handle()`, `makeOutgoingData()`, and `pollRetransmissions()` all take an
+explicit `time_point`, so tests drive timing deterministically (fixed
+synthetic instants, advanced by explicit durations) without sleeping or
+depending on machine speed.
+
+```text
+initial RTO:          1 second
+backoff:               double after each timeout-triggered retransmission
+maximum RTO:           8 seconds
+maximum retransmits:   5 (after the original, non-counted send)
+```
+
+This is an explicit educational policy, not RFC 6298 -- there is no RTT
+sampling, no smoothed RTT/variance, and no Karn's algorithm.
+
+### Retransmitting
+
+`pollRetransmissions(now)` returns every pending entry whose deadline
+(`last_sent + rto`) has passed. A retransmission reuses the entry's
+stored sequence start, flags, and (already-trimmed) payload; for data,
+the acknowledgment field is refreshed to the connection's *current*
+`rcv_nxt` (the client may have sent more data since the original send).
+It never advances `snd_nxt` or `snd_una`, and never re-delivers
+application data to the echo policy -- a retransmission is not a new
+logical send. A duplicate incoming SYN re-arms the pending SYN-ACK's
+deadline from the duplicate's arrival time without consuming any of the
+5-retransmission budget.
+
+### Timeout exhaustion
+
+Once a pending entry has already been retransmitted 5 times, its next
+expired deadline removes the connection from the table entirely and
+reports it to the caller -- no FIN, no RST, just a local abort. This is
+intentionally not a graceful close.
+
+### Delayed-reply addressing
+
+TCP connection state stores no MAC addresses. A timer-triggered
+retransmission has no current received frame to read a destination MAC
+from, so `main.cpp` looks it up in the existing `ArpCache`, which now
+learns IP->MAC mappings from any valid local IPv4 traffic (not just ARP
+packets) so a mapping is available even if the peer's last ARP exchange
+has aged out of relevance. If no mapping is known, the retransmission
+attempt is skipped (logged) but still counts toward the 5-retry budget --
+otherwise a persistently-unreachable peer would retry forever.
 
 ## Manual verification procedure
 
@@ -184,9 +250,10 @@ and echoing an HTTP request back is not a valid HTTP response.
 
 ## Known limitations
 
-- No retransmission timer or queue -- lost outgoing data (SYN-ACK, ACK, or
-  echoed application data) is not retransmitted. Duplicate incoming SYNs
-  are still answered on receipt (unchanged from Milestone 5).
+- No RTT sampling or smoothing -- the RTO policy is a fixed
+  1s/2s/4s/8s-capped backoff, not RFC 6298.
+- No fast retransmit (duplicate-ACK triggered) -- only timeout triggers
+  retransmission.
 - No congestion control.
 - No dynamic receive window (fixed value only).
 - No FIN / connection close path.
@@ -204,5 +271,5 @@ and echoing an HTTP request back is not a valid HTTP response.
 
 ## Next TCP work
 
-TCP retransmission queue, retransmission timeout, and deterministic
-loss-recovery testing.
+TCP FIN state transitions, graceful close, timeout cleanup, and reset
+handling.

@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -69,6 +70,26 @@ TapDevice& TapDevice::operator=(TapDevice&& other) noexcept {
 TapDevice::~TapDevice() {
     if (fd_ >= 0) {
         ::close(fd_);
+    }
+}
+
+std::variant<bool, std::string> TapDevice::waitReadable(int timeout_ms) {
+    pollfd pfd{};
+    pfd.fd = fd_;
+    pfd.events = POLLIN;
+
+    for (;;) {
+        int result = ::poll(&pfd, 1, timeout_ms);
+        if (result > 0) {
+            return true;
+        }
+        if (result == 0) {
+            return false;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return tap_detail::formatErrno("TAP poll failed", errno);
     }
 }
 

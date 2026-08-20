@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <variant>
 
@@ -226,13 +229,16 @@ void handleUdp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
 }
 
 // Serializes `segment` through IPv4/Ethernet and writes it back through
-// `tap`. Ethernet/IPv4 addressing come directly from the frame/packet
-// just received, same rationale as the ICMP/UDP reply paths. Shared by
-// every kind of outgoing TCP segment (SYN-ACK, pure ACK, echoed data).
-void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
-                   wirestack::MacAddress local_mac, const wirestack::Ipv4Packet& ip_packet,
-                   const wirestack::EthernetFrame& eth_frame, const wirestack::TcpSegment& segment) {
-    auto serialized_tcp = wirestack::serializeTcpSegment(segment, local_ip, ip_packet.source);
+// `tap`, addressed explicitly to `remote_ip`/`remote_mac`. Shared by every
+// kind of outgoing TCP segment (SYN-ACK, pure ACK, echoed data, and
+// timer-triggered retransmissions, which have no current received frame
+// to read addressing from).
+void sendTcpSegment(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
+                     wirestack::MacAddress local_mac, wirestack::Ipv4Address remote_ip,
+                     wirestack::MacAddress remote_mac, const wirestack::TcpSegment& segment) {
+    constexpr std::uint8_t kProtocolTcp = 6;
+
+    auto serialized_tcp = wirestack::serializeTcpSegment(segment, local_ip, remote_ip);
     if (std::holds_alternative<wirestack::TcpSerializeError>(serialized_tcp)) {
         std::printf("tcp: dropped outgoing segment: payload too large\n");
         return;
@@ -240,9 +246,9 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
 
     wirestack::Ipv4Packet reply_packet;
     reply_packet.ttl = 64;
-    reply_packet.protocol = ip_packet.protocol;
+    reply_packet.protocol = kProtocolTcp;
     reply_packet.source = local_ip;
-    reply_packet.destination = ip_packet.source;
+    reply_packet.destination = remote_ip;
     reply_packet.payload = std::get<std::vector<std::byte>>(serialized_tcp);
 
     auto serialized_ipv4 = wirestack::serializeIpv4Packet(reply_packet);
@@ -252,7 +258,7 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     }
 
     wirestack::EthernetFrame reply_frame;
-    reply_frame.destination = eth_frame.source;
+    reply_frame.destination = remote_mac;
     reply_frame.source = local_mac;
     reply_frame.ether_type = static_cast<std::uint16_t>(wirestack::EtherType::Ipv4);
     reply_frame.payload = std::get<std::vector<std::byte>>(serialized_ipv4);
@@ -260,7 +266,7 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     auto serialized = wirestack::serializeEthernetFrame(reply_frame);
     auto write_result = tap.write(serialized);
     if (auto* error = std::get_if<std::string>(&write_result)) {
-        std::fprintf(stderr, "wirestack: tcp reply write failed: %s\n", error->c_str());
+        std::fprintf(stderr, "wirestack: tcp segment write failed: %s\n", error->c_str());
         return;
     }
 
@@ -268,12 +274,21 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         std::printf("tcp syn-ack seq=%u ack=%u\n", segment.sequence_number,
                     segment.acknowledgment_number);
     } else if (!segment.payload.empty()) {
-        std::printf("tcp echo-reply dst=%s:%u len=%zu\n", ip_packet.source.toString().c_str(),
+        std::printf("tcp data-out dst=%s:%u len=%zu\n", remote_ip.toString().c_str(),
                     static_cast<unsigned int>(segment.destination_port), segment.payload.size());
     } else {
         std::printf("tcp ack seq=%u ack=%u\n", segment.sequence_number,
                     segment.acknowledgment_number);
     }
+}
+
+// Convenience wrapper for an immediate reply to a just-received frame:
+// Ethernet/IPv4 addressing come directly from it (the sender's MAC and IP
+// are already known), same rationale as the ICMP/UDP reply paths.
+void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
+                   wirestack::MacAddress local_mac, const wirestack::Ipv4Packet& ip_packet,
+                   const wirestack::EthernetFrame& eth_frame, const wirestack::TcpSegment& segment) {
+    sendTcpSegment(tap, local_ip, local_mac, ip_packet.source, eth_frame.source, segment);
 }
 
 // Parses the TCP segment, runs it through `connections`, and dispatches
@@ -301,8 +316,10 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                     static_cast<unsigned int>(segment.source_port), segment.sequence_number);
     }
 
+    auto now = wirestack::TcpClock::now();
+
     auto state_before = connections.stateOf(key);
-    auto result = connections.handle(key, segment);
+    auto result = connections.handle(key, segment, now);
     auto state_after = connections.stateOf(key);
 
     if (state_before == wirestack::TcpState::SynReceived &&
@@ -316,7 +333,7 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                     static_cast<unsigned int>(segment.source_port),
                     result.accepted_payload.size());
 
-        auto echo = connections.makeOutgoingData(key, result.accepted_payload);
+        auto echo = connections.makeOutgoingData(key, result.accepted_payload, now);
         if (echo) {
             sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *echo);
         }
@@ -334,7 +351,8 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
 // are valid IPv4 and are silently ignored -- Wirestack is a local endpoint,
 // not a router.
 void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
-                 wirestack::MacAddress local_mac, const wirestack::UdpEndpointTable& endpoints,
+                 wirestack::MacAddress local_mac, wirestack::ArpCache& arp_cache,
+                 const wirestack::UdpEndpointTable& endpoints,
                  wirestack::TcpConnectionTable& tcp_connections,
                  const wirestack::EthernetFrame& frame) {
     auto parsed = wirestack::parseIpv4Packet(frame.payload);
@@ -355,6 +373,12 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     if (packet.destination != local_ip) {
         return;
     }
+
+    // Opportunistically learn the sender's IP->MAC mapping from any valid
+    // local IPv4 traffic, not just ARP -- lets a later timer-triggered
+    // TCP retransmission (with no current received frame) still resolve
+    // a destination MAC.
+    arp_cache.insert(packet.source, frame.source);
 
     constexpr std::uint8_t kProtocolIcmp = 1;
     constexpr std::uint8_t kProtocolTcp = 6;
@@ -412,27 +436,69 @@ int main(int argc, char** argv) {
 
     std::array<std::byte, kReceiveBufferSize> buffer{};
     for (;;) {
-        auto result = tap.read(buffer);
-        if (auto* error = std::get_if<std::string>(&result)) {
+        // Size the poll timeout to the earliest pending TCP retransmission
+        // deadline (if any) so retransmissions fire even when no packet
+        // arrives, without busy-looping.
+        int timeout_ms = -1;
+        if (auto deadline = tcp_connections.nextRetransmissionDeadline()) {
+            auto now = wirestack::TcpClock::now();
+            auto remaining = *deadline > now
+                                  ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        *deadline - now)
+                                  : std::chrono::milliseconds{0};
+            timeout_ms = static_cast<int>(std::min<std::chrono::milliseconds::rep>(
+                remaining.count(), std::numeric_limits<int>::max()));
+        }
+
+        auto readable = tap.waitReadable(timeout_ms);
+        if (auto* error = std::get_if<std::string>(&readable)) {
             std::fprintf(stderr, "wirestack: %s\n", error->c_str());
             return 1;
         }
 
-        std::size_t n = std::get<std::size_t>(result);
-        auto parsed = wirestack::parseEthernetFrame(std::span(buffer).first(n));
-        auto* frame = std::get_if<wirestack::EthernetFrame>(&parsed);
-        if (frame == nullptr) {
-            std::printf("ethernet: dropped malformed frame: truncated header\n");
-            continue;
+        if (std::get<bool>(readable)) {
+            auto result = tap.read(buffer);
+            if (auto* error = std::get_if<std::string>(&result)) {
+                std::fprintf(stderr, "wirestack: %s\n", error->c_str());
+                return 1;
+            }
+
+            std::size_t n = std::get<std::size_t>(result);
+            auto parsed = wirestack::parseEthernetFrame(std::span(buffer).first(n));
+            auto* frame = std::get_if<wirestack::EthernetFrame>(&parsed);
+            if (frame == nullptr) {
+                std::printf("ethernet: dropped malformed frame: truncated header\n");
+                continue;
+            }
+
+            printFrame(*frame, n);
+
+            auto ether_type = static_cast<wirestack::EtherType>(frame->ether_type);
+            if (ether_type == wirestack::EtherType::Arp) {
+                handleArp(tap, arp_cache, *local_ip, *local_mac, *frame);
+            } else if (ether_type == wirestack::EtherType::Ipv4) {
+                handleIpv4(tap, *local_ip, *local_mac, arp_cache, udp_endpoints, tcp_connections,
+                           *frame);
+            }
         }
 
-        printFrame(*frame, n);
-
-        auto ether_type = static_cast<wirestack::EtherType>(frame->ether_type);
-        if (ether_type == wirestack::EtherType::Arp) {
-            handleArp(tap, arp_cache, *local_ip, *local_mac, *frame);
-        } else if (ether_type == wirestack::EtherType::Ipv4) {
-            handleIpv4(tap, *local_ip, *local_mac, udp_endpoints, tcp_connections, *frame);
+        auto now = wirestack::TcpClock::now();
+        auto due = tcp_connections.pollRetransmissions(now);
+        for (const auto& retransmission : due.retransmissions) {
+            auto mac = arp_cache.lookup(retransmission.key.remote_ip);
+            if (!mac) {
+                std::printf("tcp: cannot retransmit to %s:%u: no known MAC address\n",
+                            retransmission.key.remote_ip.toString().c_str(),
+                            static_cast<unsigned int>(retransmission.key.remote_port));
+                continue;
+            }
+            sendTcpSegment(tap, *local_ip, *local_mac, retransmission.key.remote_ip, *mac,
+                           retransmission.segment);
+        }
+        for (const auto& key : due.timed_out) {
+            std::printf("tcp: connection to %s:%u timed out after %d retransmissions\n",
+                        key.remote_ip.toString().c_str(), static_cast<unsigned int>(key.remote_port),
+                        wirestack::kMaxRetransmits);
         }
     }
 }
