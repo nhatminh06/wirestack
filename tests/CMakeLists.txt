@@ -81,3 +81,7 @@ add_test(NAME test_tcp_reset_path COMMAND test_tcp_reset_path)
 add_executable(test_http test_http.cpp)
 target_link_libraries(test_http PRIVATE wirestack_core)
 add_test(NAME test_http COMMAND test_http)
+
+add_executable(test_http_path test_http_path.cpp)
+target_link_libraries(test_http_path PRIVATE wirestack_core)
+add_test(NAME test_http_path COMMAND test_http_path)
