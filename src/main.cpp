@@ -3,12 +3,15 @@
 #include <chrono>
 #include <cstdio>
 #include <limits>
+#include <map>
+#include <optional>
 #include <string>
 #include <variant>
 
 #include "wirestack/arp.hpp"
 #include "wirestack/arp_cache.hpp"
 #include "wirestack/ethernet.hpp"
+#include "wirestack/http.hpp"
 #include "wirestack/icmp.hpp"
 #include "wirestack/ipv4.hpp"
 #include "wirestack/ipv4_address.hpp"
@@ -293,15 +296,14 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
 
 // Parses the TCP segment, runs it through `connections`, and dispatches
 // the result: an immediate reply (SYN-ACK / pure ACK / closed-port RST) is
-// sent as-is; newly accepted application payload is handed to the echo
-// policy -- exactly the bytes received, unmodified -- which becomes one
-// outgoing PSH|ACK data segment; and an accepted peer FIN triggers the
-// application's own close, after any echo has already been sent. TCP
-// protocol logic and echo/close policy stay separate:
-// `connections.handle`/`makeOutgoingData`/`beginClose` know nothing about
-// echoing.
+// sent as-is; newly accepted application payload and an accepted peer FIN
+// both feed the HTTP layer (`http_sessions`), which owns request
+// buffering/parsing/response-selection entirely on its own -- TCP protocol
+// logic knows nothing about HTTP, and `connections.handle`/
+// `makeOutgoingData`/`beginClose` know nothing about it either.
 void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                wirestack::MacAddress local_mac, wirestack::TcpConnectionTable& connections,
+               std::map<wirestack::TcpConnectionKey, wirestack::HttpConnectionState>& http_sessions,
                const wirestack::Ipv4Packet& ip_packet, const wirestack::EthernetFrame& eth_frame) {
     auto parsed = wirestack::parseTcpSegment(ip_packet.payload, ip_packet.source,
                                               ip_packet.destination);
@@ -331,28 +333,70 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                     static_cast<unsigned int>(segment.source_port));
     }
 
+    if (result.reply) {
+        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.reply);
+    }
+
     if (!result.accepted_payload.empty()) {
         std::printf("tcp data src=%s:%u len=%zu\n", ip_packet.source.toString().c_str(),
                     static_cast<unsigned int>(segment.source_port),
                     result.accepted_payload.size());
-
-        auto echo = connections.makeOutgoingData(key, result.accepted_payload, now);
-        if (echo) {
-            sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *echo);
-        }
-    } else if (result.reply) {
-        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.reply);
     }
-
     if (result.peer_closed) {
         std::printf("tcp fin src=%s:%u\n", ip_packet.source.toString().c_str(),
                     static_cast<unsigned int>(segment.source_port));
-        // Any echo above has already been sent, so this FIN is
-        // constructed and transmitted after it, per the required
-        // "finish any immediate echo, then initiate local close" order.
-        auto fin = connections.beginClose(key, now);
-        if (fin) {
-            sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *fin);
+    }
+
+    if (!result.accepted_payload.empty() || result.peer_closed) {
+        auto& session = http_sessions[key];
+        if (!session.responded) {
+            if (!result.accepted_payload.empty()) {
+                wirestack::appendHttpBytes(session, result.accepted_payload);
+            }
+
+            auto parsed = wirestack::parseHttpRequest(session.buffer);
+            std::optional<wirestack::HttpResponse> response;
+            switch (parsed.status) {
+                case wirestack::HttpParseStatus::Incomplete:
+                    // Peer EOF before a complete request: respond 400
+                    // rather than silently discarding the request.
+                    if (result.peer_closed) {
+                        response = wirestack::makeBadRequestResponse();
+                    }
+                    break;
+                case wirestack::HttpParseStatus::Complete:
+                    response = wirestack::selectResponse(*parsed.request);
+                    break;
+                case wirestack::HttpParseStatus::Malformed:
+                case wirestack::HttpParseStatus::TooLarge:
+                    response = wirestack::makeBadRequestResponse();
+                    break;
+                case wirestack::HttpParseStatus::UnsupportedMethod:
+                    response = wirestack::makeMethodNotAllowedResponse();
+                    break;
+                case wirestack::HttpParseStatus::UnsupportedVersion:
+                    response = wirestack::makeVersionNotSupportedResponse();
+                    break;
+            }
+
+            if (response) {
+                session.responded = true;
+                auto response_bytes = wirestack::serializeHttpResponse(*response);
+                auto sent = connections.makeOutgoingData(key, response_bytes, now);
+                if (sent) {
+                    sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *sent);
+                    // Never close before the response segment was
+                    // successfully constructed above.
+                    auto fin = connections.beginClose(key, now);
+                    if (fin) {
+                        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *fin);
+                    }
+                } else {
+                    std::printf("http: failed to construct response segment for src=%s:%u\n",
+                                ip_packet.source.toString().c_str(),
+                                static_cast<unsigned int>(segment.source_port));
+                }
+            }
         }
     }
 
@@ -360,6 +404,9 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         std::printf("tcp: connection reset by peer src=%s:%u\n",
                     ip_packet.source.toString().c_str(),
                     static_cast<unsigned int>(segment.source_port));
+    }
+    if (result.connection_reset || result.connection_closed) {
+        http_sessions.erase(key);
     }
 }
 
@@ -372,6 +419,8 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                  wirestack::MacAddress local_mac, wirestack::ArpCache& arp_cache,
                  const wirestack::UdpEndpointTable& endpoints,
                  wirestack::TcpConnectionTable& tcp_connections,
+                 std::map<wirestack::TcpConnectionKey, wirestack::HttpConnectionState>&
+                     http_sessions,
                  const wirestack::EthernetFrame& frame) {
     auto parsed = wirestack::parseIpv4Packet(frame.payload);
     if (!std::holds_alternative<wirestack::Ipv4Packet>(parsed)) {
@@ -404,7 +453,7 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     if (packet.protocol == kProtocolIcmp) {
         handleIcmp(tap, local_ip, local_mac, packet, frame);
     } else if (packet.protocol == kProtocolTcp) {
-        handleTcp(tap, local_ip, local_mac, tcp_connections, packet, frame);
+        handleTcp(tap, local_ip, local_mac, tcp_connections, http_sessions, packet, frame);
     } else if (packet.protocol == kProtocolUdp) {
         handleUdp(tap, local_ip, local_mac, endpoints, packet, frame);
     }
@@ -451,6 +500,10 @@ int main(int argc, char** argv) {
 
     constexpr std::uint16_t kTcpListenPort = 8080;
     wirestack::TcpConnectionTable tcp_connections(kTcpListenPort);
+    // HTTP application state, keyed by the same TCP four-tuple as
+    // `tcp_connections` but owned separately -- the TCP connection table
+    // has no HTTP knowledge.
+    std::map<wirestack::TcpConnectionKey, wirestack::HttpConnectionState> http_sessions;
 
     std::array<std::byte, kReceiveBufferSize> buffer{};
     for (;;) {
@@ -496,7 +549,7 @@ int main(int argc, char** argv) {
                 handleArp(tap, arp_cache, *local_ip, *local_mac, *frame);
             } else if (ether_type == wirestack::EtherType::Ipv4) {
                 handleIpv4(tap, *local_ip, *local_mac, arp_cache, udp_endpoints, tcp_connections,
-                           *frame);
+                           http_sessions, *frame);
             }
         }
 
@@ -517,10 +570,12 @@ int main(int argc, char** argv) {
             std::printf("tcp: connection to %s:%u timed out after %d retransmissions\n",
                         key.remote_ip.toString().c_str(), static_cast<unsigned int>(key.remote_port),
                         wirestack::kMaxRetransmits);
+            http_sessions.erase(key);
         }
         for (const auto& key : due.time_wait_expired) {
             std::printf("tcp: connection to %s:%u closed after time_wait\n",
                         key.remote_ip.toString().c_str(), static_cast<unsigned int>(key.remote_port));
+            http_sessions.erase(key);
         }
     }
 }

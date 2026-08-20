@@ -171,8 +171,12 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     if (segment.payload.empty() && !segment.flags.fin) {
         // Ack information already processed above; an ordinary ACK-only
         // segment does not itself warrant a reply (that would create an
-        // ACK loop).
-        return {};
+        // ACK loop). This is also exactly where a LastAck connection's
+        // final ACK lands, so pending_removal (just possibly set above)
+        // is surfaced here.
+        TcpReceiveResult result;
+        result.connection_closed = connection.pending_removal;
+        return result;
     }
 
     if (segment.sequence_number == connection.rcv_nxt) {
