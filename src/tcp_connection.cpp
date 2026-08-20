@@ -20,6 +20,27 @@ bool sequenceLessOrEqual(std::uint32_t a, std::uint32_t b) {
 
 } // namespace
 
+TcpSegment makeClosedPortReset(const TcpSegment& incoming) {
+    TcpSegment reset;
+    reset.source_port = incoming.destination_port;
+    reset.destination_port = incoming.source_port;
+    reset.flags.rst = true;
+    reset.window_size = 0;
+    reset.urgent_pointer = 0;
+
+    if (incoming.flags.ack) {
+        reset.sequence_number = incoming.acknowledgment_number;
+    } else {
+        reset.sequence_number = 0;
+        std::uint32_t consumed = static_cast<std::uint32_t>(incoming.payload.size()) +
+                                  (incoming.flags.syn ? 1u : 0u) + (incoming.flags.fin ? 1u : 0u);
+        reset.acknowledgment_number = incoming.sequence_number + consumed;
+        reset.flags.ack = true;
+    }
+
+    return reset;
+}
+
 TcpConnectionTable::TcpConnectionTable(std::uint16_t listen_port) : listen_port_(listen_port) {}
 
 std::uint32_t TcpConnectionTable::nextIsn() {
@@ -55,6 +76,19 @@ TcpSegment TcpConnectionTable::makePureAck(const TcpConnectionKey& key,
     return reply;
 }
 
+TcpSegment TcpConnectionTable::makeFin(const TcpConnectionKey& key, const Connection& connection) {
+    TcpSegment reply;
+    reply.source_port = key.local_port;
+    reply.destination_port = key.remote_port;
+    reply.sequence_number = connection.snd_nxt;
+    reply.acknowledgment_number = connection.rcv_nxt;
+    reply.flags.fin = true;
+    reply.flags.ack = true;
+    reply.window_size = 65535;
+    reply.urgent_pointer = 0;
+    return reply;
+}
+
 void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_t ack) {
     if (!sequenceGreater(ack, connection.snd_una)) {
         return; // duplicate or stale ACK -- queue and snd_una both unchanged
@@ -82,27 +116,59 @@ void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_
     }
 }
 
-TcpReceiveResult TcpConnectionTable::handleEstablished(const TcpConnectionKey& key,
-                                                         Connection& connection,
-                                                         const TcpSegment& segment) {
-    // FIN/RST/SYN are unsupported in Established; a payload attached to
-    // one of these is not partially processed -- the whole segment is
-    // dropped.
-    if (segment.flags.syn || segment.flags.fin || segment.flags.rst) {
+void TcpConnectionTable::startTimeWait(Connection& connection, TcpClock::time_point now) {
+    connection.state = TcpState::TimeWait;
+    connection.time_wait_deadline = now + kTimeWaitDuration;
+    // Both FINs are acknowledged by construction at every call site of
+    // this function, so nothing should remain pending -- cleared
+    // explicitly anyway rather than relying on that invariant.
+    connection.pending.clear();
+}
+
+TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& key,
+                                                          Connection& connection,
+                                                          const TcpSegment& segment,
+                                                          TcpClock::time_point now) {
+    // A SYN is invalid in every synchronized state; the whole segment is
+    // dropped, not partially processed.
+    if (segment.flags.syn) {
         return {};
     }
+
+    if (segment.flags.rst) {
+        // Acceptable only if it lands exactly at the next expected byte.
+        if (segment.sequence_number == connection.rcv_nxt) {
+            TcpReceiveResult result;
+            result.connection_reset = true;
+            connection.pending_removal = true;
+            return result;
+        }
+        return {};
+    }
+
     if (!segment.flags.ack) {
         return {};
     }
 
     // An ACK acknowledging sequence space beyond what has been sent is
-    // invalid: no state change, no payload delivery, no reply.
+    // invalid: no state change, no payload delivery, no FIN consumption.
     if (!sequenceLessOrEqual(segment.acknowledgment_number, connection.snd_nxt)) {
         return {};
     }
     retireAcknowledged(connection, segment.acknowledgment_number);
 
-    if (segment.payload.empty()) {
+    bool local_fin_acked = connection.local_fin_seq.has_value() &&
+                            sequenceLessOrEqual(*connection.local_fin_seq + 1, connection.snd_una);
+
+    if (connection.state == TcpState::FinWait1 && local_fin_acked) {
+        connection.state = TcpState::FinWait2;
+    } else if (connection.state == TcpState::Closing && local_fin_acked) {
+        startTimeWait(connection, now);
+    } else if (connection.state == TcpState::LastAck && local_fin_acked) {
+        connection.pending_removal = true;
+    }
+
+    if (segment.payload.empty() && !segment.flags.fin) {
         // Ack information already processed above; an ordinary ACK-only
         // segment does not itself warrant a reply (that would create an
         // ACK loop).
@@ -111,32 +177,100 @@ TcpReceiveResult TcpConnectionTable::handleEstablished(const TcpConnectionKey& k
 
     if (segment.sequence_number == connection.rcv_nxt) {
         TcpReceiveResult result;
-        result.accepted_payload = segment.payload;
-        connection.rcv_nxt += static_cast<std::uint32_t>(segment.payload.size());
+        if (!segment.payload.empty()) {
+            result.accepted_payload = segment.payload;
+            connection.rcv_nxt += static_cast<std::uint32_t>(segment.payload.size());
+        }
+
+        if (segment.flags.fin) {
+            connection.rcv_nxt += 1;
+            result.peer_closed = true;
+
+            if (connection.state == TcpState::Established) {
+                connection.state = TcpState::CloseWait;
+            } else if (connection.state == TcpState::FinWait1) {
+                connection.state = TcpState::Closing;
+            } else if (connection.state == TcpState::FinWait2) {
+                startTimeWait(connection, now);
+            }
+
+            // Only ACK the FIN directly when no payload was also
+            // delivered -- an echo built from accepted_payload already
+            // ACKs the post-FIN rcv_nxt, making a separate pure ACK
+            // redundant.
+            if (result.accepted_payload.empty()) {
+                result.reply = makePureAck(key, connection);
+            }
+        }
+
         return result;
     }
 
-    // Duplicate, out-of-order, or overlapping data -- all resolve to the
-    // same behavior: nothing is delivered, rcv_nxt is unchanged, and a
-    // duplicate ACK for the current rcv_nxt is sent. No reassembly.
+    // Duplicate, out-of-order, or overlapping data (including a
+    // retransmitted FIN already consumed) -- all resolve to the same
+    // behavior: nothing is delivered, rcv_nxt is unchanged, no
+    // peer_closed, and a duplicate ACK for the current rcv_nxt is sent.
+    // No reassembly.
     TcpReceiveResult result;
     result.reply = makePureAck(key, connection);
     return result;
+}
+
+TcpReceiveResult TcpConnectionTable::handleTimeWait(const TcpConnectionKey& key,
+                                                      Connection& connection,
+                                                      const TcpSegment& segment,
+                                                      TcpClock::time_point now) {
+    if (segment.flags.rst) {
+        if (segment.sequence_number == connection.rcv_nxt) {
+            connection.pending_removal = true;
+        }
+        return {};
+    }
+
+    if (segment.flags.syn || !segment.payload.empty()) {
+        return {};
+    }
+
+    // A retransmitted FIN carries the same sequence number it originally
+    // did, i.e. one behind the current rcv_nxt. Plain unsigned equality
+    // is wraparound-correct here (unlike ordering comparisons).
+    if (segment.flags.fin && segment.sequence_number + 1 == connection.rcv_nxt) {
+        connection.time_wait_deadline = now + kTimeWaitDuration;
+        TcpReceiveResult result;
+        result.reply = makePureAck(key, connection);
+        return result;
+    }
+
+    return {};
 }
 
 TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
                                              const TcpSegment& segment,
                                              TcpClock::time_point now) {
     if (key.local_port != listen_port_) {
-        return {};
+        // Unbound port: never respond to an incoming RST; everything
+        // else gets a closed-port reset.
+        if (segment.flags.rst) {
+            return {};
+        }
+        TcpReceiveResult result;
+        result.reply = makeClosedPortReset(segment);
+        return result;
     }
 
     auto it = connections_.find(key);
 
     if (it == connections_.end()) {
-        // No existing connection: only a bare SYN (no ACK) can start one.
+        if (segment.flags.rst) {
+            return {}; // never respond to an incoming RST
+        }
+        // No existing connection: only a bare SYN (no ACK) can start one;
+        // anything else (ACK, payload, FIN, SYN|ACK) for this bound port
+        // with no matching connection gets a closed-port reset.
         if (!segment.flags.syn || segment.flags.ack) {
-            return {};
+            TcpReceiveResult result;
+            result.reply = makeClosedPortReset(segment);
+            return result;
         }
         Connection connection;
         connection.state = TcpState::SynReceived;
@@ -159,11 +293,31 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
 
     Connection& connection = it->second;
 
-    if (connection.state == TcpState::Established) {
-        return handleEstablished(key, connection, segment);
+    if (connection.state == TcpState::TimeWait) {
+        auto result = handleTimeWait(key, connection, segment, now);
+        if (connection.pending_removal) {
+            connections_.erase(it);
+        }
+        return result;
+    }
+
+    if (connection.state != TcpState::SynReceived) {
+        auto result = handleSynchronized(key, connection, segment, now);
+        if (connection.pending_removal) {
+            connections_.erase(it);
+        }
+        return result;
     }
 
     // SynReceived.
+    if (segment.flags.rst) {
+        // Acceptable only if it acknowledges the outstanding SYN-ACK.
+        if (segment.sequence_number == connection.remote_isn + 1) {
+            connections_.erase(it);
+        }
+        return {};
+    }
+
     if (segment.flags.syn && !segment.flags.ack) {
         // Duplicate SYN: retransmit the same SYN-ACK from stored state,
         // not a freshly drawn ISN. Re-arm the pending deadline from this
@@ -223,7 +377,8 @@ std::optional<TcpSegment> TcpConnectionTable::makeOutgoingData(const TcpConnecti
     }
 
     auto it = connections_.find(key);
-    if (it == connections_.end() || it->second.state != TcpState::Established) {
+    if (it == connections_.end() || (it->second.state != TcpState::Established &&
+                                      it->second.state != TcpState::CloseWait)) {
         return std::nullopt;
     }
     Connection& connection = it->second;
@@ -252,11 +407,50 @@ std::optional<TcpSegment> TcpConnectionTable::makeOutgoingData(const TcpConnecti
     return segment;
 }
 
+std::optional<TcpSegment> TcpConnectionTable::beginClose(const TcpConnectionKey& key,
+                                                           TcpClock::time_point now) {
+    auto it = connections_.find(key);
+    if (it == connections_.end()) {
+        return std::nullopt;
+    }
+    Connection& connection = it->second;
+    if (connection.state != TcpState::Established && connection.state != TcpState::CloseWait) {
+        return std::nullopt;
+    }
+
+    TcpSegment segment = makeFin(key, connection);
+
+    PendingTransmission pending;
+    pending.sequence_start = connection.snd_nxt;
+    pending.is_fin = true;
+    pending.flags = segment.flags;
+    pending.last_sent = now;
+    connection.pending.push_back(std::move(pending));
+
+    connection.local_fin_seq = connection.snd_nxt;
+    connection.snd_nxt += 1;
+    connection.state =
+        connection.state == TcpState::Established ? TcpState::FinWait1 : TcpState::LastAck;
+
+    return segment;
+}
+
 TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_point now) {
     TcpTimeoutPollResult result;
 
     for (auto it = connections_.begin(); it != connections_.end();) {
         Connection& connection = it->second;
+
+        if (connection.state == TcpState::TimeWait) {
+            if (connection.time_wait_deadline && now >= *connection.time_wait_deadline) {
+                result.time_wait_expired.push_back(it->first);
+                it = connections_.erase(it);
+            } else {
+                ++it;
+            }
+            continue;
+        }
+
         if (connection.pending.empty()) {
             ++it;
             continue;
@@ -299,11 +493,13 @@ TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_poin
 std::optional<TcpClock::time_point> TcpConnectionTable::nextRetransmissionDeadline() const {
     std::optional<TcpClock::time_point> earliest;
     for (const auto& [key, connection] : connections_) {
-        if (connection.pending.empty()) {
-            continue;
+        std::optional<TcpClock::time_point> deadline;
+        if (connection.state == TcpState::TimeWait) {
+            deadline = connection.time_wait_deadline;
+        } else if (!connection.pending.empty()) {
+            deadline = connection.pending.front().last_sent + connection.pending.front().rto;
         }
-        auto deadline = connection.pending.front().last_sent + connection.pending.front().rto;
-        if (!earliest || deadline < *earliest) {
+        if (deadline && (!earliest || *deadline < *earliest)) {
             earliest = deadline;
         }
     }

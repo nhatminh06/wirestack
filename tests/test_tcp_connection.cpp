@@ -151,23 +151,32 @@ int main() {
         CHECK(table.stateOf(key) == TcpState::SynReceived);
     }
 
-    // ACK without prior SYN: ignored, no state created
+    // ACK without prior SYN: no state created, closed-port reset returned
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
 
         auto reply = table.handle(key, makeAck(8080, 54321, 1, 1), t0).reply;
-        CHECK(!reply.has_value());
+        CHECK(reply.has_value());
+        CHECK(reply->flags.rst);
+        CHECK(!reply->flags.ack);
+        CHECK(reply->sequence_number == 1); // incoming ack number
+        CHECK(reply->source_port == 8080);
+        CHECK(reply->destination_port == 54321);
         CHECK(!table.stateOf(key).has_value());
     }
 
-    // SYN to an unbound port: ignored, no state created
+    // SYN to an unbound port: no state created, closed-port reset returned
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8081, remoteIp(), 54321};
 
         auto reply = table.handle(key, makeSyn(8081, 54321, 1), t0).reply;
-        CHECK(!reply.has_value());
+        CHECK(reply.has_value());
+        CHECK(reply->flags.rst);
+        CHECK(reply->flags.ack);
+        CHECK(reply->sequence_number == 0);
+        CHECK(reply->acknowledgment_number == 2); // incoming seq + SYN's 1
         CHECK(!table.stateOf(key).has_value());
     }
 

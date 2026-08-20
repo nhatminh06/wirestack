@@ -16,6 +16,12 @@ namespace wirestack {
 enum class TcpState {
     SynReceived,
     Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    Closing,
+    LastAck,
+    TimeWait,
 };
 
 struct TcpConnectionKey {
@@ -41,9 +47,10 @@ struct TcpConnectionSnapshot {
 
 struct TcpReceiveResult {
     // An immediate reply to transmit as-is: a SYN-ACK during the
-    // handshake, or a pure ACK for a duplicate/out-of-order/overlapping
-    // established-state segment or an invalid ACK number. Never set at
-    // the same time as a non-empty accepted_payload.
+    // handshake, a pure ACK for a duplicate/out-of-order/overlapping
+    // segment or an invalid ACK number, a pure ACK for a peer FIN that
+    // arrived with no payload, or a closed-port/unknown-connection RST.
+    // Never set at the same time as a non-empty accepted_payload.
     std::optional<TcpSegment> reply;
 
     // Non-empty only when new in-order application data was accepted by
@@ -51,6 +58,16 @@ struct TcpReceiveResult {
     // outgoing segment via makeOutgoingData -- echo policy (or any other
     // application behavior) lives outside this class.
     std::vector<std::byte> accepted_payload;
+
+    // True exactly on the call that accepts the peer's FIN (never set
+    // again for a later duplicate/out-of-order FIN). The caller decides
+    // when to initiate its own close (e.g. via beginClose) -- this class
+    // has no echo-specific or application-specific close policy.
+    bool peer_closed = false;
+
+    // True exactly on the call whose acceptable inbound RST removed the
+    // connection. No reply is ever sent for an RST.
+    bool connection_reset = false;
 };
 
 // Monotonic clock used for retransmission scheduling. steady_clock (not
@@ -65,6 +82,10 @@ inline constexpr std::chrono::milliseconds kInitialRto{1000};
 inline constexpr std::chrono::milliseconds kMaxRto{8000};
 inline constexpr int kMaxRetransmits = 5;
 
+// Educational fixed TIME_WAIT duration -- not adaptive, not based on any
+// measured MSL.
+inline constexpr std::chrono::seconds kTimeWaitDuration{60};
+
 struct TcpDueRetransmission {
     TcpConnectionKey key;
     TcpSegment segment;
@@ -75,15 +96,24 @@ struct TcpTimeoutPollResult {
     std::vector<TcpDueRetransmission> retransmissions;
     // Connections removed after exhausting their retransmission budget.
     std::vector<TcpConnectionKey> timed_out;
+    // Connections removed after their TIME_WAIT deadline expired.
+    std::vector<TcpConnectionKey> time_wait_expired;
 };
+
+// Builds a reset for a segment addressed to an unbound port, or a bound
+// port with no matching connection where the segment is not a valid new
+// SYN. Stateless -- needs nothing beyond the inbound segment itself.
+// Never called for an incoming RST (never respond to RST with RST).
+TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 
 // Handles the passive three-way handshake (LISTEN is implicit: any key
 // with no table entry is either unbound or not yet SYN'd), single
 // in-order-segment receive with duplicate/out-of-order/overlap
-// rejection, cumulative ACK processing, and timeout-based retransmission
-// of sequence-consuming segments (SYN-ACK, application data -- never
-// pure ACKs). No segmentation/reassembly, no FIN/close, no congestion
-// control.
+// rejection, cumulative ACK processing, timeout-based retransmission of
+// sequence-consuming segments (SYN-ACK, application data, FIN -- never
+// pure ACKs), passive/active/simultaneous close, deterministic
+// TIME_WAIT, and acceptable inbound RST. No segmentation/reassembly, no
+// active open, no congestion control.
 class TcpConnectionTable {
 public:
     explicit TcpConnectionTable(std::uint16_t listen_port);
@@ -99,15 +129,24 @@ public:
     std::optional<TcpState> stateOf(const TcpConnectionKey& key) const;
     std::optional<TcpConnectionSnapshot> snapshotOf(const TcpConnectionKey& key) const;
 
-    // Builds one PSH|ACK segment carrying `payload` for an Established
-    // connection, registers it for retransmission, and advances snd_nxt
-    // by payload.size(). Returns nullopt, leaving connection state
-    // unchanged, for an unknown connection, a connection not yet
-    // Established, an empty payload, or a payload that would make the
-    // segment exceed kMaxTcpSegmentLength.
+    // Builds one PSH|ACK segment carrying `payload` for an Established or
+    // CloseWait connection (half-close: the peer's FIN doesn't stop
+    // Wirestack from still sending), registers it for retransmission, and
+    // advances snd_nxt by payload.size(). Returns nullopt, leaving
+    // connection state unchanged, for an unknown connection, a connection
+    // in any other state, an empty payload, or a payload that would make
+    // the segment exceed kMaxTcpSegmentLength.
     std::optional<TcpSegment> makeOutgoingData(const TcpConnectionKey& key,
                                                 std::vector<std::byte> payload,
                                                 TcpClock::time_point now);
+
+    // Initiates a local close: builds a FIN|ACK segment, registers it for
+    // retransmission, and advances snd_nxt by one. Returns nullopt,
+    // leaving connection state unchanged, unless the connection exists
+    // and is Established (-> FinWait1) or CloseWait (-> LastAck). Calling
+    // this again for the same connection returns nullopt (state is no
+    // longer Established/CloseWait), so it cannot create a second FIN.
+    std::optional<TcpSegment> beginClose(const TcpConnectionKey& key, TcpClock::time_point now);
 
     // Returns segments whose retransmission deadline has passed as of
     // `now`, and removes any connection that has exhausted its
@@ -122,15 +161,17 @@ public:
 private:
     struct PendingTransmission {
         std::uint32_t sequence_start;
-        bool is_syn; // true only for the handshake SYN-ACK entry
+        bool is_syn = false; // true only for the handshake SYN-ACK entry
+        bool is_fin = false; // true only for a locally-initiated FIN entry
         TcpFlags flags;
-        std::vector<std::byte> payload; // owned; empty when is_syn
+        std::vector<std::byte> payload; // owned; empty when is_syn or is_fin
         TcpClock::time_point last_sent;
         TcpClock::duration rto = kInitialRto;
         int retransmit_count = 0;
 
         std::uint32_t sequenceEnd() const {
-            return sequence_start + (is_syn ? 1u : static_cast<std::uint32_t>(payload.size()));
+            return sequence_start + static_cast<std::uint32_t>(payload.size()) +
+                   (is_syn ? 1u : 0u) + (is_fin ? 1u : 0u);
         }
     };
 
@@ -142,6 +183,12 @@ private:
         std::uint32_t snd_una = 0;
         std::uint32_t snd_nxt = 0;
         std::vector<PendingTransmission> pending; // sequence order, oldest first
+        std::optional<std::uint32_t> local_fin_seq; // set once by beginClose
+        std::optional<TcpClock::time_point> time_wait_deadline;
+        // Internal signal set by handleSynchronized (LastAck's final ACK,
+        // or an accepted RST) and consumed by handle() right after, which
+        // erases the connection. Never observed outside this class.
+        bool pending_removal = false;
     };
 
     // Not a secure or RFC 6528-style initial sequence number generator --
@@ -151,15 +198,29 @@ private:
 
     static TcpSegment makeSynAck(const TcpConnectionKey& key, const Connection& connection);
     static TcpSegment makePureAck(const TcpConnectionKey& key, const Connection& connection);
+    static TcpSegment makeFin(const TcpConnectionKey& key, const Connection& connection);
 
     // Advances snd_una to `ack` and drains/trims the pending queue to
     // match, if `ack` is ahead of the current snd_una. A no-op for a
     // duplicate or stale ACK. Precondition: `ack` already validated by
-    // the caller as not beyond snd_nxt.
+    // the caller as not beyond snd_nxt. SYN and FIN both occupy a
+    // 1-wide sequence range, so no ack value can land strictly inside
+    // one -- the partial-trim branch below only ever trims data.
     static void retireAcknowledged(Connection& connection, std::uint32_t ack);
 
-    TcpReceiveResult handleEstablished(const TcpConnectionKey& key, Connection& connection,
-                                        const TcpSegment& segment);
+    // Moves `connection` into TimeWait, arming its expiration deadline
+    // and dropping any (already-acknowledged) pending entries.
+    static void startTimeWait(Connection& connection, TcpClock::time_point now);
+
+    // Shared by every synchronized state except TimeWait: Established,
+    // FinWait1, FinWait2, CloseWait, Closing, LastAck.
+    static TcpReceiveResult handleSynchronized(const TcpConnectionKey& key, Connection& connection,
+                                                const TcpSegment& segment, TcpClock::time_point now);
+
+    // TimeWait has no payload/application events and only reacts to a
+    // duplicate FIN (restarts the deadline) or an acceptable RST.
+    static TcpReceiveResult handleTimeWait(const TcpConnectionKey& key, Connection& connection,
+                                            const TcpSegment& segment, TcpClock::time_point now);
 
     std::uint16_t listen_port_;
     std::uint32_t next_isn_ = 1000;

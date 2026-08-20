@@ -292,11 +292,14 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
 }
 
 // Parses the TCP segment, runs it through `connections`, and dispatches
-// the result: an immediate reply (SYN-ACK / pure ACK) is sent as-is;
-// newly accepted application payload is handed to the echo policy --
-// exactly the bytes received, unmodified -- which becomes one outgoing
-// PSH|ACK data segment. TCP protocol logic and echo policy stay separate:
-// `connections.handle`/`makeOutgoingData` know nothing about echoing.
+// the result: an immediate reply (SYN-ACK / pure ACK / closed-port RST) is
+// sent as-is; newly accepted application payload is handed to the echo
+// policy -- exactly the bytes received, unmodified -- which becomes one
+// outgoing PSH|ACK data segment; and an accepted peer FIN triggers the
+// application's own close, after any echo has already been sent. TCP
+// protocol logic and echo/close policy stay separate:
+// `connections.handle`/`makeOutgoingData`/`beginClose` know nothing about
+// echoing.
 void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                wirestack::MacAddress local_mac, wirestack::TcpConnectionTable& connections,
                const wirestack::Ipv4Packet& ip_packet, const wirestack::EthernetFrame& eth_frame) {
@@ -337,11 +340,26 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         if (echo) {
             sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *echo);
         }
-        return;
+    } else if (result.reply) {
+        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.reply);
     }
 
-    if (result.reply) {
-        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.reply);
+    if (result.peer_closed) {
+        std::printf("tcp fin src=%s:%u\n", ip_packet.source.toString().c_str(),
+                    static_cast<unsigned int>(segment.source_port));
+        // Any echo above has already been sent, so this FIN is
+        // constructed and transmitted after it, per the required
+        // "finish any immediate echo, then initiate local close" order.
+        auto fin = connections.beginClose(key, now);
+        if (fin) {
+            sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *fin);
+        }
+    }
+
+    if (result.connection_reset) {
+        std::printf("tcp: connection reset by peer src=%s:%u\n",
+                    ip_packet.source.toString().c_str(),
+                    static_cast<unsigned int>(segment.source_port));
     }
 }
 
@@ -499,6 +517,10 @@ int main(int argc, char** argv) {
             std::printf("tcp: connection to %s:%u timed out after %d retransmissions\n",
                         key.remote_ip.toString().c_str(), static_cast<unsigned int>(key.remote_port),
                         wirestack::kMaxRetransmits);
+        }
+        for (const auto& key : due.time_wait_expired) {
+            std::printf("tcp: connection to %s:%u closed after time_wait\n",
+                        key.remote_ip.toString().c_str(), static_cast<unsigned int>(key.remote_port));
         }
     }
 }
