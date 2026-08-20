@@ -6,6 +6,7 @@ using wirestack::Ipv4Address;
 using wirestack::kInitialRto;
 using wirestack::kMaxRetransmits;
 using wirestack::kMaxRto;
+using wirestack::kTimeWaitDuration;
 using wirestack::TcpClock;
 using wirestack::TcpConnectionKey;
 using wirestack::TcpConnectionTable;
@@ -63,6 +64,32 @@ TcpSegment makeData(std::uint16_t local_port, std::uint16_t remote_port, std::ui
     segment.window_size = 65535;
     segment.urgent_pointer = 0;
     segment.payload = std::move(payload);
+    return segment;
+}
+
+TcpSegment makeFin(std::uint16_t local_port, std::uint16_t remote_port, std::uint32_t seq,
+                    std::uint32_t ack, std::vector<std::byte> payload = {}) {
+    TcpSegment segment;
+    segment.source_port = remote_port;
+    segment.destination_port = local_port;
+    segment.sequence_number = seq;
+    segment.acknowledgment_number = ack;
+    segment.flags.ack = true;
+    segment.flags.fin = true;
+    segment.window_size = 65535;
+    segment.urgent_pointer = 0;
+    segment.payload = std::move(payload);
+    return segment;
+}
+
+TcpSegment makeRst(std::uint16_t local_port, std::uint16_t remote_port, std::uint32_t seq) {
+    TcpSegment segment;
+    segment.source_port = remote_port;
+    segment.destination_port = local_port;
+    segment.sequence_number = seq;
+    segment.flags.rst = true;
+    segment.window_size = 65535;
+    segment.urgent_pointer = 0;
     return segment;
 }
 
@@ -1084,6 +1111,522 @@ int main() {
         if (final_snapshot) {
             CHECK(final_snapshot->pending_count == 0);
         }
+    }
+
+    // --- FIN accounting ---
+
+    // peer FIN advances rcv_nxt by exactly one
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+
+        auto before = table.snapshotOf(key);
+        auto result = table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1), t0);
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->rcv_nxt == before->rcv_nxt + 1);
+        }
+        CHECK(result.peer_closed);
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+    }
+
+    // outgoing FIN advances snd_nxt by exactly one
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+
+        auto before = table.snapshotOf(key);
+        auto fin = table.beginClose(key, t0);
+        auto after = table.snapshotOf(key);
+        CHECK(fin.has_value());
+        CHECK(before.has_value() && after.has_value());
+        if (fin) {
+            CHECK(fin->flags.fin);
+            CHECK(fin->flags.ack);
+            CHECK(fin->payload.empty());
+        }
+        if (before && after) {
+            CHECK(after->snd_nxt == before->snd_nxt + 1);
+        }
+    }
+
+    // FIN retransmission does not advance snd_nxt again
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+
+        auto fin = table.beginClose(key, t0);
+        auto before = table.snapshotOf(key);
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        auto after = table.snapshotOf(key);
+        CHECK(due.retransmissions.size() == 1);
+        if (due.retransmissions.size() == 1 && fin) {
+            CHECK(due.retransmissions[0].segment.sequence_number == fin->sequence_number);
+            CHECK(due.retransmissions[0].segment.flags.fin);
+        }
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->snd_nxt == before->snd_nxt);
+        }
+    }
+
+    // FIN wraparound: rcv_nxt wraps from 0xffffffff to 0. local_isn is
+    // drawn from a small internal counter, so a send-side snd_nxt near
+    // the wrap point cannot be reached directly through the public API;
+    // client_isn, however, is caller-supplied, so the wraparound is
+    // exercised on the receive side instead -- the same 32-bit unsigned
+    // arithmetic governs both directions.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 0xfffffffe);
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->rcv_nxt == 0xffffffff);
+        }
+
+        auto result = table.handle(key, makeFin(8080, 54321, 0xffffffff, snapshot->snd_nxt), t0);
+        CHECK(result.peer_closed);
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) {
+            CHECK(after->rcv_nxt == 0);
+        }
+    }
+
+    // --- Peer close ---
+
+    // Established -> CloseWait, EOF signaled exactly once, ACK uses
+    // updated rcv_nxt, duplicate FIN does not re-signal EOF
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+
+        auto result = table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1), t0);
+        CHECK(result.peer_closed);
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+        CHECK(result.reply.has_value());
+        if (result.reply) {
+            CHECK(result.reply->flags.ack);
+            CHECK(!result.reply->flags.fin);
+            CHECK(result.reply->acknowledgment_number == 1002);
+        }
+
+        auto duplicate = table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1), t0);
+        CHECK(!duplicate.peer_closed);
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+        CHECK(duplicate.reply.has_value()); // still ACKed, just not as new EOF
+    }
+
+    // --- FIN with payload ---
+
+    // payload delivered exactly once, bytes preserved, both consume
+    // sequence space, state becomes CloseWait
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+
+        auto payload = toBytes("bye");
+        auto before = table.snapshotOf(key);
+        auto result =
+            table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1, payload), t0);
+        auto after = table.snapshotOf(key);
+
+        CHECK(result.accepted_payload == payload);
+        CHECK(result.peer_closed);
+        CHECK(!result.reply.has_value()); // redundant ACK avoided: echo will ACK it
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->rcv_nxt ==
+                  before->rcv_nxt + static_cast<std::uint32_t>(payload.size()) + 1);
+        }
+    }
+
+    // invalid ACK on a FIN+payload segment: entire segment rejected
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        (void)server_isn;
+
+        auto before = table.snapshotOf(key);
+        auto result = table.handle(key, makeFin(8080, 54321, 1001, 999999999, toBytes("x")), t0);
+        auto after = table.snapshotOf(key);
+
+        CHECK(result.accepted_payload.empty());
+        CHECK(!result.peer_closed);
+        CHECK(table.stateOf(key) == TcpState::Established);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->rcv_nxt == before->rcv_nxt);
+        }
+    }
+
+    // --- CloseWait send ---
+
+    // application data allowed in CloseWait, queued, ACKed normally
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1), t0); // -> CloseWait
+
+        auto payload = toBytes("still here");
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(sent.has_value());
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->pending_count == 1);
+        }
+
+        if (sent) {
+            table.handle(key,
+                         makeAck(8080, 54321, 1002,
+                                 sent->sequence_number +
+                                     static_cast<std::uint32_t>(sent->payload.size())),
+                         t0);
+        }
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) {
+            CHECK(after->pending_count == 0);
+        }
+    }
+
+    // --- Passive close ---
+
+    // CloseWait -> LastAck, FIN queued, valid ACK removes the connection,
+    // wrong ACK does not
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1), t0); // -> CloseWait
+
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        CHECK(table.stateOf(key) == TcpState::LastAck);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->pending_count == 1);
+        }
+
+        if (fin) {
+            // Wrong ACK: connection survives.
+            auto wrong = table.handle(key, makeAck(8080, 54321, 1002, fin->sequence_number), t0);
+            CHECK(table.stateOf(key).has_value());
+            CHECK(table.stateOf(key) == TcpState::LastAck);
+            (void)wrong;
+
+            // Valid ACK of the FIN: connection removed, no reply, no event.
+            auto final_ack =
+                table.handle(key, makeAck(8080, 54321, 1002, fin->sequence_number + 1), t0);
+            CHECK(!final_ack.reply.has_value());
+            CHECK(final_ack.accepted_payload.empty());
+            CHECK(!table.stateOf(key).has_value());
+        }
+    }
+
+    // --- Active close ---
+
+    // Established -> FinWait1 -> FinWait2 (ACK of local FIN) -> TimeWait
+    // (peer FIN)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        CHECK(table.stateOf(key) == TcpState::FinWait1);
+
+        if (fin) {
+            table.handle(key, makeAck(8080, 54321, 1001, fin->sequence_number + 1), t0);
+            CHECK(table.stateOf(key) == TcpState::FinWait2);
+
+            auto result =
+                table.handle(key, makeFin(8080, 54321, 1001, fin->sequence_number + 1), t0);
+            CHECK(result.peer_closed);
+            CHECK(table.stateOf(key) == TcpState::TimeWait);
+            CHECK(result.reply.has_value());
+        }
+        (void)server_isn;
+    }
+
+    // --- Simultaneous close ---
+
+    // FinWait1 -- peer FIN not ACKing local FIN --> Closing --ACK--> TimeWait
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        (void)server_isn;
+
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        CHECK(table.stateOf(key) == TcpState::FinWait1);
+
+        if (fin) {
+            // Peer's FIN arrives without acknowledging our FIN.
+            auto result = table.handle(key, makeFin(8080, 54321, 1001, fin->sequence_number), t0);
+            CHECK(result.peer_closed);
+            CHECK(table.stateOf(key) == TcpState::Closing);
+
+            table.handle(key, makeAck(8080, 54321, 1002, fin->sequence_number + 1), t0);
+            CHECK(table.stateOf(key) == TcpState::TimeWait);
+        }
+    }
+
+    // FinWait1 -- a single segment carrying both an acceptable FIN and a
+    // valid ACK of the local FIN --> TimeWait directly
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        CHECK(table.stateOf(key) == TcpState::FinWait1);
+
+        if (fin) {
+            auto result = table.handle(
+                key, makeFin(8080, 54321, 1001, fin->sequence_number + 1), t0);
+            CHECK(result.peer_closed);
+            CHECK(table.stateOf(key) == TcpState::TimeWait);
+        }
+    }
+
+    // --- TIME_WAIT ---
+
+    // no expiration before 60s, expiration exactly at the deadline
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        if (fin) {
+            table.handle(key, makeAck(8080, 54321, 1001, fin->sequence_number + 1), t0);
+            table.handle(key, makeFin(8080, 54321, 1001, fin->sequence_number + 1), t0);
+        }
+        CHECK(table.stateOf(key) == TcpState::TimeWait);
+
+        auto too_early = table.pollRetransmissions(t0 + kTimeWaitDuration - std::chrono::milliseconds(1));
+        CHECK(too_early.time_wait_expired.empty());
+        CHECK(table.stateOf(key).has_value());
+
+        auto at_deadline = table.pollRetransmissions(t0 + kTimeWaitDuration);
+        CHECK(at_deadline.time_wait_expired.size() == 1);
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // duplicate FIN in TimeWait restarts the deadline, sends the current
+    // pure ACK, and is never queued
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        std::uint32_t local_fin_seq = fin ? fin->sequence_number : 0;
+        if (fin) {
+            table.handle(key, makeAck(8080, 54321, 1001, local_fin_seq + 1), t0);
+            table.handle(key, makeFin(8080, 54321, 1001, local_fin_seq + 1), t0);
+        }
+        CHECK(table.stateOf(key) == TcpState::TimeWait);
+
+        auto restart_time = t0 + kTimeWaitDuration - std::chrono::seconds(1);
+        auto duplicate =
+            table.handle(key, makeFin(8080, 54321, 1001, local_fin_seq + 1), restart_time);
+        CHECK(!duplicate.peer_closed);
+        CHECK(duplicate.reply.has_value());
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->pending_count == 0);
+        }
+
+        // Original deadline (t0 + kTimeWaitDuration) has now passed, but
+        // the restart pushed it to restart_time + kTimeWaitDuration.
+        auto not_yet = table.pollRetransmissions(t0 + kTimeWaitDuration);
+        CHECK(not_yet.time_wait_expired.empty());
+        CHECK(table.stateOf(key).has_value());
+
+        auto expired = table.pollRetransmissions(restart_time + kTimeWaitDuration);
+        CHECK(expired.time_wait_expired.size() == 1);
+    }
+
+    // --- Inbound RST ---
+
+    // valid RST removes a synchronized connection, no response, no
+    // pending transmissions survive
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.makeOutgoingData(key, toBytes("data"), t0); // leaves a pending entry
+
+        auto result = table.handle(key, makeRst(8080, 54321, 1001), t0);
+        CHECK(result.connection_reset);
+        CHECK(!result.reply.has_value());
+        CHECK(!table.stateOf(key).has_value());
+
+        auto due = table.pollRetransmissions(t0 + kMaxRto * kMaxRetransmits);
+        CHECK(due.retransmissions.empty());
+        (void)server_isn;
+    }
+
+    // invalid-sequence RST is ignored: connection survives unchanged
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+
+        auto result = table.handle(key, makeRst(8080, 54321, 999999), t0);
+        CHECK(!result.connection_reset);
+        CHECK(!result.reply.has_value());
+        CHECK(table.stateOf(key) == TcpState::Established);
+    }
+
+    // RST accepted during SynReceived only when it acknowledges the
+    // outstanding SYN-ACK
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto syn_ack = table.handle(key, makeSyn(8080, 54321, 5000), t0).reply;
+        CHECK(syn_ack.has_value());
+
+        auto wrong = table.handle(key, makeRst(8080, 54321, 1), t0);
+        CHECK(!wrong.reply.has_value());
+        CHECK(table.stateOf(key) == TcpState::SynReceived);
+
+        auto accepted = table.handle(key, makeRst(8080, 54321, 5001), t0);
+        CHECK(!accepted.reply.has_value());
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // an incoming RST for an unknown connection is silently ignored (no
+    // response, no state created)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+
+        auto result = table.handle(key, makeRst(8080, 54321, 1), t0);
+        CHECK(!result.reply.has_value());
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // --- Closed-port RST: wraparound ---
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+
+        TcpSegment incoming;
+        incoming.source_port = 54321;
+        incoming.destination_port = 8080;
+        incoming.sequence_number = 0xffffffff;
+        incoming.payload = toBytes({1, 2, 3, 4});
+        incoming.flags.ack = false;
+        incoming.window_size = 65535;
+
+        auto reply = table.handle(key, incoming, t0).reply;
+        CHECK(reply.has_value());
+        if (reply) {
+            CHECK(reply->flags.rst);
+            CHECK(reply->flags.ack);
+            CHECK(reply->sequence_number == 0);
+            CHECK(reply->acknowledgment_number == 3); // 0xffffffff + 4 wraps to 3
+        }
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // --- FIN retransmission regression: backoff, ACK retirement, exhaustion ---
+
+    // backoff sequence identical to data's: 1s, 2s, 4s, 8s, 8s
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+
+        auto t = t0;
+        std::vector<TcpClock::duration> offsets = {kInitialRto, std::chrono::milliseconds(2000),
+                                                     std::chrono::milliseconds(4000),
+                                                     std::chrono::milliseconds(8000),
+                                                     std::chrono::milliseconds(8000)};
+        for (std::size_t i = 0; i < offsets.size(); ++i) {
+            t += offsets[i];
+            auto due = table.pollRetransmissions(t);
+            CHECK(due.retransmissions.size() == 1);
+            if (due.retransmissions.size() == 1 && fin) {
+                CHECK(due.retransmissions[0].segment.sequence_number == fin->sequence_number);
+                CHECK(due.retransmissions[0].segment.flags.fin);
+            }
+        }
+    }
+
+    // ACK retires the pending FIN; no further retransmission occurs
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        if (fin) {
+            table.handle(key, makeAck(8080, 54321, 1001, fin->sequence_number + 1), t0);
+        }
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->pending_count == 0);
+        }
+
+        auto due = table.pollRetransmissions(t0 + kMaxRto * kMaxRetransmits);
+        CHECK(due.retransmissions.empty());
+    }
+
+    // exhaustion removes the connection; a second, unrelated connection
+    // is unaffected
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key_a{localIp(), 8080, remoteIp(), 11111};
+        TcpConnectionKey key_b{localIp(), 8080, remoteIp(), 22222};
+        establish(table, key_a, 1000);
+        establish(table, key_b, 2000);
+
+        auto fin_a = table.beginClose(key_a, t0);
+        CHECK(fin_a.has_value());
+
+        auto t = t0;
+        std::vector<TcpClock::duration> offsets = {kInitialRto, std::chrono::milliseconds(2000),
+                                                     std::chrono::milliseconds(4000),
+                                                     std::chrono::milliseconds(8000),
+                                                     std::chrono::milliseconds(8000)};
+        for (auto offset : offsets) {
+            t += offset;
+            table.pollRetransmissions(t);
+        }
+        t += std::chrono::milliseconds(8000);
+        auto exhausted = table.pollRetransmissions(t);
+        CHECK(exhausted.timed_out.size() == 1);
+        if (exhausted.timed_out.size() == 1) {
+            CHECK(exhausted.timed_out[0] == key_a);
+        }
+        CHECK(!table.stateOf(key_a).has_value());
+        CHECK(table.stateOf(key_b) == TcpState::Established);
     }
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;
