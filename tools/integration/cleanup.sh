@@ -79,16 +79,18 @@ ws_cleanup() {
         ws_cleanup_kill_recorded "${WS_EVIDENCE_DIR}/${WS_WIRESTACK_PIDFILE_NAME}" "wirestack"
         ws_cleanup_kill_recorded "$(ws_client_pidfile)" "client namespace placeholder"
 
-        # Any tcpdump/tc processes this run started record their own pid
-        # files under WS_EVIDENCE_DIR; sweep them so a failed run does not
-        # leave a capture process running.
+        # Any tcpdump capture or background Python test client this run
+        # started records its own pid file under WS_EVIDENCE_DIR (see
+        # ws_capture_start, and the http_retrans/synack_loss client pid
+        # files in run.sh); sweep them so a scenario that returns early
+        # does not leave a capture or client process running.
         local f base
         for f in "${WS_EVIDENCE_DIR}"/*.pid; do
             [ -e "${f}" ] || continue
             base="$(basename "${f}")"
             [ "${base}" = "${WS_WIRESTACK_PIDFILE_NAME}" ] && continue
             [ "${base}" = "${WS_CLIENT_PIDFILE_NAME}" ] && continue
-            ws_cleanup_kill_recorded "${f}" "capture process (${base})"
+            ws_cleanup_kill_recorded "${f}" "background process (${base})"
         done
     else
         ws_log "no WS_EVIDENCE_DIR set; no recorded processes to stop"

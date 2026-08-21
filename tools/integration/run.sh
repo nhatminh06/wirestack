@@ -406,6 +406,12 @@ else:
     sys.exit(1)
 PYEOF
     local client_pid=$!
+    # Recorded so a failure between here and `wait` below (any of the
+    # `return 1`s further down) leaves cleanup.sh's generic *.pid sweep
+    # able to find and identity-verify this background client instead of
+    # orphaning it -- same mechanism ws_capture_start uses for tcpdump.
+    echo "${client_pid}" >"${WS_EVIDENCE_DIR}/http_retrans_client.pid"
+    ws_record_identity "${client_pid}" "${WS_EVIDENCE_DIR}/http_retrans_client.pid" python3
 
     local waited=0
     while ! grep -q "^CONNECTED" "${WS_EVIDENCE_DIR}/http_retrans_client.log" 2>/dev/null; do
@@ -488,6 +494,12 @@ print("OK connected after %.2fs" % (time.time() - start))
 s.close()
 PYEOF
     local client_pid=$!
+    # See the matching comment in ws_test_http_retransmission: recorded
+    # so an early `return 1` in this function does not orphan the
+    # background client -- cleanup.sh's generic sweep will find and
+    # identity-verify it.
+    echo "${client_pid}" >"${WS_EVIDENCE_DIR}/synack_loss_client.pid"
+    ws_record_identity "${client_pid}" "${WS_EVIDENCE_DIR}/synack_loss_client.pid" python3
 
     # Span at least two of wirestack's own 1-second RTO ticks (kInitialRto
     # in include/wirestack/tcp_connection.hpp) while the drop is active.
