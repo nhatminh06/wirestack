@@ -94,6 +94,96 @@ std::uint32_t TcpConnectionTable::availableSendWindow(const Connection& connecti
     return connection.snd_wnd - flight;
 }
 
+std::uint32_t TcpConnectionTable::availableCongestionWindow(const Connection& connection) {
+    std::uint32_t flight = connection.snd_nxt - connection.snd_una;
+    if (flight >= connection.cwnd) {
+        return 0;
+    }
+    return connection.cwnd - flight;
+}
+
+std::uint32_t TcpConnectionTable::clampCwnd(std::uint64_t value) {
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(value, kMaxCongestionWindow));
+}
+
+std::uint32_t TcpConnectionTable::initialCongestionWindow(std::uint16_t smss) {
+    std::uint64_t ten_smss = std::uint64_t{10} * smss;
+    std::uint64_t two_smss = std::uint64_t{2} * smss;
+    std::uint64_t floor_value = std::max<std::uint64_t>(two_smss, kInitialCongestionWindowFloor);
+    return clampCwnd(std::min(ten_smss, floor_value));
+}
+
+void TcpConnectionTable::applyCongestionGrowth(Connection& connection, std::uint32_t data_bytes) {
+    if (data_bytes == 0) {
+        return; // SYN/FIN/pure-ACK acknowledgment carries no application data
+    }
+    std::uint32_t smss = connection.effective_send_mss;
+    if (connection.cwnd < connection.ssthresh) {
+        // Slow Start: one ACK grows cwnd by at most one SMSS, regardless
+        // of how many bytes it cumulatively acknowledges.
+        std::uint32_t increase = std::min(data_bytes, smss);
+        connection.cwnd = clampCwnd(std::uint64_t{connection.cwnd} + increase);
+    } else {
+        // Congestion Avoidance: one SMSS of growth per cwnd of
+        // acknowledged data, applied repeatedly if a single cumulative
+        // ACK crosses more than one window's worth.
+        connection.congestion_avoidance_acked_bytes += data_bytes;
+        while (connection.cwnd > 0 &&
+               connection.congestion_avoidance_acked_bytes >= connection.cwnd) {
+            connection.congestion_avoidance_acked_bytes -= connection.cwnd;
+            connection.cwnd = clampCwnd(std::uint64_t{connection.cwnd} + smss);
+        }
+    }
+}
+
+void TcpConnectionTable::applyTimeoutCongestionCollapse(Connection& connection) {
+    std::uint32_t flight = connection.snd_nxt - connection.snd_una;
+    std::uint32_t smss = connection.effective_send_mss;
+    connection.ssthresh = clampCwnd(std::max<std::uint64_t>(flight / 2, std::uint64_t{2} * smss));
+    connection.cwnd = smss;
+    connection.duplicate_ack_count = 0;
+    connection.in_fast_recovery = false;
+    connection.congestion_avoidance_acked_bytes = 0;
+}
+
+TcpSegment TcpConnectionTable::beginFastRecovery(const TcpConnectionKey& key,
+                                                   Connection& connection,
+                                                   TcpClock::time_point now) {
+    std::uint32_t flight = connection.snd_nxt - connection.snd_una;
+    std::uint32_t smss = connection.effective_send_mss;
+    connection.ssthresh = clampCwnd(std::max<std::uint64_t>(flight / 2, std::uint64_t{2} * smss));
+    connection.recovery_point = connection.snd_nxt;
+    connection.cwnd = clampCwnd(std::uint64_t{connection.ssthresh} + std::uint64_t{3} * smss);
+    connection.in_fast_recovery = true;
+    connection.congestion_avoidance_acked_bytes = 0;
+
+    // The oldest outstanding application-data entry -- never SYN or FIN.
+    // Guaranteed to exist: the caller only reaches here after confirming
+    // an eligible data entry is pending.
+    auto it = std::find_if(connection.pending.begin(), connection.pending.end(),
+                            [](const PendingTransmission& p) { return !p.is_syn && !p.is_fin; });
+    PendingTransmission& entry = *it;
+
+    TcpSegment segment;
+    segment.source_port = key.local_port;
+    segment.destination_port = key.remote_port;
+    segment.sequence_number = entry.sequence_start;
+    segment.acknowledgment_number = connection.rcv_nxt;
+    segment.flags = entry.flags;
+    segment.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
+    segment.urgent_pointer = 0;
+    segment.payload = entry.payload;
+
+    // Karn ambiguity, not a timeout retry: restart this entry's deadline
+    // from now without doubling its timeout_interval, touching the
+    // connection's current_rto, incrementing timeout_retransmit_count, or
+    // changing first_sent_at.
+    entry.was_retransmitted = true;
+    entry.last_sent_at = now;
+
+    return segment;
+}
+
 std::uint32_t TcpConnectionTable::decodePeerWindow(const Connection& connection,
                                                      std::uint16_t raw) {
     if (!connection.window_scaling_enabled) {
@@ -194,12 +284,16 @@ void TcpConnectionTable::recordRttSample(Connection& connection, TcpClock::durat
     connection.current_rto = std::clamp<TcpClock::duration>(rto, kMinRto, kMaxRto);
 }
 
-void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_t ack,
-                                             TcpClock::time_point now) {
+TcpConnectionTable::TcpAckRetirementResult TcpConnectionTable::retireAcknowledged(
+    Connection& connection, std::uint32_t ack, TcpClock::time_point now) {
+    TcpAckRetirementResult result;
     if (!sequenceGreater(ack, connection.snd_una)) {
-        return; // duplicate or stale ACK -- queue and snd_una both unchanged
+        return result; // duplicate or stale ACK -- queue and snd_una both unchanged
     }
+    result.ack_advanced = true;
+    std::uint32_t old_snd_una = connection.snd_una;
     connection.snd_una = ack;
+    result.newly_acked_sequence_space = ack - old_snd_una;
 
     // Newest (last-processed, since entries are in send order) entry
     // covered -- fully or partially -- by this ack that was never
@@ -215,7 +309,8 @@ void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_
     while (!pending.empty()) {
         auto& entry = pending.front();
         if (sequenceLessOrEqual(entry.sequenceEnd(), ack)) {
-            if (entry.retransmit_count == 0 && !entry.rtt_sample_taken) {
+            result.newly_acked_data_bytes += static_cast<std::uint32_t>(entry.payload.size());
+            if (!entry.was_retransmitted && !entry.rtt_sample_taken) {
                 sample_first_sent = entry.first_sent_at;
                 sample_entry = nullptr; // this entry is about to be erased
             }
@@ -226,12 +321,14 @@ void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_
             // Partial ACK lands inside this entry. SYN's 1-byte range
             // can never satisfy this (no integer lies strictly between
             // sequence_start and sequence_start + 1), so this only ever
-            // trims a data entry's payload.
-            if (entry.retransmit_count == 0 && !entry.rtt_sample_taken) {
+            // trims a data entry's payload -- newly_acked_data_bytes below
+            // is exactly the trimmed span, never a SYN/FIN control byte.
+            std::uint32_t trimmed = ack - entry.sequence_start;
+            result.newly_acked_data_bytes += trimmed;
+            if (!entry.was_retransmitted && !entry.rtt_sample_taken) {
                 sample_first_sent = entry.first_sent_at;
                 sample_entry = &entry; // survives, trimmed -- mark below
             }
-            std::uint32_t trimmed = ack - entry.sequence_start;
             entry.payload.erase(entry.payload.begin(),
                                  entry.payload.begin() + trimmed);
             entry.sequence_start = ack;
@@ -241,10 +338,13 @@ void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_
 
     if (sample_first_sent && *sample_first_sent <= now) {
         recordRttSample(connection, now - *sample_first_sent);
+        result.rtt_sample_taken = true;
         if (sample_entry) {
             sample_entry->rtt_sample_taken = true;
         }
     }
+
+    return result;
 }
 
 void TcpConnectionTable::startTimeWait(Connection& connection, TcpClock::time_point now) {
@@ -359,8 +459,50 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     if (!sequenceLessOrEqual(segment.acknowledgment_number, connection.snd_nxt)) {
         return {};
     }
-    retireAcknowledged(connection, segment.acknowledgment_number, now);
+    TcpAckRetirementResult ack_result =
+        retireAcknowledged(connection, segment.acknowledgment_number, now);
+    std::uint32_t snd_wnd_before = connection.snd_wnd;
     updateSendWindow(connection, segment);
+    bool window_changed = connection.snd_wnd != snd_wnd_before;
+
+    // Reno-style congestion control (see docs/tcp.md). An advancing ACK
+    // either exits fast recovery (classic Reno: any advancing ACK exits,
+    // even one covering less than recovery_point -- NewReno partial-ACK
+    // recovery is out of scope for this milestone) or applies ordinary
+    // Slow Start/Congestion Avoidance growth. A non-advancing ACK is
+    // checked against the duplicate-ACK definition; the third qualifying
+    // duplicate triggers one fast retransmission, and later qualifying
+    // duplicates while already in recovery inflate cwnd without
+    // retransmitting again.
+    std::optional<TcpSegment> fast_retransmit_segment;
+    if (ack_result.ack_advanced) {
+        connection.duplicate_ack_count = 0;
+        if (connection.in_fast_recovery) {
+            connection.cwnd = connection.ssthresh;
+            connection.in_fast_recovery = false;
+            connection.congestion_avoidance_acked_bytes = 0;
+        } else {
+            applyCongestionGrowth(connection, ack_result.newly_acked_data_bytes);
+        }
+    } else {
+        bool has_outstanding_data = std::any_of(
+            connection.pending.begin(), connection.pending.end(),
+            [](const PendingTransmission& p) { return !p.is_syn && !p.is_fin; });
+        bool is_duplicate_ack = segment.acknowledgment_number == connection.snd_una &&
+                                 segment.payload.empty() && !segment.flags.syn &&
+                                 !segment.flags.fin && !window_changed && has_outstanding_data;
+        if (is_duplicate_ack) {
+            connection.duplicate_ack_count += 1;
+            if (connection.in_fast_recovery) {
+                connection.cwnd = clampCwnd(std::uint64_t{connection.cwnd} +
+                                             connection.effective_send_mss);
+            } else if (connection.duplicate_ack_count == 3) {
+                fast_retransmit_segment = beginFastRecovery(key, connection, now);
+            }
+        } else if (window_changed) {
+            connection.duplicate_ack_count = 0;
+        }
+    }
 
     bool local_fin_acked = connection.local_fin_seq.has_value() &&
                             sequenceLessOrEqual(*connection.local_fin_seq + 1, connection.snd_una);
@@ -381,6 +523,7 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         // is surfaced here.
         TcpReceiveResult result;
         result.connection_closed = connection.pending_removal;
+        result.fast_retransmit = fast_retransmit_segment;
         return result;
     }
 
@@ -417,6 +560,7 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         // nothing, deliver nothing, rcv_nxt unchanged, duplicate ACK.
         TcpReceiveResult result;
         result.reply = makePureAck(key, connection);
+        result.fast_retransmit = fast_retransmit_segment;
         return result;
     }
 
@@ -434,6 +578,7 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
 
     TcpReceiveResult result;
     result.accepted_payload = releaseContiguous(connection);
+    result.fast_retransmit = fast_retransmit_segment;
 
     if (connection.pending_fin_seq && *connection.pending_fin_seq == connection.rcv_nxt) {
         connection.rcv_nxt += 1;
@@ -532,6 +677,11 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
         connection.peer_mss = options.maximum_segment_size.value_or(kDefaultPeerMss);
         connection.effective_send_mss = std::min<std::uint16_t>(
             static_cast<std::uint16_t>(kTcpMss), connection.peer_mss);
+        // Congestion state is initialized only now, once the negotiated
+        // MSS this connection will actually use is fixed; ssthresh needs
+        // no MSS knowledge and is already defaulted in the struct. SYN
+        // and SYN-ACK are never gated by cwnd.
+        connection.cwnd = initialCongestionWindow(connection.effective_send_mss);
         if (options.window_scale) {
             connection.window_scaling_enabled = true;
             connection.peer_window_scale =
@@ -658,6 +808,12 @@ std::optional<TcpConnectionSnapshot> TcpConnectionTable::snapshotOf(
         connection.srtt,
         connection.rttvar,
         connection.current_rto,
+        connection.cwnd,
+        connection.ssthresh,
+        connection.duplicate_ack_count,
+        connection.in_fast_recovery,
+        connection.recovery_point,
+        connection.congestion_avoidance_acked_bytes,
     };
 }
 
@@ -682,8 +838,16 @@ TcpSendResult TcpConnectionTable::makeOutgoingData(const TcpConnectionKey& key,
     }
     Connection& connection = it->second;
 
-    if (payload.size() > availableSendWindow(connection)) {
-        result.error = TcpSendError::WindowTooSmall;
+    // New application data is gated by both limits; whichever is smaller
+    // is reported as the rejection reason. A tie (equal availability)
+    // reports WindowTooSmall -- an arbitrary but documented tie-break,
+    // since either is equally true and only one error value can be
+    // returned.
+    std::uint32_t rwnd_available = availableSendWindow(connection);
+    std::uint32_t cwnd_available = availableCongestionWindow(connection);
+    if (payload.size() > rwnd_available || payload.size() > cwnd_available) {
+        result.error = (cwnd_available < rwnd_available) ? TcpSendError::CongestionWindowTooSmall
+                                                           : TcpSendError::WindowTooSmall;
         return result;
     }
 
@@ -801,10 +965,21 @@ TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_poin
             continue;
         }
 
-        if (oldest.retransmit_count >= kMaxRetransmits) {
+        if (oldest.timeout_retransmit_count >= kMaxRetransmits) {
             result.timed_out.push_back(it->first);
             it = connections_.erase(it);
             continue;
+        }
+
+        if (!oldest.is_syn && !oldest.is_fin) {
+            // Congestion collapse applies once per timeout event, only
+            // for an established application-data segment -- SYN-ACK and
+            // FIN timeouts preserve existing retransmission behavior
+            // without touching application-data congestion state. Safe
+            // against a second poll at the same instant: last_sent_at is
+            // set to `now` below, so the entry's deadline cannot be due
+            // again until strictly later.
+            applyTimeoutCongestionCollapse(connection);
         }
 
         TcpSegment segment;
@@ -829,7 +1004,8 @@ TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_poin
             segment.options = buildSynAckOptions(connection);
         }
 
-        oldest.retransmit_count += 1;
+        oldest.timeout_retransmit_count += 1;
+        oldest.was_retransmitted = true;
         oldest.last_sent_at = now;
         oldest.timeout_interval = std::min<TcpClock::duration>(oldest.timeout_interval * 2, kMaxRto);
         // The connection's own RTO reflects this backed-off value too, so

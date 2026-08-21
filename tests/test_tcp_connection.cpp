@@ -4,7 +4,9 @@
 
 using wirestack::Ipv4Address;
 using wirestack::kInitialRto;
+using wirestack::kInitialSsthresh;
 using wirestack::kMaxApplicationSendSize;
+using wirestack::kMaxCongestionWindow;
 using wirestack::kMaxRetransmits;
 using wirestack::kMaxReassemblyFragments;
 using wirestack::kMaxRto;
@@ -2446,7 +2448,12 @@ int main() {
     }
 
     // segment-count bound: a tiny negotiated peer MSS cannot fragment a
-    // send into an unbounded number of segments
+    // send into an unbounded number of segments. With a fresh connection
+    // the initial congestion window (10*SMSS = 10 bytes here) is smaller
+    // than kMaxSegmentsPerSend+1 bytes, so it is now the binding rejection
+    // reason rather than the segment-count bound -- the milestone-12
+    // congestion tests separately grow cwnd and confirm the segment-count
+    // bound still fires once congestion is no longer the constraint.
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
@@ -2454,7 +2461,7 @@ int main() {
         auto before = table.snapshotOf(key);
         auto sent = table.makeOutgoingData(key, makeFilledPayload(kMaxSegmentsPerSend + 1), t0);
         CHECK(sent.segments.empty());
-        CHECK(sent.error == TcpSendError::TooLarge);
+        CHECK(sent.error == TcpSendError::CongestionWindowTooSmall);
         auto after = table.snapshotOf(key);
         CHECK(before.has_value() && after.has_value());
         if (before && after) CHECK(after->snd_nxt == before->snd_nxt);
@@ -3194,6 +3201,835 @@ int main() {
                 CHECK((after_new_sample->srtt != after_first_sample->srtt) ||
                       (after_new_sample->current_rto != after_first_sample->current_rto));
             }
+        }
+    }
+
+    // ================= Milestone 12: congestion-control initialization =================
+
+    {
+        auto check = [&](std::uint16_t peer_mss, std::uint32_t expected_cwnd) {
+            TcpConnectionTable table(8080);
+            TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+            establishWithPeerMss(table, key, 1000, peer_mss, t0); // handshake ACK acks only the SYN-ACK
+            auto snapshot = table.snapshotOf(key);
+            CHECK(snapshot.has_value());
+            if (snapshot) {
+                CHECK(snapshot->cwnd == expected_cwnd);
+                CHECK(snapshot->ssthresh == kInitialSsthresh);
+                CHECK(snapshot->duplicate_ack_count == 0);
+                CHECK(!snapshot->in_fast_recovery);
+                CHECK(snapshot->congestion_avoidance_acked_bytes == 0);
+            }
+        };
+        check(1460, 14600);
+        check(1200, 12000);
+        check(536, 5360);
+        check(1, 10);
+    }
+
+    // ================= Milestone 12: send-gating tests =================
+
+    // payload exactly fills cwnd_available; one byte more is rejected atomically
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0); // SMSS 1460 -> cwnd 14600, rwnd 65535
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+
+        auto exact = table.makeOutgoingData(key, makeFilledPayload(14600), t0);
+        CHECK(exact.segments.size() == 10); // ceil(14600/1460)
+        CHECK(exact.bytes_accepted == 14600);
+    }
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+
+        auto over = table.makeOutgoingData(key, makeFilledPayload(14601), t0);
+        CHECK(over.segments.empty());
+        CHECK(over.error == TcpSendError::CongestionWindowTooSmall);
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->snd_nxt == before->snd_nxt);
+            CHECK(after->pending_count == before->pending_count);
+        }
+    }
+
+    // peer window smaller than cwnd: rwnd controls, reported as WindowTooSmall
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 5000, t0); // rwnd=5000 < cwnd=14600
+        auto ok = table.makeOutgoingData(key, makeFilledPayload(5000), t0);
+        CHECK(ok.bytes_accepted == 5000);
+    }
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 5000, t0);
+        auto rejected = table.makeOutgoingData(key, makeFilledPayload(5001), t0);
+        CHECK(rejected.segments.empty());
+        CHECK(rejected.error == TcpSendError::WindowTooSmall);
+    }
+
+    // cwnd smaller than peer window: cwnd controls, reported as CongestionWindowTooSmall
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithPeerMss(table, key, 1000, std::uint16_t{200}, t0); // cwnd = 10*200 = 2000
+        auto rejected = table.makeOutgoingData(key, makeFilledPayload(2001), t0);
+        CHECK(rejected.segments.empty());
+        CHECK(rejected.error == TcpSendError::CongestionWindowTooSmall);
+    }
+
+    // both limits equal: documented tie-break reports WindowTooSmall
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 14600, t0); // rwnd == cwnd == 14600
+        auto rejected = table.makeOutgoingData(key, makeFilledPayload(14601), t0);
+        CHECK(rejected.segments.empty());
+        CHECK(rejected.error == TcpSendError::WindowTooSmall);
+    }
+
+    // retransmission remains permitted even with zero new-data allowance
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(14600), t0); // fills cwnd exactly
+        CHECK(sent.bytes_accepted == 14600);
+        auto blocked = table.makeOutgoingData(key, toBytes("x"), t0);
+        CHECK(blocked.error == TcpSendError::CongestionWindowTooSmall);
+
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1); // still retransmits despite zero availability
+    }
+
+    // FIN preserves its narrow rwnd-only gating: exhausted cwnd does not block it
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(14600), t0); // cwnd exhausted
+        CHECK(sent.bytes_accepted == 14600);
+        auto blocked = table.makeOutgoingData(key, toBytes("x"), t0);
+        CHECK(blocked.error == TcpSendError::CongestionWindowTooSmall);
+
+        auto fin = table.beginClose(key, t0); // rwnd (65535) still has room
+        CHECK(fin.has_value());
+    }
+
+    // wraparound flight-size calculation
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 0xffffffff - 10, t0); // crosses the sequence-number boundary
+        auto sent = table.makeOutgoingData(key, toBytes("abcdefghij"), t0);
+        CHECK(sent.bytes_accepted == 10);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->cwnd >= 10); // congestion window still computed correctly across the wrap
+        }
+    }
+
+    // ================= Milestone 12: Slow Start tests =================
+
+    // exact vector: SMSS 1460 -> cwnd 14600 -> ACK full segment -> 16060 -> ACK another -> 17520
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto snap0 = table.snapshotOf(key);
+        CHECK(snap0.has_value());
+        if (snap0) CHECK(snap0->cwnd == 14600);
+
+        auto sent1 = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+        CHECK(sent1.segments.size() == 1);
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   sent1.segments.front().sequence_number + 1460),
+                     t0);
+        auto snap1 = table.snapshotOf(key);
+        CHECK(snap1.has_value());
+        if (snap1) CHECK(snap1->cwnd == 16060);
+
+        auto sent2 = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+        CHECK(sent2.segments.size() == 1);
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   sent2.segments.front().sequence_number + 1460),
+                     t0);
+        auto snap2 = table.snapshotOf(key);
+        CHECK(snap2.has_value());
+        if (snap2) CHECK(snap2->cwnd == 17520);
+    }
+
+    // one partial-MSS ACK grows cwnd by exactly the acked bytes
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(500), t0);
+        CHECK(sent.segments.size() == 1);
+        table.handle(key, makeAck(8080, 54321, 1001, sent.segments.front().sequence_number + 500),
+                     t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->cwnd == 14600 + 500);
+    }
+
+    // a cumulative ACK covering more than one MSS grows cwnd by at most one MSS
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(3 * 1460), t0);
+        CHECK(sent.segments.size() == 3);
+        // One cumulative ACK covering all three segments (4380 bytes).
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   sent.segments.back().sequence_number +
+                                       static_cast<std::uint32_t>(sent.segments.back().payload.size())),
+                     t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->cwnd == 14600 + 1460); // capped to one SMSS, not 4380
+    }
+
+    // ACK of FIN alone does not grow cwnd
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        if (fin) {
+            table.handle(key, makeAck(8080, 54321, 1001, fin->sequence_number + 1), t0);
+        }
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) CHECK(after->cwnd == before->cwnd);
+    }
+
+    // a duplicate (non-advancing) ACK does not use Slow Start growth
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+        CHECK(sent.segments.size() == 1);
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        table.handle(key, makeAck(8080, 54321, 1001, sent.segments.front().sequence_number), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, sent.segments.front().sequence_number), t0);
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) CHECK(after->cwnd == before->cwnd);
+    }
+
+    // crossing ssthresh: a timeout sets a small ssthresh, then one ACK's Slow
+    // Start growth lands cwnd exactly on it, and the NEXT ACK uses
+    // Congestion Avoidance instead (no growth, since it acked less than one
+    // full cwnd) -- proving the two growth rules are never both applied to
+    // the same acknowledged bytes.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+        auto lost = table.makeOutgoingData(key, makeFilledPayload(3000), t0); // flight = 3000
+        CHECK(!lost.segments.empty());
+        auto due = table.pollRetransmissions(t0 + kInitialRto); // timeout collapse
+        CHECK(due.retransmissions.size() == 1);
+        auto after_timeout = table.snapshotOf(key);
+        CHECK(after_timeout.has_value());
+        if (after_timeout) {
+            CHECK(after_timeout->ssthresh == 2920); // max(3000/2, 2*1460)
+            CHECK(after_timeout->cwnd == 1460);      // SMSS
+        }
+
+        auto t1 = t0 + kInitialRto;
+        // Free the still-outstanding original 3000 bytes (Karn's rule
+        // prevents a sample from this retransmitted flight) before
+        // sending new data. This ACK itself is Slow Start's growth step
+        // (cwnd 1460 < ssthresh 2920): increase = min(3000, 1460) = 1460,
+        // landing cwnd exactly on ssthresh (2920) -- the boundary.
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   lost.segments.back().sequence_number +
+                                       static_cast<std::uint32_t>(
+                                           lost.segments.back().payload.size())),
+                     t1);
+        auto snap0 = table.snapshotOf(key);
+        CHECK(snap0.has_value());
+        if (snap0) CHECK(snap0->cwnd == 2920); // == ssthresh exactly, one SS step only
+
+        // The next ACK, for new data, now uses Congestion Avoidance
+        // instead: it acked less than one full cwnd (1460 < 2920), so no
+        // growth yet -- proving Slow Start and Congestion Avoidance were
+        // never both applied to the same acknowledged bytes.
+        auto sent1 = table.makeOutgoingData(key, makeFilledPayload(1460), t1);
+        CHECK(sent1.segments.size() == 1);
+        if (sent1.segments.size() != 1) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   sent1.segments.front().sequence_number + 1460),
+                     t1);
+        auto snap1 = table.snapshotOf(key);
+        CHECK(snap1.has_value());
+        if (snap1) {
+            CHECK(snap1->cwnd == 2920); // Congestion Avoidance: 1460 < cwnd(2920), no growth yet
+            CHECK(snap1->congestion_avoidance_acked_bytes == 1460);
+        }
+    }
+
+    // ================= Milestone 12: Congestion Avoidance tests =================
+
+    {
+        // Enter Congestion Avoidance directly by starting from a timeout
+        // that sets ssthresh == cwnd's next value (see boundary test
+        // above for the crossing itself); here cwnd == ssthresh == 2920
+        // from the outset.
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+        auto lost = table.makeOutgoingData(key, makeFilledPayload(5840), t0); // flight = 5840
+        CHECK(!lost.segments.empty());
+        table.pollRetransmissions(t0 + kInitialRto); // ssthresh = max(2920,2920) = 2920, cwnd = 1460
+        auto t1 = t0 + kInitialRto;
+        // Acknowledging the still-outstanding original flight both frees
+        // it for new sends and is itself the Slow Start step that lands
+        // cwnd exactly on ssthresh: increase = min(5840, 1460) = 1460.
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   lost.segments.back().sequence_number +
+                                       static_cast<std::uint32_t>(
+                                           lost.segments.back().payload.size())),
+                     t1);
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(snap->cwnd == 2920 && snap->ssthresh == 2920); // now in CA
+
+        // No growth before one cwnd (2920) of data is acknowledged.
+        auto s1 = table.makeOutgoingData(key, makeFilledPayload(1000), t1);
+        CHECK(s1.segments.size() == 1);
+        table.handle(key, makeAck(8080, 54321, 1001, s1.segments.front().sequence_number + 1000), t1);
+        auto snap_partial = table.snapshotOf(key);
+        CHECK(snap_partial.has_value());
+        if (snap_partial) {
+            CHECK(snap_partial->cwnd == 2920);
+            CHECK(snap_partial->congestion_avoidance_acked_bytes == 1000);
+        }
+
+        // Exact threshold (2920 total, 1920 more) produces exactly one
+        // SMSS of growth and resets the accumulator.
+        auto s2 = table.makeOutgoingData(key, makeFilledPayload(1920), t1);
+        CHECK(s2.segments.size() == 2); // 1460 + 460
+        table.handle(key, makeAck(8080, 54321, 1001, s2.segments.back().sequence_number +
+                                                           static_cast<std::uint32_t>(
+                                                               s2.segments.back().payload.size())),
+                     t1);
+        auto snap_threshold = table.snapshotOf(key);
+        CHECK(snap_threshold.has_value());
+        if (snap_threshold) {
+            CHECK(snap_threshold->cwnd == 2920 + 1460);
+            CHECK(snap_threshold->congestion_avoidance_acked_bytes == 0);
+        }
+
+        // A large cumulative ACK filling the entire current window in one
+        // shot still produces exactly the correct growth (one SMSS) and
+        // an exactly-zero remainder, safely -- the "repeat while the
+        // accumulator still reaches cwnd" loop is exercised the same way
+        // it would be for a multi-window jump, just with a single
+        // crossing here: since every legitimate atomic send is itself
+        // gated by the current cwnd (see "New application-data allowance"
+        // in docs/tcp.md), one ACK can never newly-acknowledge more than
+        // one window's worth of data under ordinary operation, so a
+        // literal multi-threshold single-ACK crossing is not organically
+        // reachable through the public send/ack API -- documented as a
+        // structural, not tested, consequence of correct cwnd gating.
+        auto s3 = table.makeOutgoingData(key, makeFilledPayload(4380), t1); // exactly cwnd
+        CHECK(s3.segments.size() == 3);
+        if (s3.segments.empty()) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   s3.segments.back().sequence_number +
+                                       static_cast<std::uint32_t>(s3.segments.back().payload.size())),
+                     t1);
+        auto snap_large = table.snapshotOf(key);
+        CHECK(snap_large.has_value());
+        if (snap_large) {
+            CHECK(snap_large->cwnd == 4380 + 1460); // 5840
+            CHECK(snap_large->congestion_avoidance_acked_bytes == 0);
+        }
+    }
+
+    // loss resets the accumulator
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+        auto lost = table.makeOutgoingData(key, makeFilledPayload(5840), t0);
+        CHECK(!lost.segments.empty());
+        table.pollRetransmissions(t0 + kInitialRto); // ssthresh=2920, cwnd=1460
+        auto t1 = t0 + kInitialRto;
+        // Frees flight and is itself the Slow Start step landing cwnd on
+        // ssthresh (2920), same as the Congestion Avoidance test above.
+        table.handle(key, makeAck(8080, 54321, 1001,
+                                   lost.segments.back().sequence_number +
+                                       static_cast<std::uint32_t>(
+                                           lost.segments.back().payload.size())),
+                     t1);
+        auto s1 = table.makeOutgoingData(key, makeFilledPayload(1000), t1); // partial CA credit
+        CHECK(s1.segments.size() == 1);
+        if (s1.segments.size() != 1) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        table.handle(key, makeAck(8080, 54321, 1001, s1.segments.front().sequence_number + 1000), t1);
+        auto before_loss = table.snapshotOf(key);
+        CHECK(before_loss.has_value());
+        if (before_loss) CHECK(before_loss->congestion_avoidance_acked_bytes == 1000);
+
+        auto more = table.makeOutgoingData(key, makeFilledPayload(1460), t1);
+        CHECK(more.segments.size() == 1);
+        auto due2 = table.pollRetransmissions(t1 + before_loss->current_rto);
+        CHECK(due2.retransmissions.size() == 1);
+        auto after_loss = table.snapshotOf(key);
+        CHECK(after_loss.has_value());
+        if (after_loss) CHECK(after_loss->congestion_avoidance_acked_bytes == 0);
+    }
+
+    // ================= Milestone 12: duplicate-ACK classification =================
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+        CHECK(sent.segments.size() == 1);
+        std::uint32_t seq = sent.segments.front().sequence_number;
+
+        // first and second duplicate: count increases, no other effect
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        auto after1 = table.snapshotOf(key);
+        CHECK(after1.has_value());
+        if (after1) CHECK(after1->duplicate_ack_count == 1);
+
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        auto after2 = table.snapshotOf(key);
+        CHECK(after2.has_value());
+        if (after2) {
+            CHECK(after2->duplicate_ack_count == 2);
+            CHECK(!after2->in_fast_recovery);
+        }
+
+        // future ACK (beyond snd_nxt) is dropped entirely, count untouched
+        auto future_result =
+            table.handle(key, makeAck(8080, 54321, 1001, after2->snd_nxt + 100000), t0);
+        CHECK(!future_result.reply.has_value());
+        auto after_future = table.snapshotOf(key);
+        CHECK(after_future.has_value());
+        if (after_future) CHECK(after_future->duplicate_ack_count == 2);
+
+        // stale ACK (below snd_una, i.e. below the connection's ISN+1) is
+        // simply not equal to snd_una -- not counted, and not a reset
+        // trigger either.
+        auto stale = makeAck(8080, 54321, 1001, server_isn); // < snd_una
+        table.handle(key, stale, t0);
+        auto after_stale = table.snapshotOf(key);
+        CHECK(after_stale.has_value());
+        if (after_stale) CHECK(after_stale->duplicate_ack_count == 2);
+
+        // ACK carrying data is excluded from duplicate counting
+        auto with_data = makeData(8080, 54321, 1001, seq, toBytes("x"));
+        table.handle(key, with_data, t0);
+        auto after_data = table.snapshotOf(key);
+        CHECK(after_data.has_value());
+        if (after_data) CHECK(after_data->duplicate_ack_count == 2);
+
+        // FIN|ACK is excluded from duplicate counting
+        auto fin_ack = makeAck(8080, 54321, 1001, seq);
+        fin_ack.flags.fin = true;
+        table.handle(key, fin_ack, t0);
+        auto after_fin = table.snapshotOf(key);
+        CHECK(after_fin.has_value());
+        if (after_fin) CHECK(after_fin->duplicate_ack_count == 2);
+
+        // SYN|ACK is dropped entirely in a synchronized state
+        auto syn_ack = makeAck(8080, 54321, 1001, seq);
+        syn_ack.flags.syn = true;
+        auto syn_ack_result = table.handle(key, syn_ack, t0);
+        CHECK(!syn_ack_result.reply.has_value());
+        auto after_syn = table.snapshotOf(key);
+        CHECK(after_syn.has_value());
+        if (after_syn) CHECK(after_syn->duplicate_ack_count == 2);
+
+        // an unacceptable RST (wrong sequence number) changes nothing
+        auto bad_rst = makeRst(8080, 54321, 1001);
+        table.handle(key, bad_rst, t0);
+        auto after_rst = table.snapshotOf(key);
+        CHECK(after_rst.has_value());
+        if (after_rst) CHECK(after_rst->duplicate_ack_count == 2);
+
+        // a changed advertised window disqualifies AND resets the count
+        auto window_update = makeWindowUpdate(8080, 54321, 1001, seq, 40000);
+        table.handle(key, window_update, t0);
+        auto after_window = table.snapshotOf(key);
+        CHECK(after_window.has_value());
+        if (after_window) CHECK(after_window->duplicate_ack_count == 0);
+
+        // Restore the window to the 65535 that plain makeAck() advertises,
+        // so the remaining duplicate ACKs below don't themselves register
+        // as window changes against the just-updated 40000.
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, seq, 65535), t0);
+
+        // third qualifying duplicate (fresh count from here) triggers fast retransmit
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        auto third = table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        CHECK(third.fast_retransmit.has_value());
+        auto after_third = table.snapshotOf(key);
+        CHECK(after_third.has_value());
+        if (after_third) CHECK(after_third->in_fast_recovery);
+
+        // an advancing ACK resets the count (and exits recovery)
+        table.handle(key, makeAck(8080, 54321, 1001, seq + 1460), t0);
+        auto after_advance = table.snapshotOf(key);
+        CHECK(after_advance.has_value());
+        if (after_advance) {
+            CHECK(after_advance->duplicate_ack_count == 0);
+            CHECK(!after_advance->in_fast_recovery);
+        }
+    }
+
+    // no outstanding data: a duplicate-looking ACK after the queue is
+    // fully drained does not count
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(sent.segments.size() == 1);
+        table.handle(key, makeAck(8080, 54321, 1001, sent.segments.front().sequence_number + 100),
+                     t0); // fully drains the queue
+        auto drained = table.snapshotOf(key);
+        CHECK(drained.has_value());
+        if (drained) CHECK(drained->pending_count == 0);
+
+        table.handle(key, makeAck(8080, 54321, 1001, sent.segments.front().sequence_number + 100),
+                     t0); // ack == snd_una, but nothing outstanding
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) CHECK(after->duplicate_ack_count == 0);
+    }
+
+    // ACK for an outstanding FIN but no outstanding data does not count
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        if (before) CHECK(before->pending_count == 1); // only the FIN is outstanding
+
+        table.handle(key, makeAck(8080, 54321, 1001, before->snd_una), t0); // ack == snd_una
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) CHECK(after->duplicate_ack_count == 0);
+    }
+
+    // ================= Milestone 12: fast retransmit and fast recovery =================
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 5; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+            CHECK(sent.segments.size() == 1);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 5);
+        if (sent_segments.size() != 5) return wirestack::test::failureCount() == 0 ? 0 : 1;
+
+        std::uint32_t seg2_seq = sent_segments[1].sequence_number;
+        auto seg2_payload = sent_segments[1].payload;
+        auto before_snd_nxt = table.snapshotOf(key);
+        CHECK(before_snd_nxt.has_value());
+
+        // Segment 1 acknowledged (advances snd_una to the start of segment 2).
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+
+        // Segments 3, 4, 5 arrive out of order behind the missing segment 2:
+        // three duplicate ACKs, each still acknowledging up to seg2_seq.
+        auto dup1 = table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        CHECK(!dup1.fast_retransmit.has_value());
+        auto dup2 = table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        CHECK(!dup2.fast_retransmit.has_value());
+        auto dup3 = table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        CHECK(dup3.fast_retransmit.has_value());
+
+        if (dup3.fast_retransmit) {
+            CHECK(dup3.fast_retransmit->sequence_number == seg2_seq);
+            CHECK(dup3.fast_retransmit->payload == seg2_payload);
+            CHECK(dup3.fast_retransmit->flags.ack);
+        }
+
+        auto after_fr = table.snapshotOf(key);
+        CHECK(after_fr.has_value());
+        if (after_fr && before_snd_nxt) {
+            CHECK(after_fr->snd_nxt == before_snd_nxt->snd_nxt); // unchanged
+            CHECK(after_fr->snd_una == seg2_seq);                // unchanged by the dup ACKs
+            // flight at the moment of the 3rd duplicate = 4 segments still
+            // outstanding (2,3,4,5) = 5840; ssthresh = max(2920,2920).
+            CHECK(after_fr->ssthresh == 2920);
+            CHECK(after_fr->cwnd == 2920 + 3 * 1460);
+            CHECK(after_fr->in_fast_recovery);
+            CHECK(after_fr->recovery_point == after_fr->snd_nxt);
+        }
+
+        // The retransmitted entry's deadline was only refreshed, not
+        // doubled: it is due again after exactly one more kInitialRto
+        // from t0 (since it was never previously retransmitted).
+        auto immediate_poll = table.pollRetransmissions(t0);
+        CHECK(immediate_poll.retransmissions.empty());
+
+        // Duplicate ACK 4: inflates cwnd by one SMSS, no additional retransmission.
+        auto dup4 = table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        CHECK(!dup4.fast_retransmit.has_value());
+        auto after_dup4 = table.snapshotOf(key);
+        CHECK(after_dup4.has_value());
+        if (after_dup4 && after_fr) CHECK(after_dup4->cwnd == after_fr->cwnd + 1460);
+    }
+
+    // recovery exit: a valid cumulative ACK covering everything
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 5; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 5);
+        if (sent_segments.size() != 5) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seg2_seq = sent_segments[1].sequence_number;
+
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        auto dup3 = table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        CHECK(dup3.fast_retransmit.has_value());
+        auto recovering = table.snapshotOf(key);
+        CHECK(recovering.has_value());
+        std::uint32_t recovery_ssthresh = recovering ? recovering->ssthresh : 0;
+
+        auto final_ack = table.handle(
+            key, makeAck(8080, 54321, 1001, recovering ? recovering->snd_nxt : 0),
+            t0 + std::chrono::milliseconds(50));
+        CHECK(!final_ack.reply.has_value());
+        auto after_exit = table.snapshotOf(key);
+        CHECK(after_exit.has_value());
+        if (after_exit) {
+            CHECK(after_exit->cwnd == recovery_ssthresh);
+            CHECK(!after_exit->in_fast_recovery);
+            CHECK(after_exit->duplicate_ack_count == 0);
+            CHECK(after_exit->congestion_avoidance_acked_bytes == 0);
+            CHECK(after_exit->pending_count == 0);
+        }
+    }
+
+    // classic-Reno limitation: an advancing ACK below recovery_point still
+    // exits recovery immediately (no NewReno partial-ACK behavior)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 3; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 3);
+        if (sent_segments.size() != 3) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seg2_seq = sent_segments[1].sequence_number;
+        std::uint32_t seg3_seq = sent_segments[2].sequence_number;
+
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        auto dup3 = table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        CHECK(dup3.fast_retransmit.has_value());
+        auto recovering = table.snapshotOf(key);
+        CHECK(recovering.has_value());
+        if (recovering) CHECK(recovering->recovery_point > seg3_seq); // recovery_point == snd_nxt
+
+        // Only acknowledges segment 2 (retransmitted), leaving segment 3
+        // still outstanding and below recovery_point.
+        table.handle(key, makeAck(8080, 54321, 1001, seg3_seq), t0);
+        auto after_partial = table.snapshotOf(key);
+        CHECK(after_partial.has_value());
+        if (after_partial) {
+            CHECK(!after_partial->in_fast_recovery); // exits despite seg3 < recovery_point
+            CHECK(after_partial->pending_count == 1); // segment 3 remains queued
+        }
+    }
+
+    // ================= Milestone 12: timeout congestion collapse =================
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(3000), t0); // flight = 3000
+        CHECK(!sent.segments.empty());
+
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) {
+            CHECK(after->ssthresh == 2920); // max(3000/2, 2*1460) = max(1500,2920)
+            CHECK(after->cwnd == 1460);      // SMSS
+            CHECK(!after->in_fast_recovery);
+            CHECK(after->duplicate_ack_count == 0);
+            CHECK(after->congestion_avoidance_acked_bytes == 0);
+        }
+
+        // A second poll at the same instant must not collapse a second time.
+        auto due_again = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due_again.retransmissions.empty());
+        auto after_again = table.snapshotOf(key);
+        CHECK(after_again.has_value());
+        if (after_again && after) {
+            CHECK(after_again->ssthresh == after->ssthresh);
+            CHECK(after_again->cwnd == after->cwnd);
+        }
+    }
+
+    // SYN-ACK timeout does not collapse application-data congestion state
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        table.handle(key, makeSyn(8080, 54321, 1000), t0);
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->cwnd == before->cwnd);
+            CHECK(after->ssthresh == before->ssthresh);
+        }
+    }
+
+    // FIN timeout does not collapse application-data congestion state
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto fin = table.beginClose(key, t0);
+        CHECK(fin.has_value());
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+
+        auto due = before ? table.pollRetransmissions(t0 + before->current_rto)
+                           : wirestack::TcpTimeoutPollResult{};
+        CHECK(due.retransmissions.size() == 1);
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->cwnd == before->cwnd);
+            CHECK(after->ssthresh == before->ssthresh);
+        }
+    }
+
+    // ================= Milestone 12: Karn's rule regression =================
+
+    // fast-retransmitted data produces no RTT sample; fast retransmit does
+    // not consume the timeout retry budget
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+        CHECK(sent.segments.size() == 1);
+        std::uint32_t seq = sent.segments.front().sequence_number;
+
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        auto dup3 = table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        CHECK(dup3.fast_retransmit.has_value());
+
+        auto before_ack = table.snapshotOf(key);
+        CHECK(before_ack.has_value());
+        table.handle(key, makeAck(8080, 54321, 1001, seq + 1460),
+                     t0 + std::chrono::milliseconds(500));
+        auto after_ack = table.snapshotOf(key);
+        CHECK(before_ack.has_value() && after_ack.has_value());
+        if (before_ack && after_ack) {
+            CHECK(after_ack->srtt == before_ack->srtt);
+            CHECK(after_ack->rttvar == before_ack->rttvar);
+            CHECK(after_ack->pending_count == 0);
+        }
+
+        // The fast-retransmitted entry's timeout was never doubled or
+        // consumed: this same entry, if it had gone on to time out, would
+        // still be retry #0 -- demonstrated separately below since this
+        // entry is already retired here.
+    }
+
+    // fast retransmit does not consume the timeout retry budget: the same
+    // entry can still legitimately time out afterward, starting from
+    // timeout-retry zero
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+        CHECK(sent.segments.size() == 1);
+        std::uint32_t seq = sent.segments.front().sequence_number;
+
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        auto dup3 = table.handle(key, makeAck(8080, 54321, 1001, seq), t0);
+        CHECK(dup3.fast_retransmit.has_value());
+
+        // The entry's own timeout_interval was untouched by the fast
+        // retransmission (still kInitialRto), and last_sent_at was reset
+        // to t0 -- it becomes due again at t0 + kInitialRto, not sooner
+        // (not doubled) and not later (RTO not otherwise changed).
+        auto early = table.pollRetransmissions(t0 + kInitialRto - std::chrono::milliseconds(1));
+        CHECK(early.retransmissions.empty());
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1); // genuine timeout retry #1 for this entry
+
+        // Free the still-outstanding (timed-out, congestion-collapsed)
+        // original entry before sending new data -- this ACK also carries
+        // no RTT sample (Karn's rule: was_retransmitted from the timeout).
+        auto t1 = t0 + kInitialRto;
+        table.handle(key, makeAck(8080, 54321, 1001, seq + 1460), t1);
+
+        // A later, different, never-retransmitted transmission can still
+        // update RTT normally.
+        auto clean = table.makeOutgoingData(key, makeFilledPayload(200), t1);
+        CHECK(clean.segments.size() == 1);
+        auto before_clean_ack = table.snapshotOf(key);
+        CHECK(before_clean_ack.has_value());
+        table.handle(key, makeAck(8080, 54321, 1001, clean.segments.front().sequence_number + 200),
+                     t1 + std::chrono::milliseconds(100));
+        auto after_clean_ack = table.snapshotOf(key);
+        CHECK(before_clean_ack.has_value() && after_clean_ack.has_value());
+        if (before_clean_ack && after_clean_ack) {
+            CHECK((after_clean_ack->srtt != before_clean_ack->srtt) ||
+                  (after_clean_ack->current_rto != before_clean_ack->current_rto));
         }
     }
 

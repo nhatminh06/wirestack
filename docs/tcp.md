@@ -4,16 +4,18 @@
 
 Passive three-way handshake with SYN-carried MSS/Window Scale option
 negotiation, MSS-bounded outgoing segmentation within the peer's
-advertised (and, when negotiated, scaled) send window, bounded
-out-of-order receive reassembly with duplicate/overlap trimming, RTT
-measurement with an adaptive SRTT/RTTVAR/RTO estimator driving
-timeout-based retransmission of SYN-ACK/data/FIN, passive/active/
-simultaneous close with a deterministic TIME_WAIT, and
-acceptable-inbound-RST/closed-port-RST handling, over IPv4, on a single
-fixed listening port (8080). No active open, no congestion control, no
-fast retransmit, no SACK, no timestamps. Port 8080 hosts the minimal
-HTTP/1.0 demonstration described in [docs/http.md](http.md), not a raw
-byte echo -- this file covers only TCP itself.
+advertised (and, when negotiated, scaled) send window and a Reno-style
+congestion window, bounded out-of-order receive reassembly with
+duplicate/overlap trimming, RTT measurement with an adaptive
+SRTT/RTTVAR/RTO estimator driving timeout-based retransmission of
+SYN-ACK/data/FIN, duplicate-ACK fast retransmit and classic fast
+recovery, passive/active/simultaneous close with a deterministic
+TIME_WAIT, and acceptable-inbound-RST/closed-port-RST handling, over
+IPv4, on a single fixed listening port (8080). No active open, no SACK,
+no NewReno partial-ACK recovery, no CUBIC/BBR, no ECN, no timestamps.
+Port 8080 hosts the minimal HTTP/1.0 demonstration described in
+[docs/http.md](http.md), not a raw byte echo -- this file covers only
+TCP itself.
 
 `TcpSegment` holds source/destination ports, sequence/acknowledgment
 numbers, flags, window size, urgent pointer, and the raw `options` and
@@ -246,20 +248,29 @@ ACK-bearing segment when `seq > snd_wl1`, or `seq == snd_wl1 and snd_wl2
 
 ```text
 flight_size = snd_nxt - snd_una
-available    = flight_size >= snd_wnd ? 0 : snd_wnd - flight_size
+rwnd_available = flight_size >= snd_wnd ? 0 : snd_wnd - flight_size
+cwnd_available = flight_size >= cwnd    ? 0 : cwnd - flight_size
+send_available = min(rwnd_available, cwnd_available)
 ```
 
 An application send of `N` bytes (`makeOutgoingData`, capped at
 `kMaxApplicationSendSize` = 65535 bytes regardless of window) is
-permitted only when `N <= available`; a local FIN requires `available
->= 1`. A zero window blocks all new payload and FIN sends but does not
-block anything else: ACK and RST processing continue normally, and
-already-outstanding (unacknowledged) segments still retransmit on
-schedule through the existing timeout machinery -- there is no persist
-timer and no zero-window probe, so once the window is genuinely zero and
-nothing is outstanding, Wirestack simply waits for the peer to advertise
-room; callers must retry a rejected send later themselves, since there is
-no internal send queue.
+permitted only when `N <= send_available`; on rejection the smaller/
+binding limit is reported (`TcpSendError::WindowTooSmall` for the peer
+window, `::CongestionWindowTooSmall` for the congestion window -- a tie
+reports `WindowTooSmall`, an arbitrary but documented choice since either
+is equally true). A local FIN requires `rwnd_available >= 1` only --
+see "Congestion control" below for why FIN is not additionally gated by
+`cwnd`. A zero window (either one) blocks all new payload sends but does
+not block anything else: ACK and RST processing continue normally, and
+already-outstanding (unacknowledged) segments still retransmit --
+whether by timeout or by duplicate-ACK fast retransmit -- regardless of
+either available value, since a retransmission is not new data and
+consumes no additional allowance. There is no persist timer and no
+zero-window probe, so once the peer window is genuinely zero and nothing
+is outstanding, Wirestack simply waits for the peer to advertise room;
+callers must retry a rejected send later themselves, since there is no
+internal send queue.
 
 ## Receive windows and reassembly
 
@@ -419,14 +430,16 @@ backoff of the *estimator* itself, no minimum-RTO tuning knob).
 
 At most one RTT sample is taken per ACK, from the newest pending entry
 that ACK fully or partially retires, provided that entry was sent exactly
-once (`retransmit_count == 0`), has a valid `first_sent_at <= now`, and
-has not already contributed a sample (`PendingTransmission::
-rtt_sample_taken`) -- distinct from Karn eligibility: a partial ACK can
-sample a still-outstanding entry once, after which a later ACK of that
-same entry's remaining bytes is not eligible again, even though it was
-never retransmitted (Karn's rule: once any entry has been retransmitted, an ACK covering it
-can never produce a sample, even the very next ACK). A pure ACK
-(consumes no sequence space, never queued) and an accepted RST never
+once (`!PendingTransmission::was_retransmitted`), has a valid
+`first_sent_at <= now`, and has not already contributed a sample
+(`PendingTransmission::rtt_sample_taken`) -- distinct from Karn
+eligibility: a partial ACK can sample a still-outstanding entry once,
+after which a later ACK of that same entry's remaining bytes is not
+eligible again, even though it was never retransmitted. Karn's rule:
+once any entry has been retransmitted -- by *either* a timeout or a
+duplicate-ACK fast retransmit, see "Congestion control" below -- an ACK
+covering it can never produce a sample, even the very next ACK. A pure
+ACK (consumes no sequence space, never queued) and an accepted RST never
 produce a sample, since neither retires a pending entry. A clean,
 non-retransmitted SYN-ACK may provide the very first sample, sampled by
 the handshake-completing final ACK.
@@ -471,11 +484,21 @@ It never advances `snd_nxt` or `snd_una`, and never re-delivers
 application data to the layer above TCP -- a retransmission is not a new
 logical send. A duplicate incoming SYN re-arms the pending SYN-ACK's
 deadline from the duplicate's arrival time without consuming any of the
-5-retransmission budget.
+timeout-retransmission budget.
+
+A pending entry now tracks two distinct facts about being retransmitted,
+kept deliberately separate (see "Congestion control" below): timeout
+retries (`PendingTransmission::timeout_retransmit_count`, incremented
+only by an actual RTO expiry here) and Karn ambiguity
+(`PendingTransmission::was_retransmitted`, set by *either* a timeout or
+a duplicate-ACK fast retransmit). A fast retransmission is never encoded
+as a fake timeout -- it never touches `timeout_retransmit_count`, never
+doubles `timeout_interval`, and never changes `connection.current_rto`.
 
 ### Timeout exhaustion
 
-Once a pending entry has already been retransmitted 5 times, its next
+Once a pending entry's `timeout_retransmit_count` has already reached 5
+(a fast retransmission never contributes to this count), its next
 expired deadline removes the connection from the table entirely and
 reports it to the caller -- no FIN, no RST, just a local abort. This is
 intentionally not a graceful close.
@@ -483,13 +506,216 @@ intentionally not a graceful close.
 ### Delayed-reply addressing
 
 TCP connection state stores no MAC addresses. A timer-triggered
-retransmission has no current received frame to read a destination MAC
-from, so `main.cpp` looks it up in the existing `ArpCache`, which now
-learns IP->MAC mappings from any valid local IPv4 traffic (not just ARP
-packets) so a mapping is available even if the peer's last ARP exchange
-has aged out of relevance. If no mapping is known, the retransmission
-attempt is skipped (logged) but still counts toward the 5-retry budget --
-otherwise a persistently-unreachable peer would retry forever.
+(timeout) retransmission has no current received frame to read a
+destination MAC from, so `main.cpp` looks it up in the existing
+`ArpCache`, which now learns IP->MAC mappings from any valid local IPv4
+traffic (not just ARP packets) so a mapping is available even if the
+peer's last ARP exchange has aged out of relevance. If no mapping is
+known, the retransmission attempt is skipped (logged) but still counts
+toward the 5-retry budget -- otherwise a persistently-unreachable peer
+would retry forever. A duplicate-ACK-triggered fast retransmission (see
+"Congestion control" below) is different: it is produced synchronously
+while handling a just-received frame, so `main.cpp` addresses it using
+that frame's own source MAC directly, through the same immediate-reply
+path as an ordinary SYN-ACK or pure ACK -- it never goes through the
+ArpCache/timer path and is not subject to this failure mode.
+
+## Congestion control
+
+An educational Reno-style model: Slow Start, Congestion Avoidance,
+duplicate-ACK fast retransmit, and classic fast recovery. Explicitly not
+implemented: NewReno partial-ACK recovery, SACK, PRR, CUBIC, BBR, ECN,
+limited transmit, congestion-window validation after idle, ACK pacing.
+This is a deliberate approximation for this educational stack, not a
+claim of full or RFC-compliant Reno.
+
+### State
+
+Per connection, byte units except `recovery_point` (a sequence number):
+
+```text
+cwnd                             congestion window
+ssthresh                         slow-start threshold
+duplicate_ack_count              consecutive qualifying duplicate ACKs
+in_fast_recovery                 true from the 3rd duplicate ACK until an advancing ACK
+recovery_point                   snd_nxt when fast recovery began (diagnostic only after exit)
+congestion_avoidance_acked_bytes accumulator for Congestion Avoidance growth
+```
+
+All six are exposed read-only through `TcpConnectionSnapshot` and are
+fully independent per connection -- there is no global congestion state.
+
+### Initial window and threshold
+
+Computed once, right after `effective_send_mss` is fixed at connection
+creation (see "TCP options" above) -- SYN and SYN-ACK are never gated by
+`cwnd`:
+
+```text
+SMSS = effective_send_mss
+initial_cwnd = min(10 * SMSS, max(2 * SMSS, 14600))    (wirestack::kInitialCongestionWindowFloor = 14600)
+initial ssthresh = 65535                                (wirestack::kInitialSsthresh)
+```
+
+`initial_cwnd` examples: SMSS 1460 -> 14600; SMSS 1200 -> 12000; SMSS 536
+-> 5360; SMSS 1 -> 10. The initial threshold is a fixed, deterministic
+project policy -- not derived from the peer's initial window, and not a
+claim about every production TCP's default. All arithmetic uses `uint64_t`
+intermediates before clamping to `wirestack::kMaxCongestionWindow` (`1 <<
+30` bytes, chosen to stay well under half the 32-bit sequence space) so
+no growth step can overflow `uint32_t`.
+
+### New-data send limit
+
+`makeOutgoingData` gates every application send by both the peer window
+and the congestion window (see "Send window" above for the exact
+`send_available` formula and the `WindowTooSmall`/
+`CongestionWindowTooSmall` error split). A FIN is gated by the peer
+window only, not by `cwnd` -- a narrow, documented choice for this
+milestone rather than a claim that FIN should never interact with
+congestion control. Congestion-window growth counts only application-data
+bytes: acknowledging a SYN, a FIN, or a pure ACK never grows `cwnd`.
+
+### ACK retirement's byte accounting
+
+`retireAcknowledged` returns a small `TcpAckRetirementResult`
+(`newly_acked_sequence_space`, `newly_acked_data_bytes`, `ack_advanced`,
+`rtt_sample_taken`) so congestion control can size growth without a
+second pass over the pending queue. `newly_acked_sequence_space` is
+simply `ack - old snd_una` (wraparound-safe, matches the rest of
+sequence-space tracking); `newly_acked_data_bytes` is accumulated per
+retired/trimmed entry and excludes a SYN or FIN's own control byte (SYN
+and FIN both occupy a 1-wide range that can never be partially
+acknowledged, so the partial-trim path only ever trims data). A
+duplicate or stale ACK reports an all-zero, `ack_advanced=false` result.
+
+### Slow Start and Congestion Avoidance
+
+Chosen once per advancing ACK, outside fast recovery, based on `cwnd`
+before that ACK's growth is applied -- never both rules for the same
+acknowledged bytes:
+
+```text
+Slow Start (cwnd < ssthresh):
+  cwnd += min(newly_acked_data_bytes, SMSS)
+
+Congestion Avoidance (cwnd >= ssthresh):
+  congestion_avoidance_acked_bytes += newly_acked_data_bytes
+  while congestion_avoidance_acked_bytes >= cwnd:
+      congestion_avoidance_acked_bytes -= cwnd
+      cwnd += SMSS
+```
+
+The `while` loop (not a single `if`) safely handles a cumulative ACK that
+crosses more than one window's worth of accumulated credit; in practice,
+because every legitimate send is itself gated by the then-current `cwnd`,
+one ACK can newly-acknowledge at most one window's worth of *new* data
+under ordinary operation, so more than one loop iteration is only
+reachable when stale, still-outstanding data (e.g. from before a timeout
+shrank `cwnd`) is acknowledged. Worked vector (SMSS 1460): initial
+`cwnd=14600`; ACK one full segment -> `16060`; ACK another -> `17520`.
+`congestion_avoidance_acked_bytes` is reset to 0 whenever a loss event
+(fast recovery entry, fast-recovery exit, or timeout collapse) makes
+prior accumulated credit invalid.
+
+### Duplicate-ACK definition
+
+An ACK counts as a qualifying duplicate only when *all* of the following
+hold: the connection is synchronized; ACK is set; the ACK number equals
+`snd_una` exactly (excludes both a stale ACK below it and an advancing
+one); the segment carries no payload; SYN, FIN, and RST are all clear;
+the advertised peer window is unchanged from what is currently stored
+(compared before vs. after `updateSendWindow` runs); and at least one
+outstanding pending entry is application data (never SYN- or FIN-only --
+an ACK for an outstanding FIN with no outstanding data does not count).
+`duplicate_ack_count` resets to 0 whenever the ACK advances `snd_una`,
+whenever the peer window changes, or on a timeout loss; it is left
+unchanged by a non-qualifying ACK that is neither of those (a stale ACK,
+a data-carrying ACK, or a FIN|ACK), since none of those are reset
+triggers on their own.
+
+### Third duplicate ACK: fast retransmit and fast recovery entry
+
+```text
+flight = snd_nxt - snd_una
+ssthresh = max(flight / 2, 2 * SMSS)
+recovery_point = snd_nxt
+cwnd = ssthresh + 3 * SMSS
+in_fast_recovery = true
+congestion_avoidance_acked_bytes = 0
+```
+
+Then the oldest outstanding application-data pending entry (never SYN or
+FIN) is retransmitted immediately: sequence number and (already-trimmed)
+payload preserved, acknowledgment number and advertised window refreshed
+exactly like an ordinary retransmission, `TcpSegment::flags` reused from
+the original send. This is reported through
+`TcpReceiveResult::fast_retransmit` -- a field distinct from `reply`,
+sent by `main.cpp` through the same immediate-reply path used for a
+SYN-ACK or pure ACK, addressed with the *current* received frame's
+source MAC (not the timer/ArpCache path -- see "Delayed-reply
+addressing"). The entry's `was_retransmitted` is set (Karn ambiguity,
+see "RTT measurement" above) and `last_sent_at` is reset to `now`, but
+its `timeout_interval` is left untouched (not doubled),
+`connection.current_rto` is untouched, `first_sent_at` is untouched, and
+`timeout_retransmit_count` is untouched -- a fast retransmission is never
+encoded as a fake timeout.
+
+### Additional duplicate ACKs and recovery exit
+
+Every further qualifying duplicate ACK while already in fast recovery
+inflates the window (`cwnd += SMSS`, clamped) without triggering another
+retransmission -- one loss indication produces exactly one fast
+retransmission. Because there is no application send queue, this
+inflated space may go unused if the caller has nothing more to send.
+
+On the first valid advancing ACK while in fast recovery (classic Reno):
+
+```text
+cwnd = ssthresh
+duplicate_ack_count = 0
+in_fast_recovery = false
+congestion_avoidance_acked_bytes = 0
+```
+
+with no additional Slow Start or Congestion Avoidance growth applied to
+that same ACK. This is deliberately NewReno-free: an ACK that advances
+`snd_una` by less than `recovery_point` still exits recovery immediately
+in this milestone, rather than continuing recovery until `recovery_point`
+is reached.
+
+### Timeout congestion response
+
+When an established application-data segment (never a SYN-ACK or FIN)
+reaches its RTO, once per timeout event, before the existing
+retransmission and RTO backoff:
+
+```text
+flight = snd_nxt - snd_una
+ssthresh = max(flight / 2, 2 * SMSS)
+cwnd = SMSS
+duplicate_ack_count = 0
+in_fast_recovery = false
+congestion_avoidance_acked_bytes = 0
+```
+
+A SYN-ACK or FIN timeout preserves existing retransmission/backoff
+behavior unchanged, without applying this collapse. A repeated
+`pollRetransmissions` call at the same timestamp cannot collapse twice:
+the entry's `last_sent_at` is set to that timestamp as part of the same
+timeout event, so its deadline cannot be due again until strictly later.
+
+### Testing limitation
+
+`kMaxCongestionWindow` (`1 << 30`) is not organically reachable through
+the public send/ack API within a practical deterministic test -- reaching
+it requires on the order of 700,000 SMSS-sized growth steps. The
+deterministic tests instead verify the exact formulas, the boundary
+between Slow Start and Congestion Avoidance, and that ordinary growth
+never regresses, relying on the `uint64_t`-then-clamp arithmetic
+(exercised directly by the initial-window and fast-recovery-entry
+formulas) to rule out overflow rather than literally driving `cwnd` to
+the bound.
 
 ## Connection close
 
@@ -639,16 +865,37 @@ bytes), Wirestack's cumulative ACKs advancing across them, and the exact
 reassembled. Do not apply loss injection or reordering (`tc netem`,
 network namespaces) against a shared or production interface -- only a
 dedicated, isolated TAP device with no other traffic, removing any such
-change afterward.
+change afterward:
+
+```bash
+# terminal 2, on the dedicated wire0 device only -- record and remove
+# this qdisc when done
+sudo tc qdisc add dev wire0 root netem loss 25%
+# ... run the HTTP request above one or more times ...
+sudo tc qdisc del dev wire0 root netem
+```
+
+Expect tcpdump to occasionally show three duplicate `Flags [.]` ACKs from
+the client for the same acknowledgment number, followed by Wirestack
+retransmitting the missing segment before any RTO would have expired
+(well under the connection's current RTO, visible via the `wirestack`
+process's own logging), and the client's next ACK advancing past the
+previously-missing segment. `LIVE FAST RETRANSMIT: MANUAL VERIFICATION
+REQUIRED` when this has not been exercised in the current environment
+(e.g. no `CAP_NET_ADMIN` or usable non-interactive sudo) -- do not
+fabricate tcpdump evidence.
 
 ## Known limitations
 
 - Only MSS and Window Scale options are understood; SACK-permitted and
   timestamps are safely skipped like any other unknown well-formed
   option, never interpreted or acted on.
-- No fast retransmit (duplicate-ACK triggered) -- only timeout triggers
-  retransmission.
-- No congestion control, no slow start, no fast recovery.
+- Congestion control is a narrow, educational Reno-style model (Slow
+  Start, Congestion Avoidance, duplicate-ACK fast retransmit, classic
+  fast recovery) -- not a claim of full or RFC-compliant Reno. No NewReno
+  partial-ACK recovery, no SACK-based recovery, no PRR, no CUBIC, no BBR,
+  no ECN, no limited transmit, no congestion-window validation after
+  idle, no ACK pacing.
 - No active open (Wirestack never initiates a connection).
 - No challenge ACK; an unacceptable RST is simply dropped.
 - The RTT/RTO estimator is an integer-arithmetic approximation of
@@ -657,7 +904,12 @@ change afterward.
 - No zero-window persist timer or probe -- Wirestack waits for the peer
   to advertise room; a rejected send must be retried by the caller.
 - No application-level send queue -- an atomic send is either fully
-  accepted or fully rejected, never partially buffered internally.
+  accepted or fully rejected, never partially buffered internally; an
+  inflated fast-recovery `cwnd` may go unused if the caller has nothing
+  queued to send into it.
+- `kMaxCongestionWindow` (`1 << 30` bytes) is not organically reachable
+  through a practical deterministic test -- see "Testing limitation"
+  under "Congestion control" above.
 - Overlap/duplicate handling is a deterministic first-arrival-wins policy
   bounded to a 262140-byte internal capacity and 128 fragments, not
   general attack-resistant TCP normalization; the wire-visible advertised
@@ -667,5 +919,5 @@ change afterward.
 
 ## Next TCP work
 
-TCP slow start, congestion avoidance, duplicate-ACK fast retransmit, and
-fast recovery.
+Bounded TCP send buffering, ACK-driven transmission scheduling, and
+zero-window persist probes.
