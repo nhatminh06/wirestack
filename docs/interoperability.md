@@ -161,6 +161,45 @@ out-of-order range while cumulative ACK stays at `rcv_nxt`.
 All ten scenarios pass. See `docs/tcp.md` for the exact reset field
 construction and `docs/http.md` for the exact response bytes asserted.
 
+## Active open (`active_open.sh`)
+
+`tools/integration/active_open.sh` exercises Wirestack's `--active-open`
+flag (Wirestack initiating a connection) against real Linux peers, kept
+separate from `run.sh` because `--active-open` configures a single
+one-shot connection attempt at process startup -- each scenario needs
+its own wirestack instance, restarted with different flags, rather than
+the one long-lived passive-open server instance `run.sh`'s ten scenarios
+share:
+
+```bash
+unshare --user --net --map-root-user -- bash tools/integration/active_open.sh
+```
+
+| # | Scenario | Mechanism |
+|---|----------|-----------|
+| 1 | Active open established | a real Python `accept()` in the client namespace, immediately followed by `close()` with no bytes exchanged; verifies SYN/SYN-ACK/ACK sequence and ack numbers, and that the resulting peer FIN produces neither an unsolicited HTTP response nor a listener-side RST (see below) |
+| 2 | Active open refused | `--active-open` pointed at an unbound port; verifies the client kernel's `RST\|ACK` and that Wirestack does not retransmit the SYN afterward |
+
+Both scenarios prime Wirestack's ARP cache with a single `ping` from the
+client namespace first -- Wirestack never sends an ARP request of its
+own, so `beginConnect` only fires once it has already learned the peer's
+MAC opportunistically from some inbound traffic (see `arp_cache.insert`
+in `handleIpv4`, `src/main.cpp`).
+
+**Cross-layer defect found and fixed**: this harness originally surfaced
+a bug where closing the accepted connection immediately from the
+listener caused Wirestack to send an unsolicited HTTP 400 response on
+that connection, which the already-closing Linux socket then answered
+with RST. `handleTcp` in `src/main.cpp` ran every connection reaching
+`peer_closed`/`accepted_payload` through the HTTP response layer
+regardless of whether it was passively or actively opened. This is now
+fixed: `handleTcp`/`handleIpv4` take the runtime's `active_open_key` and
+skip the HTTP server routing entirely for that connection. Scenario 1
+above now exercises this directly (the listener closes immediately
+rather than being left open) and fails if either a PSH-carrying segment
+or a listener-side RST appears after the close -- confirmed to fail
+against the pre-fix binary and pass against the fixed one.
+
 ## Troubleshooting
 
 - `conflicting pre-existing interface`: a previous run's resources were
@@ -188,8 +227,12 @@ construction and `docs/http.md` for the exact response bytes asserted.
   `tests/test_tcp_sack_path.cpp` and `tests/test_tcp_newreno_path.cpp`.
   Receiver-side SACK generation (advertising SACK blocks for retained
   out-of-order data) *is* live-qualified -- see scenario 10.
-- TCP active open, keep-alive, HTTP/1.1, and TLS are out of scope for
-  this milestone and are not exercised here (see `README.md`).
+- TCP active open's handshake (SYN sent, established, and refused) is
+  exercised by `active_open.sh` (see above); data transfer over an
+  actively-opened connection is not, since Wirestack's active-open path
+  currently only completes the handshake. Keep-alive, HTTP/1.1, and TLS
+  remain out of scope for this milestone and are not exercised here (see
+  `README.md`).
 - The harness proves behavior inside its own isolated topology; it does
   not substitute for testing against a real physical NIC or a real
   routed network.
