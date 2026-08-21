@@ -602,5 +602,247 @@ int main() {
         CHECK(std::holds_alternative<TcpParsedOptions>(result));
     }
 
+    // ================= SACK-Permitted / SACK =================
+
+    // SACK-Permitted alone
+    {
+        auto result = parseTcpOptions(toBytes({4, 2}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_permitted);
+            CHECK(parsed->sack_blocks.empty());
+        }
+    }
+
+    // SACK-Permitted with MSS
+    {
+        auto result = parseTcpOptions(toBytes({2, 4, 0x05, 0xb4, 4, 2}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->maximum_segment_size == 1460);
+            CHECK(parsed->sack_permitted);
+        }
+    }
+
+    // SACK-Permitted with Window Scale
+    {
+        auto result = parseTcpOptions(toBytes({4, 2, 1, 3, 3, 2}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_permitted);
+            CHECK(parsed->window_scale == 2);
+        }
+    }
+
+    // malformed SACK-Permitted length
+    {
+        auto result = parseTcpOptions(toBytes({4, 3, 0}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::InvalidSackPermittedLength);
+        }
+    }
+
+    // missing length byte for kind 4
+    {
+        auto result = parseTcpOptions(toBytes({4}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::MissingLength);
+        }
+    }
+
+    // duplicate SACK-Permitted
+    {
+        auto result = parseTcpOptions(toBytes({4, 2, 4, 2}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::DuplicateSackPermitted);
+        }
+    }
+
+    // one SACK block: left=1001 right=2461
+    {
+        auto result = parseTcpOptions(toBytes({
+            5, 10,                  // kind SACK, length 10 (2 + 8*1)
+            0x00, 0x00, 0x03, 0xe9, // left edge 1001
+            0x00, 0x00, 0x09, 0x9d, // right edge 2461
+        }));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_blocks.size() == 1);
+            if (parsed->sack_blocks.size() == 1) {
+                CHECK(parsed->sack_blocks[0].left_edge == 1001);
+                CHECK(parsed->sack_blocks[0].right_edge == 2461);
+            }
+        }
+    }
+
+    // two SACK blocks
+    {
+        auto result = parseTcpOptions(toBytes({
+            5, 18,                  // kind SACK, length 18 (2 + 8*2)
+            0x00, 0x00, 0x00, 0x0a, // block 1 left 10
+            0x00, 0x00, 0x00, 0x14, // block 1 right 20
+            0x00, 0x00, 0x00, 0x1e, // block 2 left 30
+            0x00, 0x00, 0x00, 0x28, // block 2 right 40
+        }));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_blocks.size() == 2);
+            if (parsed->sack_blocks.size() == 2) {
+                CHECK(parsed->sack_blocks[0].left_edge == 10);
+                CHECK(parsed->sack_blocks[0].right_edge == 20);
+                CHECK(parsed->sack_blocks[1].left_edge == 30);
+                CHECK(parsed->sack_blocks[1].right_edge == 40);
+            }
+        }
+    }
+
+    // four SACK blocks (maximum)
+    {
+        auto result = parseTcpOptions(toBytes({
+            5, 34, // kind SACK, length 34 (2 + 8*4)
+            0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x14,
+            0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x3c,
+            0x00, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00, 0x50,
+        }));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_blocks.size() == 4);
+        }
+    }
+
+    // sequence wraparound edges: left=0xfffffff0 right=0x00000010
+    {
+        auto result = parseTcpOptions(toBytes({
+            5, 10, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x10,
+        }));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_blocks.size() == 1);
+            if (parsed->sack_blocks.size() == 1) {
+                CHECK(parsed->sack_blocks[0].left_edge == 0xfffffff0);
+                CHECK(parsed->sack_blocks[0].right_edge == 0x00000010);
+            }
+        }
+    }
+
+    // EOL termination after a SACK block
+    {
+        auto result = parseTcpOptions(toBytes({
+            5, 10, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x14, 0,
+        }));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_blocks.size() == 1);
+        }
+    }
+
+    // NOP placement between SACK-Permitted and a SACK block
+    {
+        auto result = parseTcpOptions(toBytes({
+            4, 2, 1, 1, 5, 10, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x14,
+        }));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_permitted);
+            CHECK(parsed->sack_blocks.size() == 1);
+        }
+    }
+
+    // unknown option mixed with SACK
+    {
+        auto result = parseTcpOptions(toBytes({
+            8, 4, 0xaa, 0xbb, 5, 10, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x14,
+        }));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->sack_blocks.size() == 1);
+        }
+    }
+
+    // malformed SACK lengths: 2, 9, 11, and truncated 10
+    {
+        auto len2 = parseTcpOptions(toBytes({5, 2}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(len2));
+        if (auto* err = std::get_if<TcpOptionParseError>(&len2)) {
+            CHECK(*err == TcpOptionParseError::InvalidSackLength);
+        }
+
+        auto len9 = parseTcpOptions(
+            toBytes({5, 9, 0, 0, 0, 0, 0, 0, 0}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(len9));
+        if (auto* err = std::get_if<TcpOptionParseError>(&len9)) {
+            CHECK(*err == TcpOptionParseError::InvalidSackLength);
+        }
+
+        auto len11 = parseTcpOptions(
+            toBytes({5, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(len11));
+        if (auto* err = std::get_if<TcpOptionParseError>(&len11)) {
+            CHECK(*err == TcpOptionParseError::InvalidSackLength);
+        }
+
+        auto truncated = parseTcpOptions(toBytes({5, 10, 0, 0, 0, 0}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(truncated));
+        if (auto* err = std::get_if<TcpOptionParseError>(&truncated)) {
+            CHECK(*err == TcpOptionParseError::TruncatedOption);
+        }
+    }
+
+    // too many blocks: length 42 is not a valid SACK length even though
+    // it would decode to 5 blocks
+    {
+        std::vector<std::byte> options(42, std::byte{0});
+        options[0] = std::byte{5};
+        options[1] = std::byte{42};
+        auto result = parseTcpOptions(options);
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::InvalidSackLength);
+        }
+    }
+
+    // duplicate SACK
+    {
+        auto result = parseTcpOptions(toBytes({
+            5, 10, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x14,
+            5, 10, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x28,
+        }));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::DuplicateSack);
+        }
+    }
+
+    // maximum 40-byte option area: MSS + SACK-Permitted + NOP + Window
+    // Scale + a 3-block SACK + EOL padding, exactly 40 bytes (10 + 26 + 4)
+    {
+        std::vector<std::byte> options = toBytes({
+            2, 4, 0x05, 0xb4, // MSS
+            4, 2,             // SACK-Permitted
+            1, 3, 3, 2,       // NOP + Window Scale
+        });
+        std::vector<std::byte> sack = toBytes({
+            5, 26, // SACK, 3 blocks
+            0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x14,
+            0x00, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x3c,
+        });
+        options.insert(options.end(), sack.begin(), sack.end());
+        options.insert(options.end(), 4, std::byte{0}); // EOL + padding
+        CHECK(options.size() == 40);
+        auto result = parseTcpOptions(options);
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->maximum_segment_size == 1460);
+            CHECK(parsed->sack_permitted);
+            CHECK(parsed->window_scale == 2);
+            CHECK(parsed->sack_blocks.size() == 3);
+        }
+    }
+
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }

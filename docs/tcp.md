@@ -9,14 +9,17 @@ segmentation within the peer's advertised (and, when negotiated, scaled)
 send window and a Reno-style congestion window, bounded out-of-order
 receive reassembly with duplicate/overlap trimming, RTT measurement with
 an adaptive SRTT/RTTVAR/RTO estimator driving timeout-based
-retransmission of SYN-ACK/data/FIN, duplicate-ACK fast retransmit and
-classic fast recovery, a deterministic zero-window persist probe,
-passive/active/simultaneous close (with FIN deferred until all queued
-application bytes enter sequence space) and a deterministic TIME_WAIT,
-and acceptable-inbound-RST/closed-port-RST handling, over IPv4, on a
-single fixed listening port (8080). No active open, no SACK, no NewReno
-partial-ACK recovery, no CUBIC/BBR, no ECN, no timestamps. Port 8080
-hosts the minimal HTTP/1.0 demonstration described in
+retransmission of SYN-ACK/data/FIN, duplicate-ACK fast retransmit,
+NewReno-style partial-ACK recovery, and a bounded segment-granular SACK
+scoreboard (SACK-Permitted negotiated only from the peer's SYN -- see
+"Selective acknowledgment (SACK) and NewReno recovery"), a deterministic
+zero-window persist probe, passive/active/simultaneous close (with FIN
+deferred until all queued application bytes enter sequence space) and a
+deterministic TIME_WAIT, and acceptable-inbound-RST/closed-port-RST
+handling, over IPv4, on a single fixed listening port (8080). No active
+open, no DSACK, no SACK reneging recovery beyond clearing marks on RTO,
+no RFC 6675 pipe algorithm, no CUBIC/BBR, no ECN, no timestamps. Port
+8080 hosts the minimal HTTP/1.0 demonstration described in
 [docs/http.md](http.md), not a raw byte echo -- this file covers only
 TCP itself.
 
@@ -32,17 +35,26 @@ connection creation -- see "TCP options" below.
 ## TCP options
 
 `parseTcpOptions(options)` returns a `TcpParsedOptions{maximum_segment_size,
-window_scale}` (each `std::optional`) or a `TcpOptionParseError`. A
-single left-to-right cursor scan: kind 0 (End of List) stops parsing
-immediately; kind 1 (No-Operation) advances one byte; every other kind
-requires a length byte (`MissingLength` if absent), `length >= 2`
-(`InvalidLength`), and enough remaining bytes for the declared length
-(`TruncatedOption`) before it is read. Kind 2 (MSS) requires `length ==
-4` and a nonzero 16-bit value (`InvalidMss` otherwise); kind 3 (Window
-Scale) requires `length == 3`; a second occurrence of either is
-`DuplicateMss`/`DuplicateWindowScale`. Any other well-formed kind is
+window_scale, sack_permitted, sack_blocks}` (the first two
+`std::optional`) or a `TcpOptionParseError`. A single left-to-right
+cursor scan: kind 0 (End of List) stops parsing immediately; kind 1
+(No-Operation) advances one byte; every other kind requires a length byte
+(`MissingLength` if absent), `length >= 2` (`InvalidLength`), and enough
+remaining bytes for the declared length (`TruncatedOption`) before it is
+read. Kind 2 (MSS) requires `length == 4` and a nonzero 16-bit value
+(`InvalidMss` otherwise); kind 3 (Window Scale) requires `length == 3`;
+kind 4 (SACK-Permitted) requires `length == 2`
+(`InvalidSackPermittedLength` otherwise); kind 5 (SACK) requires `length`
+in `{10, 18, 26, 34}` (`InvalidSackLength` otherwise) and decodes
+`(length - 2) / 8` `TcpSackBlock{left_edge, right_edge}` pairs. A second
+occurrence of any of the four is `DuplicateMss`/`DuplicateWindowScale`/
+`DuplicateSackPermitted`/`DuplicateSack`. Any other well-formed kind is
 safely skipped using its own declared length without being interpreted.
-No index ever advances past `options.size()`.
+No index ever advances past `options.size()`. See "Selective
+acknowledgment (SACK) and NewReno recovery" for SACK negotiation and
+established-state SACK block handling; the negotiation description
+below covers only MSS and Window Scale, unchanged from before this
+milestone.
 
 Negotiation happens exactly once, in `handle()`'s bare-SYN branch, from
 that SYN's own `parseTcpOptions` result:
@@ -66,14 +78,12 @@ already-stored SYN-ACK unchanged regardless of what options the
 duplicate itself carries; negotiated state is never touched twice.
 
 Wirestack's outgoing SYN-ACK always advertises its own path MSS (1460),
-never the peer's offered value: `02 04 05 b4`. When
-`window_scaling_enabled`, it also advertises `01 03 03 02` (NOP + kind=3
-length=3 shift=2) immediately after, giving an 8-byte option block (TCP
-header 28 bytes, Data Offset 7); without negotiation, the option block is
-just the 4 MSS bytes (TCP header 24 bytes, Data Offset 6). Neither the
-SYN-ACK's own window field, nor a retransmission of it, is ever scaled --
-window scaling first applies starting with the handshake's own completing
-ACK.
+never the peer's offered value: `02 04 05 b4`, followed by SACK-Permitted
+and/or Window Scale when negotiated -- see "SYN-ACK option layout" under
+"Selective acknowledgment (SACK) and NewReno recovery" for the exact
+byte layout of all four combinations. Neither the SYN-ACK's own window
+field, nor a retransmission of it, is ever scaled -- window scaling
+first applies starting with the handshake's own completing ACK.
 
 ## Current state machine
 
@@ -670,12 +680,16 @@ encoded as a fake timeout.
 ### Additional duplicate ACKs and recovery exit
 
 Every further qualifying duplicate ACK while already in fast recovery
-inflates the window (`cwnd += SMSS`, clamped) without triggering another
-retransmission -- one loss indication produces exactly one fast
-retransmission. Because there is no application send queue, this
-inflated space may go unused if the caller has nothing more to send.
+inflates the window (`cwnd += SMSS`, clamped). Without SACK negotiated,
+this never triggers another retransmission -- one loss indication
+produces exactly one fast retransmission, and NewReno partial-ACK
+recovery (below) is what retransmits further losses. With SACK
+negotiated, this same duplicate ACK may *also* select one further
+eligible retransmission (see "SACK-guided additional duplicate ACKs"
+below) -- still at most one retransmission per incoming ACK.
 
-On the first valid advancing ACK while in fast recovery (classic Reno):
+Recovery exits only once the cumulative ACK reaches `recovery_point`
+(full ACK, using the project's wraparound-safe sequence comparison):
 
 ```text
 cwnd = ssthresh
@@ -685,10 +699,10 @@ congestion_avoidance_acked_bytes = 0
 ```
 
 with no additional Slow Start or Congestion Avoidance growth applied to
-that same ACK. This is deliberately NewReno-free: an ACK that advances
-`snd_una` by less than `recovery_point` still exits recovery immediately
-in this milestone, rather than continuing recovery until `recovery_point`
-is reached.
+that same ACK, and every pending entry's `retransmitted_in_recovery`
+marker cleared (the episode is over). An advancing ACK that stops short
+of `recovery_point` is a NewReno partial ACK instead -- see "NewReno
+partial-ACK recovery" below.
 
 ### Timeout congestion response
 
@@ -722,6 +736,207 @@ never regresses, relying on the `uint64_t`-then-clamp arithmetic
 (exercised directly by the initial-window and fast-recovery-entry
 formulas) to rule out overflow rather than literally driving `cwnd` to
 the bound.
+
+## Selective acknowledgment (SACK) and NewReno recovery
+
+Wirestack implements NewReno-style partial-ACK recovery with a bounded,
+segment-granular SACK scoreboard -- not full RFC 2018 SACK, not RFC 6675
+pipe-based loss recovery, not PRR, not Limited Transmit, no DSACK, no
+SACK reneging recovery beyond clearing marks on RTO.
+
+### Negotiation
+
+SACK is negotiated only from the peer's initial SYN, decided once and
+never touched again -- the same one-time-SYN-only pattern as MSS and
+Window Scale. `parseTcpOptions` additionally recognizes kind 4
+(SACK-Permitted, `length == 2`, otherwise `InvalidSackPermittedLength`; a
+second occurrence is `DuplicateSackPermitted`) and kind 5 (SACK,
+`length` one of `{10, 18, 26, 34}` for 1-4 blocks, otherwise
+`InvalidSackLength`; a second occurrence is `DuplicateSack`), returning
+`TcpParsedOptions{..., sack_permitted, sack_blocks}` (`sack_blocks` holds
+`TcpSackBlock{left_edge, right_edge}` pairs, `[left_edge, right_edge)`,
+at most 4). A SYN carrying a SACK block option is invalid for this
+milestone (SACK is only meaningful once a connection has outstanding
+data) and creates no connection, exactly like any other malformed SYN. A
+later SACK-Permitted option (on a duplicate SYN or any established-state
+segment) is parsed but never renegotiates -- `connection.sack_permitted`
+is set exactly once, at connection creation.
+
+### SYN-ACK option layout
+
+Fixed order: MSS, SACK-Permitted (only if negotiated), Window Scale
+(only if negotiated), then EOL + zero padding to a 4-byte boundary.
+`buildSynAckOptions` builds the unpadded bytes and pads generically,
+which happens to produce these exact four combinations:
+
+```text
+MSS only:                      02 04 05 b4                                     (24-byte header, DO 6)
+MSS + Window Scale:            02 04 05 b4 01 03 03 02                         (28-byte header, DO 7)
+MSS + SACK-Permitted:          02 04 05 b4 04 02 00 00                         (28-byte header, DO 7)
+MSS + SACK-Permitted + WScale: 02 04 05 b4 04 02 01 03 03 02 00 00             (32-byte header, DO 8)
+```
+
+A timeout or duplicate-SYN retransmission of the SYN-ACK rebuilds these
+same bytes from stored connection state (`buildSynAckOptions` is called
+again, not a cached copy) -- MSS, Window Scale, and SACK-Permitted are
+therefore always preserved exactly, in the same order, with the same
+padding, across any number of retransmissions.
+
+### Receiver SACK block generation
+
+When SACK was negotiated and `connection.out_of_order` is non-empty,
+`generateSackBlocks` builds at most 4 blocks, one per retained fragment,
+with exact edges (`fragment.sequence_start`, `fragment.sequenceEnd()`) --
+never a gap, never bytes already below `rcv_nxt`, never a pending FIN's
+sequence space (FIN is tracked separately from `out_of_order` and never
+contributes a block), never bytes trimmed outside the receive window or
+rejected by the fragment/capacity bounds that already apply to ordinary
+reassembly (see "Receive windows and reassembly").
+
+Ordering policy: the fragment associated with the most recently accepted
+out-of-order range occupies the first block position, if that fragment
+still exists after this call's insert/coalesce (`handleSynchronized`
+locates it by scanning `out_of_order` for the fragment now containing the
+just-inserted range -- absent if that range was released into `rcv_nxt`
+instead, which correctly drops it from the report). The remaining
+fragments fill in descending `sequence_start` order. This is a
+deterministic, easy-to-verify policy, not a claim of matching any
+particular real TCP's exact heuristic. Duplicate/overlapping arrivals
+never produce duplicate blocks, because they never produce duplicate
+fragments (see "Trimming and buffering" -- first-arrival-wins already
+guarantees a canonical fragment set).
+
+### Pure-ACK-only emission policy
+
+SACK blocks are emitted only on `makePureAck`'s output, via
+`buildSackOptions(generateSackBlocks(...))`. Never on application-data
+segments, FIN segments, timeout retransmissions, or fast/NewReno
+recovery retransmissions -- so MSS-bounded data-segment sizing and
+retransmission payload boundaries are completely unaffected by SACK.
+`buildSackOptions` writes kind 5, `length = 2 + 8*N`, the N block pairs
+in network byte order, then EOL + zero padding to a 4-byte boundary --
+1/2/3/4 blocks give exactly 12/20/28/36 option bytes (32/40/48/56-byte
+TCP headers, Data Offset 8/10/12/14).
+
+`handleSynchronized` previously suppressed a pure ACK whenever scheduled
+data or a released payload's own reply already carried a valid ACK
+(avoiding a redundant reply). That rule now has one exception: when SACK
+is negotiated and out-of-order data is still held, the pure ACK is sent
+*in addition* to scheduled data / a released-payload reply, because it
+carries SACK information neither of those carries. An ordinary ACK-only
+input with nothing to report still gets no reply (no ACK-loop risk
+introduced).
+
+### Sender scoreboard: segment-granular, not sub-segment
+
+The existing bounded `pending` entries double as the sender's SACK
+scoreboard -- no separate range collection. Two new per-entry fields,
+meaningless (always `false`) when `!sack_permitted`:
+
+- `sacked`: set once the entry's *entire* current unacknowledged range is
+  covered by the normalized union of valid SACK blocks. Never unset
+  except by RTO (clears the whole scoreboard) or by the entry being
+  retired by a later cumulative ACK. A block covering only part of an
+  entry does **not** mark it `sacked` -- this milestone uses
+  pending-segment granularity, not arbitrary sub-ranges, so a partially
+  SACKed segment may be retransmitted in full later. This is a
+  deliberate, documented limitation, not an oversight.
+- `retransmitted_in_recovery`: set by any recovery retransmission of this
+  entry (duplicate-ACK-3, an additional SACK-guided duplicate ACK, or a
+  NewReno partial ACK), reset at the start of each fresh fast-recovery
+  episode (entry into recovery on duplicate ACK 3) and by RTO. Prevents
+  selecting the same entry twice within one recovery episode.
+
+`applySackBlocks(connection, cumulative_ack, blocks)` runs on every valid
+ACK on a negotiated connection (advancing or not), after
+`retireAcknowledged`. A block is semantically usable only if
+`left_edge` is strictly after `cumulative_ack`, `right_edge` is strictly
+after `left_edge`, and `right_edge` is at or before `snd_nxt` (using the
+project's wraparound-safe sequence comparisons) -- this excludes empty
+blocks, reversed blocks, DSACK-style blocks at/below the cumulative ACK,
+and blocks spanning unsent sequence space. An individually unusable
+block is simply dropped; it never invalidates the ACK's normal cumulative
+processing. The usable blocks are then sorted and merged (overlapping or
+touching blocks combined) before being checked against each pending
+entry, so repeated or overlapping reports are idempotent.
+
+`selectRecoveryRetransmission` -- shared by duplicate-ACK-3 entry,
+SACK-guided additional duplicate ACKs, and NewReno partial-ACK
+retransmission -- returns the oldest pending data entry (never SYN/FIN)
+that starts before `recovery_point`, is not `sacked`, and has not already
+been `retransmitted_in_recovery`, or `nullptr` if none qualifies (every
+outstanding entry already SACKed -- recovery state still changes, just
+no retransmission is emitted).
+
+### Cumulative ACK authority
+
+SACK information never performs any of the operations only the
+cumulative ACK field performs: it does not advance `snd_una`, does not
+remove a pending entry, does not trim pending payload, does not release
+application send-buffer capacity, does not grow `cwnd`, does not update
+`ssthresh`, and does not take an RTT sample. A later cumulative ACK may
+retire an entry that was previously marked `sacked` -- that retirement
+releases capacity exactly once, through the ordinary `retireAcknowledged`
+path, identically to an entry that was never SACKed at all.
+
+### RTT sampling and Karn's rule
+
+`retireAcknowledged`'s existing eligibility rule (`!was_retransmitted &&
+!rtt_sample_taken`) already excludes a SACKed-then-retransmitted entry
+for free, since any recovery retransmission sets `was_retransmitted`. No
+RTT sample is ever taken from the arrival of a SACK block itself -- only
+from an entry's eventual cumulative-ACK retirement, same as before this
+milestone.
+
+### NewReno partial-ACK recovery
+
+While in fast recovery, an advancing ACK below `recovery_point` (a
+NewReno partial ACK, RFC 6582-style approximation) does not exit
+recovery. Instead:
+
+```text
+deflated = max(cwnd - newly_acked_sequence_space, SMSS)
+if newly_acked_sequence_space >= SMSS:
+    deflated += SMSS
+cwnd = clamp(deflated)
+```
+
+computed in a wide (`uint64_t`) intermediate to avoid underflow before
+the `max`. `duplicate_ack_count` resets to 0 (same as any advancing ACK),
+`in_fast_recovery` stays `true`, and one further eligible retransmission
+is selected via `selectRecoveryRetransmission` and sent through
+`fast_retransmit` -- at most one per ACK, same field and same
+addressing/scheduling precedence as the duplicate-ACK-3 case. Ordinary
+Slow Start / Congestion Avoidance growth is not applied to this same ACK.
+This behavior is identical whether or not SACK was negotiated: without
+SACK, no entry is ever marked `sacked`, so `selectRecoveryRetransmission`
+degenerates to "the oldest entry not yet retransmitted this episode" --
+standard NewReno head-of-line retransmission.
+
+### SACK-guided additional duplicate ACKs
+
+An additional qualifying duplicate ACK while already in fast recovery
+still inflates `cwnd += SMSS`. When SACK is negotiated, it may *also*
+select one further eligible retransmission the same way a partial ACK
+does (skipping entries already `sacked` or already
+`retransmitted_in_recovery`, bounded to `sequence_start < recovery_point`)
+-- still at most one retransmission per incoming ACK.
+`applySackBlocks` runs before this selection, so a SACK report riding
+the same duplicate ACK that triggers this path is already reflected in
+which entries are skipped. Without SACK negotiated, additional duplicate
+ACKs never retransmit (existing classic-Reno behavior) -- only a partial
+ACK does. This is still not RFC 6675 pipe-estimation-based recovery.
+
+### RTO scoreboard reset
+
+`applyTimeoutCongestionCollapse` additionally clears every pending
+entry's `sacked` and `retransmitted_in_recovery` on every RTO of an
+application-data segment -- the safe fallback if the peer reneged on a
+prior SACK report (SACK reneging recovery beyond this is not
+implemented; timeout simply clears the whole segment-granular
+scoreboard and falls back to ordinary timeout retransmission). RST
+removal and timeout exhaustion both erase the connection (and therefore
+its scoreboard) entirely, same as before this milestone.
 
 ## Send buffering and scheduling
 
@@ -1086,6 +1301,17 @@ REQUIRED` when this has not been exercised in the current environment
 (e.g. no `CAP_NET_ADMIN` or usable non-interactive sudo) -- do not
 fabricate tcpdump evidence.
 
+A real client (Linux's own TCP) advertises `sackOK` in its SYN by
+default, so the same `curl`/`tcpdump` procedure above should show
+Wirestack's SYN-ACK echoing `sackOK` too (`tcpdump -vvv` prints the
+negotiated options). Repeating the `tc netem loss` procedure with a
+larger HTTP body (so more than one segment is outstanding at once) is
+expected to occasionally show a client ACK carrying `sack N:M` blocks
+alongside a duplicate ACK -- proof of the same selective-retransmission
+path exercised by `tests/test_tcp_sack_path.cpp`. `LIVE SACK RECOVERY:
+MANUAL VERIFICATION REQUIRED` when this has not been exercised in the
+current environment -- do not fabricate tcpdump evidence.
+
 To exercise zero-window persist live, the peer must deliberately
 advertise a zero receive window with an empty socket receive buffer
 (e.g. `nc -l` reading nothing, or a small Python socket with `SO_RCVBUF`
@@ -1104,15 +1330,19 @@ probe, and the reopening update.
 
 ## Known limitations
 
-- Only MSS and Window Scale options are understood; SACK-permitted and
-  timestamps are safely skipped like any other unknown well-formed
-  option, never interpreted or acted on.
-- Congestion control is a narrow, educational Reno-style model (Slow
-  Start, Congestion Avoidance, duplicate-ACK fast retransmit, classic
-  fast recovery) -- not a claim of full or RFC-compliant Reno. No NewReno
-  partial-ACK recovery, no SACK-based recovery, no PRR, no CUBIC, no BBR,
-  no ECN, no limited transmit, no congestion-window validation after
-  idle, no ACK pacing.
+- MSS, Window Scale, SACK-Permitted, and SACK are understood; timestamps
+  are safely skipped like any other unknown well-formed option, never
+  interpreted or acted on.
+- Congestion control is a narrow, educational Reno/NewReno-style model
+  (Slow Start, Congestion Avoidance, duplicate-ACK fast retransmit,
+  NewReno-style partial-ACK recovery, a bounded segment-granular SACK
+  scoreboard) -- not a claim of full or RFC-compliant Reno/NewReno/SACK.
+  Specifically: SACK coverage is segment-granular, not sub-range -- a
+  partially SACKed pending entry may be retransmitted in full; no SACK
+  reneging recovery beyond clearing the whole scoreboard on RTO; no
+  DSACK; no RFC 6675 pipe-estimation algorithm; no PRR; no Limited
+  Transmit; no CUBIC; no BBR; no ECN; no congestion-window validation
+  after idle; no ACK pacing.
 - No active open (Wirestack never initiates a connection).
 - No challenge ACK; an unacceptable RST is simply dropped.
 - The RTT/RTO estimator is an integer-arithmetic approximation of
@@ -1144,4 +1374,5 @@ probe, and the reopening update.
 
 ## Next TCP work
 
-No further milestone is currently scoped.
+Reproducible Linux TAP interoperability, loss/reordering qualification,
+and packet-capture evidence.

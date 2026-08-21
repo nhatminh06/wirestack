@@ -74,15 +74,29 @@ using TcpSerializeResult = std::variant<std::vector<std::byte>, TcpSerializeErro
 TcpSerializeResult serializeTcpSegment(const TcpSegment& segment, Ipv4Address source,
                                         Ipv4Address destination);
 
+// A parsed SACK block: [left_edge, right_edge) in TCP sequence-number
+// space. left_edge is inclusive, right_edge is exclusive.
+struct TcpSackBlock {
+    std::uint32_t left_edge;
+    std::uint32_t right_edge;
+
+    friend bool operator==(const TcpSackBlock&, const TcpSackBlock&) = default;
+};
+
 // Only the options Wirestack understands (see docs/tcp.md): Maximum
-// Segment Size and Window Scale. Every other well-formed option kind is
-// safely skipped, not stored -- Wirestack negotiates nothing else.
+// Segment Size, Window Scale, SACK-Permitted, and SACK. Every other
+// well-formed option kind is safely skipped, not stored -- Wirestack
+// negotiates nothing else.
 struct TcpParsedOptions {
     std::optional<std::uint16_t> maximum_segment_size;
     // Raw parsed shift count, not yet clamped to the 14-bit maximum a
     // real window field can represent -- callers that use this for
     // arithmetic must clamp it themselves (see tcp_connection.cpp).
     std::optional<std::uint8_t> window_scale;
+    bool sack_permitted = false;
+    // At most 4 blocks (bounded by the largest valid SACK option length,
+    // 2 + 8*4 == 34 bytes).
+    std::vector<TcpSackBlock> sack_blocks;
 };
 
 enum class TcpOptionParseError {
@@ -93,6 +107,10 @@ enum class TcpOptionParseError {
     DuplicateMss,
     DuplicateWindowScale,
     InvalidMss,           // MSS value of exactly 0
+    DuplicateSackPermitted,
+    DuplicateSack,
+    InvalidSackPermittedLength,   // SACK-Permitted with length != 2
+    InvalidSackLength,            // SACK with length not in {10, 18, 26, 34}
 };
 
 using TcpOptionParseResult = std::variant<TcpParsedOptions, TcpOptionParseError>;

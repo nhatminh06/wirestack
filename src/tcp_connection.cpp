@@ -144,11 +144,18 @@ void TcpConnectionTable::applyTimeoutCongestionCollapse(Connection& connection) 
     connection.duplicate_ack_count = 0;
     connection.in_fast_recovery = false;
     connection.congestion_avoidance_acked_bytes = 0;
+    // Timeout is the safe fallback if the peer reneged on a prior SACK
+    // report (reneging recovery beyond this is not implemented -- see
+    // docs/tcp.md): clear the segment-granular scoreboard entirely.
+    for (auto& entry : connection.pending) {
+        entry.sacked = false;
+        entry.retransmitted_in_recovery = false;
+    }
 }
 
-TcpSegment TcpConnectionTable::beginFastRecovery(const TcpConnectionKey& key,
-                                                   Connection& connection,
-                                                   TcpClock::time_point now) {
+std::optional<TcpSegment> TcpConnectionTable::beginFastRecovery(const TcpConnectionKey& key,
+                                                                   Connection& connection,
+                                                                   TcpClock::time_point now) {
     std::uint32_t flight = connection.snd_nxt - connection.snd_una;
     std::uint32_t smss = connection.effective_send_mss;
     connection.ssthresh = clampCwnd(std::max<std::uint64_t>(flight / 2, std::uint64_t{2} * smss));
@@ -157,31 +164,18 @@ TcpSegment TcpConnectionTable::beginFastRecovery(const TcpConnectionKey& key,
     connection.in_fast_recovery = true;
     connection.congestion_avoidance_acked_bytes = 0;
 
-    // The oldest outstanding application-data entry -- never SYN or FIN.
-    // Guaranteed to exist: the caller only reaches here after confirming
-    // an eligible data entry is pending.
-    auto it = std::find_if(connection.pending.begin(), connection.pending.end(),
-                            [](const PendingTransmission& p) { return !p.is_syn && !p.is_fin; });
-    PendingTransmission& entry = *it;
+    // Fresh recovery episode: nothing has been retransmitted within it
+    // yet. sacked marks are untouched -- they remain valid scoreboard
+    // information across episodes until cumulative ACK or RTO clears them.
+    for (auto& entry : connection.pending) {
+        entry.retransmitted_in_recovery = false;
+    }
 
-    TcpSegment segment;
-    segment.source_port = key.local_port;
-    segment.destination_port = key.remote_port;
-    segment.sequence_number = entry.sequence_start;
-    segment.acknowledgment_number = connection.rcv_nxt;
-    segment.flags = entry.flags;
-    segment.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
-    segment.urgent_pointer = 0;
-    segment.payload = entry.payload;
-
-    // Karn ambiguity, not a timeout retry: restart this entry's deadline
-    // from now without doubling its timeout_interval, touching the
-    // connection's current_rto, incrementing timeout_retransmit_count, or
-    // changing first_sent_at.
-    entry.was_retransmitted = true;
-    entry.last_sent_at = now;
-
-    return segment;
+    PendingTransmission* entry = selectRecoveryRetransmission(connection);
+    if (!entry) {
+        return std::nullopt; // every outstanding data entry already sacked
+    }
+    return buildRecoveryRetransmission(key, connection, *entry, now);
 }
 
 std::size_t TcpConnectionTable::appOwnedBytes(const Connection& connection) {
@@ -355,11 +349,41 @@ std::vector<std::byte> TcpConnectionTable::buildSynAckOptions(const Connection& 
     out.push_back(std::byte{4}); // length
     out.push_back(static_cast<std::byte>((kTcpMss >> 8) & 0xff));
     out.push_back(static_cast<std::byte>(kTcpMss & 0xff));
+    if (connection.sack_permitted) {
+        out.push_back(std::byte{4}); // kind: SACK-Permitted
+        out.push_back(std::byte{2}); // length
+    }
     if (connection.window_scaling_enabled) {
         out.push_back(std::byte{1}); // NOP (pads to a 4-byte boundary)
         out.push_back(std::byte{3}); // kind: Window Scale
         out.push_back(std::byte{3}); // length
         out.push_back(static_cast<std::byte>(connection.local_window_scale));
+    }
+    // EOL + zero padding to a 4-byte boundary -- MSS and MSS+Window Scale
+    // are already aligned, so this is a no-op for those two combinations.
+    while (out.size() % 4 != 0) {
+        out.push_back(std::byte{0});
+    }
+    return out;
+}
+
+std::vector<std::byte> TcpConnectionTable::buildSackOptions(const std::vector<TcpSackBlock>& blocks) {
+    std::vector<std::byte> out;
+    if (blocks.empty()) {
+        return out;
+    }
+    out.push_back(std::byte{5}); // kind: SACK
+    out.push_back(static_cast<std::byte>(2 + 8 * blocks.size()));
+    for (const auto& block : blocks) {
+        for (std::uint32_t value : {block.left_edge, block.right_edge}) {
+            out.push_back(static_cast<std::byte>((value >> 24) & 0xff));
+            out.push_back(static_cast<std::byte>((value >> 16) & 0xff));
+            out.push_back(static_cast<std::byte>((value >> 8) & 0xff));
+            out.push_back(static_cast<std::byte>(value & 0xff));
+        }
+    }
+    while (out.size() % 4 != 0) { // EOL + zero padding
+        out.push_back(std::byte{0});
     }
     return out;
 }
@@ -379,8 +403,8 @@ TcpSegment TcpConnectionTable::makeSynAck(const TcpConnectionKey& key,
     return reply;
 }
 
-TcpSegment TcpConnectionTable::makePureAck(const TcpConnectionKey& key,
-                                            const Connection& connection) {
+TcpSegment TcpConnectionTable::makePureAck(const TcpConnectionKey& key, const Connection& connection,
+                                            std::optional<std::uint32_t> most_recent_fragment_start) {
     TcpSegment reply;
     reply.source_port = key.local_port;
     reply.destination_port = key.remote_port;
@@ -389,7 +413,144 @@ TcpSegment TcpConnectionTable::makePureAck(const TcpConnectionKey& key,
     reply.flags.ack = true;
     reply.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
     reply.urgent_pointer = 0;
+    if (connection.sack_permitted) {
+        reply.options =
+            buildSackOptions(generateSackBlocks(connection, most_recent_fragment_start));
+    }
     return reply;
+}
+
+std::vector<TcpSackBlock> TcpConnectionTable::generateSackBlocks(
+    const Connection& connection, std::optional<std::uint32_t> most_recent_fragment_start) {
+    std::vector<TcpSackBlock> blocks;
+    if (connection.out_of_order.empty()) {
+        return blocks;
+    }
+
+    const TcpReassemblyFragment* most_recent = nullptr;
+    if (most_recent_fragment_start) {
+        for (const auto& fragment : connection.out_of_order) {
+            if (fragment.sequence_start == *most_recent_fragment_start) {
+                most_recent = &fragment;
+                break;
+            }
+        }
+    }
+
+    std::vector<const TcpReassemblyFragment*> rest;
+    for (const auto& fragment : connection.out_of_order) {
+        if (&fragment != most_recent) {
+            rest.push_back(&fragment);
+        }
+    }
+    std::sort(rest.begin(), rest.end(),
+              [](const TcpReassemblyFragment* a, const TcpReassemblyFragment* b) {
+                  return sequenceGreater(a->sequence_start, b->sequence_start);
+              });
+
+    std::vector<const TcpReassemblyFragment*> ordered;
+    if (most_recent) {
+        ordered.push_back(most_recent);
+    }
+    ordered.insert(ordered.end(), rest.begin(), rest.end());
+
+    for (const auto* fragment : ordered) {
+        if (blocks.size() >= 4) {
+            break;
+        }
+        blocks.push_back(TcpSackBlock{fragment->sequence_start, fragment->sequenceEnd()});
+    }
+    return blocks;
+}
+
+void TcpConnectionTable::applySackBlocks(Connection& connection, std::uint32_t cumulative_ack,
+                                          const std::vector<TcpSackBlock>& blocks) {
+    // Semantic validation relative to the cumulative ACK (see docs/tcp.md):
+    // left_edge strictly after cumulative_ack, right_edge strictly after
+    // left_edge, right_edge at or before snd_nxt. Structurally valid but
+    // semantically unusable blocks are dropped individually.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> valid;
+    for (const auto& block : blocks) {
+        if (!sequenceGreater(block.left_edge, cumulative_ack)) {
+            continue;
+        }
+        if (!sequenceGreater(block.right_edge, block.left_edge)) {
+            continue;
+        }
+        if (sequenceGreater(block.right_edge, connection.snd_nxt)) {
+            continue;
+        }
+        valid.push_back({block.left_edge, block.right_edge});
+    }
+    if (valid.empty()) {
+        return;
+    }
+
+    // Normalize: sort by left edge (wraparound-safe, all edges lie within
+    // the bounded [cumulative_ack, snd_nxt] range) and merge overlapping
+    // or touching blocks.
+    std::sort(valid.begin(), valid.end(),
+              [](const auto& a, const auto& b) { return sequenceGreater(b.first, a.first); });
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> merged;
+    for (const auto& [left, right] : valid) {
+        if (!merged.empty() && !sequenceGreater(left, merged.back().second)) {
+            merged.back().second = sequenceMax(merged.back().second, right);
+        } else {
+            merged.push_back({left, right});
+        }
+    }
+
+    for (auto& entry : connection.pending) {
+        if (entry.is_syn || entry.is_fin || entry.sacked) {
+            continue;
+        }
+        for (const auto& [left, right] : merged) {
+            if (sequenceLessOrEqual(left, entry.sequence_start) &&
+                sequenceLessOrEqual(entry.sequenceEnd(), right)) {
+                entry.sacked = true;
+                break;
+            }
+        }
+    }
+}
+
+TcpConnectionTable::PendingTransmission* TcpConnectionTable::selectRecoveryRetransmission(
+    Connection& connection) {
+    for (auto& entry : connection.pending) {
+        if (entry.is_syn || entry.is_fin) {
+            continue;
+        }
+        if (!sequenceGreater(connection.recovery_point, entry.sequence_start)) {
+            break; // pending is send-ordered: nothing later qualifies either
+        }
+        if (entry.sacked || entry.retransmitted_in_recovery) {
+            continue;
+        }
+        return &entry;
+    }
+    return nullptr;
+}
+
+TcpSegment TcpConnectionTable::buildRecoveryRetransmission(const TcpConnectionKey& key,
+                                                             Connection& connection,
+                                                             PendingTransmission& entry,
+                                                             TcpClock::time_point now) {
+    TcpSegment segment;
+    segment.source_port = key.local_port;
+    segment.destination_port = key.remote_port;
+    segment.sequence_number = entry.sequence_start;
+    segment.acknowledgment_number = connection.rcv_nxt;
+    segment.flags = entry.flags;
+    segment.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
+    segment.urgent_pointer = 0;
+    segment.payload = entry.payload;
+
+    // Karn ambiguity, not a timeout retry -- see beginFastRecovery.
+    entry.was_retransmitted = true;
+    entry.retransmitted_in_recovery = true;
+    entry.last_sent_at = now;
+
+    return segment;
 }
 
 TcpSegment TcpConnectionTable::makeFin(const TcpConnectionKey& key, const Connection& connection) {
@@ -469,6 +630,12 @@ TcpConnectionTable::TcpAckRetirementResult TcpConnectionTable::retireAcknowledge
             entry.payload.erase(entry.payload.begin(),
                                  entry.payload.begin() + trimmed);
             entry.sequence_start = ack;
+            // The retained suffix is a still-unacknowledged range that has
+            // not itself been retransmitted -- re-eligible for
+            // selectRecoveryRetransmission. was_retransmitted (Karn
+            // ambiguity) is untouched: the bytes it now covers were, in
+            // part, actually sent by that earlier retransmission.
+            entry.retransmitted_in_recovery = false;
         }
         break; // TCP is send-ordered: no later entry can be (partially) acked yet
     }
@@ -576,6 +743,16 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         return {};
     }
 
+    // Malformed options drop the whole segment before any state mutation --
+    // including an otherwise-acceptable RST: no reset, no ACK processing,
+    // no window update, no congestion-state change, no SACK marking, no
+    // payload acceptance, no FIN consumption (see docs/tcp.md).
+    auto parsed_options_result = parseTcpOptions(segment.options);
+    if (std::holds_alternative<TcpOptionParseError>(parsed_options_result)) {
+        return {};
+    }
+    const TcpParsedOptions& parsed_options = std::get<TcpParsedOptions>(parsed_options_result);
+
     if (segment.flags.rst) {
         // Acceptable only if it lands exactly at the next expected byte.
         if (segment.sequence_number == connection.rcv_nxt) {
@@ -598,26 +775,60 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     }
     TcpAckRetirementResult ack_result =
         retireAcknowledged(connection, segment.acknowledgment_number, now);
+
+    // Established-state SACK blocks are processed only for a negotiated
+    // connection (see docs/tcp.md); parsed but semantically ignored
+    // otherwise. Never advances snd_una, frees capacity, grows cwnd, or
+    // takes an RTT sample -- only the cumulative ACK above does that.
+    if (connection.sack_permitted) {
+        applySackBlocks(connection, segment.acknowledgment_number, parsed_options.sack_blocks);
+    }
+
     std::uint32_t snd_wnd_before = connection.snd_wnd;
     updateSendWindow(connection, segment);
     bool window_changed = connection.snd_wnd != snd_wnd_before;
 
-    // Reno-style congestion control (see docs/tcp.md). An advancing ACK
-    // either exits fast recovery (classic Reno: any advancing ACK exits,
-    // even one covering less than recovery_point -- NewReno partial-ACK
-    // recovery is out of scope for this milestone) or applies ordinary
-    // Slow Start/Congestion Avoidance growth. A non-advancing ACK is
-    // checked against the duplicate-ACK definition; the third qualifying
-    // duplicate triggers one fast retransmission, and later qualifying
-    // duplicates while already in recovery inflate cwnd without
-    // retransmitting again.
+    // Reno/NewReno-style congestion control (see docs/tcp.md). An
+    // advancing ACK either fully exits fast recovery (reaches
+    // recovery_point), applies NewReno partial-ACK recovery (advances but
+    // stays below recovery_point), or -- outside recovery -- applies
+    // ordinary Slow Start/Congestion Avoidance growth. A non-advancing ACK
+    // is checked against the duplicate-ACK definition; the third
+    // qualifying duplicate triggers one fast retransmission, and later
+    // qualifying duplicates while already in recovery inflate cwnd and,
+    // when SACK was negotiated, may also select one further eligible
+    // retransmission.
     std::optional<TcpSegment> fast_retransmit_segment;
     if (ack_result.ack_advanced) {
         connection.duplicate_ack_count = 0;
         if (connection.in_fast_recovery) {
-            connection.cwnd = connection.ssthresh;
-            connection.in_fast_recovery = false;
-            connection.congestion_avoidance_acked_bytes = 0;
+            if (sequenceLessOrEqual(connection.recovery_point, segment.acknowledgment_number)) {
+                // Full ACK: recovery_point reached or passed.
+                connection.cwnd = connection.ssthresh;
+                connection.in_fast_recovery = false;
+                connection.congestion_avoidance_acked_bytes = 0;
+                for (auto& entry : connection.pending) {
+                    entry.retransmitted_in_recovery = false;
+                }
+            } else {
+                // NewReno partial ACK: remain in recovery, deflate cwnd by
+                // the newly acknowledged sequence space and add back one
+                // SMSS if that space covered at least one SMSS (RFC
+                // 6582-style approximation -- see docs/tcp.md), then
+                // retransmit at most one further eligible entry.
+                std::uint32_t smss = connection.effective_send_mss;
+                std::uint64_t deflate_by = ack_result.newly_acked_sequence_space;
+                std::uint64_t deflated =
+                    connection.cwnd > deflate_by ? connection.cwnd - deflate_by : 0;
+                deflated = std::max<std::uint64_t>(deflated, smss);
+                if (deflate_by >= smss) {
+                    deflated += smss;
+                }
+                connection.cwnd = clampCwnd(deflated);
+                if (PendingTransmission* entry = selectRecoveryRetransmission(connection)) {
+                    fast_retransmit_segment = buildRecoveryRetransmission(key, connection, *entry, now);
+                }
+            }
         } else {
             applyCongestionGrowth(connection, ack_result.newly_acked_data_bytes);
         }
@@ -633,6 +844,12 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
             if (connection.in_fast_recovery) {
                 connection.cwnd = clampCwnd(std::uint64_t{connection.cwnd} +
                                              connection.effective_send_mss);
+                if (connection.sack_permitted) {
+                    if (PendingTransmission* entry = selectRecoveryRetransmission(connection)) {
+                        fast_retransmit_segment =
+                            buildRecoveryRetransmission(key, connection, *entry, now);
+                    }
+                }
             } else if (connection.duplicate_ack_count == 3) {
                 fast_retransmit_segment = beginFastRecovery(key, connection, now);
             }
@@ -674,14 +891,18 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     if (segment.payload.empty() && !segment.flags.fin) {
         // Ack information already processed above; an ordinary ACK-only
         // segment does not itself warrant a reply (that would create an
-        // ACK loop). This is also exactly where a LastAck connection's
-        // final ACK lands, so pending_removal (just possibly set above)
-        // is surfaced here. No payload/FIN means no receive-side state
-        // change, so rcv_nxt is already final here.
+        // ACK loop) UNLESS receive-side SACK information exists to report
+        // (see docs/tcp.md). This is also exactly where a LastAck
+        // connection's final ACK lands, so pending_removal (just possibly
+        // set above) is surfaced here. No payload/FIN means no
+        // receive-side state change, so rcv_nxt is already final here.
         TcpReceiveResult result;
         result.connection_closed = connection.pending_removal;
         result.fast_retransmit = fast_retransmit_segment;
         result.scheduled = scheduleIfSendable();
+        if (connection.sack_permitted && !connection.out_of_order.empty()) {
+            result.reply = makePureAck(key, connection);
+        }
         return result;
     }
 
@@ -722,12 +943,14 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         TcpReceiveResult result;
         result.fast_retransmit = fast_retransmit_segment;
         result.scheduled = scheduleIfSendable();
-        if (result.scheduled.empty()) {
+        if (result.scheduled.empty() ||
+            (connection.sack_permitted && !connection.out_of_order.empty())) {
             result.reply = makePureAck(key, connection);
         }
         return result;
     }
 
+    std::optional<std::uint32_t> most_recent_fragment_start;
     if (any_payload_in_window) {
         std::uint32_t prefix_trim = usable_start - seg_start;
         std::uint32_t usable_len = usable_end - usable_start;
@@ -735,6 +958,18 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
             segment.payload.begin() + prefix_trim,
             segment.payload.begin() + prefix_trim + usable_len);
         insertReassemblyFragment(connection, usable_start, std::move(usable_payload));
+        // Identify (after coalescing) the fragment now containing the
+        // just-inserted range, for SACK block ordering (see
+        // generateSackBlocks) -- nullopt if it was released into rcv_nxt
+        // below, in which case it correctly disappears from any generated
+        // SACK blocks.
+        for (const auto& fragment : connection.out_of_order) {
+            if (sequenceLessOrEqual(fragment.sequence_start, usable_start) &&
+                sequenceGreater(fragment.sequenceEnd(), usable_start)) {
+                most_recent_fragment_start = fragment.sequence_start;
+                break;
+            }
+        }
     }
     if (fin_in_window) {
         connection.pending_fin_seq = seg_end;
@@ -764,14 +999,19 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     // the newly consumed peer sequence space.
     result.scheduled = scheduleIfSendable();
 
-    // Only reply directly when nothing was released -- an out-of-order
-    // arrival (still gapped) gets a duplicate ACK; a released payload is
-    // ACKed by whatever the caller builds from accepted_payload instead
-    // (an echo/response), avoiding a redundant separate ACK. Scheduled
-    // data (if any) already carries a valid ACK too, so it takes the
-    // same precedence as a released payload.
-    if (result.accepted_payload.empty() && result.scheduled.empty()) {
-        result.reply = makePureAck(key, connection);
+    // Normally reply directly only when nothing was released -- an
+    // out-of-order arrival (still gapped) gets a duplicate ACK; a released
+    // payload is ACKed by whatever the caller builds from accepted_payload
+    // instead (an echo/response), avoiding a redundant separate ACK.
+    // Scheduled data (if any) already carries a valid ACK too, so it takes
+    // the same precedence as a released payload. The one exception is a
+    // negotiated connection with SACK information to report (see
+    // docs/tcp.md) -- that pure ACK is not redundant, since neither a
+    // released payload's reply nor a scheduled data segment carries SACK
+    // metadata, so it may be sent alongside either.
+    if ((result.accepted_payload.empty() && result.scheduled.empty()) ||
+        (connection.sack_permitted && !connection.out_of_order.empty())) {
+        result.reply = makePureAck(key, connection, most_recent_fragment_start);
     }
     return result;
 }
@@ -841,6 +1081,14 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
         }
         const auto& options = std::get<TcpParsedOptions>(parsed_options);
 
+        // A SYN carrying a SACK block option is invalid for this
+        // milestone (SACK is only meaningful once a connection has
+        // outstanding data) -- reject the whole segment rather than
+        // create a connection.
+        if (!options.sack_blocks.empty()) {
+            return {};
+        }
+
         Connection connection;
         connection.state = TcpState::SynReceived;
         connection.remote_isn = segment.sequence_number;
@@ -860,6 +1108,7 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
                 std::min<std::uint8_t>(*options.window_scale, kMaxWindowScaleShift);
             connection.local_window_scale = kLocalWindowScaleShift;
         }
+        connection.sack_permitted = options.sack_permitted;
 
         auto [inserted_it, _] = connections_.emplace(key, connection);
 
@@ -961,6 +1210,16 @@ std::optional<TcpConnectionSnapshot> TcpConnectionTable::snapshotOf(
         return std::nullopt;
     }
     const Connection& connection = it->second;
+    std::size_t sacked_count = 0;
+    std::size_t recovery_retransmitted_count = 0;
+    for (const auto& entry : connection.pending) {
+        if (entry.sacked) {
+            sacked_count += 1;
+        }
+        if (entry.retransmitted_in_recovery) {
+            recovery_retransmitted_count += 1;
+        }
+    }
     return TcpConnectionSnapshot{
         connection.state,
         connection.rcv_nxt,
@@ -986,6 +1245,9 @@ std::optional<TcpConnectionSnapshot> TcpConnectionTable::snapshotOf(
         connection.in_fast_recovery,
         connection.recovery_point,
         connection.congestion_avoidance_acked_bytes,
+        connection.sack_permitted,
+        sacked_count,
+        recovery_retransmitted_count,
         connection.unsent.size(),
         appOwnedBytes(connection),
         connection.close_requested,

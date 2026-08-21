@@ -182,6 +182,8 @@ constexpr std::uint8_t kOptionKindEndOfList = 0;
 constexpr std::uint8_t kOptionKindNoOperation = 1;
 constexpr std::uint8_t kOptionKindMss = 2;
 constexpr std::uint8_t kOptionKindWindowScale = 3;
+constexpr std::uint8_t kOptionKindSackPermitted = 4;
+constexpr std::uint8_t kOptionKindSack = 5;
 
 } // namespace
 
@@ -231,6 +233,28 @@ TcpOptionParseResult parseTcpOptions(std::span<const std::byte> options) {
                 return TcpOptionParseError::DuplicateWindowScale;
             }
             parsed.window_scale = static_cast<std::uint8_t>(options[i + 2]);
+        } else if (kind == kOptionKindSackPermitted) {
+            if (length != 2) {
+                return TcpOptionParseError::InvalidSackPermittedLength;
+            }
+            if (parsed.sack_permitted) {
+                return TcpOptionParseError::DuplicateSackPermitted;
+            }
+            parsed.sack_permitted = true;
+        } else if (kind == kOptionKindSack) {
+            if (length != 10 && length != 18 && length != 26 && length != 34) {
+                return TcpOptionParseError::InvalidSackLength;
+            }
+            if (!parsed.sack_blocks.empty()) {
+                return TcpOptionParseError::DuplicateSack;
+            }
+            std::size_t block_count = (static_cast<std::size_t>(length) - 2) / 8;
+            for (std::size_t b = 0; b < block_count; ++b) {
+                std::size_t block_offset = i + 2 + b * 8;
+                std::uint32_t left = readBigEndian32(options, block_offset);
+                std::uint32_t right = readBigEndian32(options, block_offset + 4);
+                parsed.sack_blocks.push_back(TcpSackBlock{left, right});
+            }
         }
         // Any other kind is an unknown well-formed option: safely
         // skipped below using its own declared length, never interpreted.

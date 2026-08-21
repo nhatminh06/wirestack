@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 13 (bounded TCP send
-buffering, ACK-driven scheduling, and zero-window persist probes):
+Milestone 0 (project foundation) through Milestone 14 (NewReno
+partial-ACK recovery and a bounded segment-granular SACK scoreboard):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,7 +18,7 @@ buffering, ACK-driven scheduling, and zero-window persist probes):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake with SYN-carried MSS/Window Scale option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly, RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit/fast recovery, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
+| TCP         | passive handshake with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
 | HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented and deterministically tested; live curl verification still required |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -32,9 +32,10 @@ buffering, ACK-driven scheduling, and zero-window persist probes):
   minimal `UdpEndpointTable`, and a built-in echo endpoint on port 9000
 - TCP segment parsing/serialization with the IPv4 pseudo-header checksum, a
   4-tuple `TcpConnectionTable`, a passive handshake (LISTEN implicit /
-  SYN_RECEIVED / ESTABLISHED) that parses and negotiates a SYN's MSS and
-  Window Scale options (IPv4 default 536-byte MSS fallback, Window Scale
-  clamped to 14, both fixed for the connection's lifetime), sequence-space
+  SYN_RECEIVED / ESTABLISHED) that parses and negotiates a SYN's MSS,
+  Window Scale, and SACK-Permitted options (IPv4 default 536-byte MSS
+  fallback, Window Scale clamped to 14, all fixed for the connection's
+  lifetime), sequence-space
   tracking, a bounded (262144-byte) per-connection application send
   buffer with atomic enqueue/backpressure and FIFO ordering across
   enqueue calls, scheduled by every ACK/window update into
@@ -52,9 +53,12 @@ buffering, ACK-driven scheduling, and zero-window persist probes):
   retirement, a per-connection Reno-style congestion window (initial
   window sized from the negotiated MSS, Slow Start, Congestion Avoidance,
   precise duplicate-ACK classification, third-duplicate-ACK fast
-  retransmit, classic fast recovery, and timeout congestion collapse, all
-  gating new application data alongside the peer's advertised window), a
-  deterministic zero-window persist probe (1s-60s exponential backoff,
+  retransmit, NewReno-style partial-ACK recovery, a bounded
+  segment-granular SACK scoreboard used to skip already-acknowledged
+  segments during selective retransmission when SACK was negotiated, and
+  timeout congestion collapse, all gating new application data alongside
+  the peer's advertised window), a deterministic zero-window persist
+  probe (1s-60s exponential backoff,
   narrowly scoped to unsent data with no sequence space outstanding),
   passive/active/simultaneous close
   (FinWait1/FinWait2/CloseWait/Closing/LastAck, FIN deferred until all
@@ -83,11 +87,13 @@ echo, a completed TCP handshake, and a `curl --http1.0` request) is
 manually verifiable but has not been exercised in every development
 environment this project has run in — see those docs for exact commands.
 
-Not implemented: TCP active-open/NewReno partial-ACK recovery/SACK/
-CUBIC/BBR/ECN/timestamps (persist is implemented, but only for the
-narrow no-outstanding-data case -- see docs/tcp.md), HTTP/1.1/keep-alive/
-pipelining/request bodies/chunked encoding/TLS, IPv4 options,
-fragmentation, routing.
+Not implemented: TCP active-open/DSACK/RFC 6675 pipe-based recovery/PRR/
+Limited Transmit/CUBIC/BBR/ECN/timestamps (persist is implemented, but
+only for the narrow no-outstanding-data case; SACK coverage is
+segment-granular, not sub-range, and reneging recovery beyond clearing
+the scoreboard on RTO is not implemented -- see docs/tcp.md),
+HTTP/1.1/keep-alive/pipelining/request bodies/chunked encoding/TLS,
+IPv4 options, fragmentation, routing.
 
 ## Structure
 

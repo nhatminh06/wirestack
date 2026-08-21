@@ -73,6 +73,15 @@ struct TcpConnectionSnapshot {
     std::uint32_t recovery_point;
     std::uint32_t congestion_avoidance_acked_bytes;
 
+    // SACK (see docs/tcp.md). sack_permitted is fixed for the connection
+    // lifetime, decided only from the peer's initial SYN.
+    // sacked_pending_count/recovery_retransmitted_count are narrow
+    // read-only counts over the segment-granular scoreboard, exposed for
+    // tests without exposing the mutable pending entries themselves.
+    bool sack_permitted;
+    std::size_t sacked_pending_count;
+    std::size_t recovery_retransmitted_count;
+
     // Bounded application send buffer (see docs/tcp.md). unsent_bytes is
     // the FIFO backlog not yet in sequence space; owned_bytes additionally
     // includes application payload still retained in pending
@@ -94,14 +103,20 @@ struct TcpReceiveResult {
     // handshake, a pure ACK for a segment that released no new
     // contiguous bytes (duplicate, still-gapped out-of-order, or an
     // invalid ACK number) or for a peer FIN that arrived with no
-    // payload, or a closed-port/unknown-connection RST. Never set at the
-    // same time as a non-empty accepted_payload.
+    // payload, or a closed-port/unknown-connection RST. Normally never
+    // set at the same time as a non-empty accepted_payload or a non-empty
+    // `scheduled` -- except when SACK was negotiated and out-of-order
+    // receive state exists: that pure ACK carries SACK metadata absent
+    // from any data segment in `scheduled`, so it is not redundant and
+    // may be sent alongside it (see docs/tcp.md).
     std::optional<TcpSegment> reply;
 
-    // Set exactly on the call whose ACK is the third qualifying duplicate
-    // ACK (see docs/tcp.md): an immediate retransmission of the oldest
-    // outstanding application-data segment, distinct from `reply` and
-    // from ordinary timeout-triggered retransmission. The caller sends it
+    // Set exactly on the call whose ACK triggers one immediate loss-
+    // recovery retransmission (see docs/tcp.md): the third qualifying
+    // duplicate ACK, an additional SACK-guided duplicate ACK while already
+    // in fast recovery, or a NewReno partial ACK -- at most one such
+    // retransmission per incoming ACK, distinct from `reply` and from
+    // ordinary timeout-triggered retransmission. The caller sends it
     // through the same immediate-reply path as `reply`, addressed using
     // the current received frame, not the timer/ARP path.
     std::optional<TcpSegment> fast_retransmit;
@@ -306,10 +321,12 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 // processing with Slow Start/Congestion Avoidance growth, RTT-adaptive
 // timeout-based retransmission of sequence-consuming segments (SYN-ACK,
 // application data, FIN -- never pure ACKs), duplicate-ACK fast
-// retransmit and classic fast recovery, passive/active/simultaneous
-// close, deterministic TIME_WAIT, and acceptable inbound RST. No SACK,
-// no NewReno partial-ACK recovery, no CUBIC/BBR, no ECN, no TCP
-// timestamps, no active open.
+// retransmit, NewReno-style partial-ACK recovery, and a bounded
+// segment-granular SACK scoreboard (see docs/tcp.md), passive/active/
+// simultaneous close, deterministic TIME_WAIT, and acceptable inbound
+// RST. No DSACK, no SACK reneging recovery beyond clearing marks on RTO,
+// no RFC 6675 pipe algorithm, no CUBIC/BBR, no ECN, no TCP timestamps, no
+// active open.
 class TcpConnectionTable {
 public:
     explicit TcpConnectionTable(std::uint16_t listen_port);
@@ -404,6 +421,17 @@ private:
         // never-retransmitted entry may still be ineligible for a *second*
         // sample after a partial ACK already sampled it once.
         bool rtt_sample_taken = false;
+        // Segment-granular SACK scoreboard (see docs/tcp.md). `sacked` is
+        // set once this entry's whole unacknowledged range is covered by
+        // the normalized union of valid SACK blocks -- never unset except
+        // by RTO (see applyTimeoutCongestionCollapse) or by ordinary
+        // cumulative-ACK retirement removing the entry. `retransmitted_in_
+        // recovery` is reset at the start of each fast-recovery episode
+        // and prevents selecting the same entry twice within it. Both are
+        // meaningless (always false) when sack_permitted is false. SYN/FIN
+        // entries are never marked either.
+        bool sacked = false;
+        bool retransmitted_in_recovery = false;
 
         std::uint32_t sequenceEnd() const {
             return sequence_start + static_cast<std::uint32_t>(payload.size()) +
@@ -471,6 +499,9 @@ private:
         std::uint8_t peer_window_scale = 0;  // clamped to [0, kMaxWindowScaleShift]
         std::uint8_t local_window_scale = 0; // 0 unless negotiated; kLocalWindowScaleShift if so
         bool window_scaling_enabled = false;
+        // Decided once from the peer's initial SYN (see docs/tcp.md);
+        // never renegotiated by a duplicate SYN or any later segment.
+        bool sack_permitted = false;
 
         // RFC 6298-style adaptive RTO estimator.
         bool has_rtt_sample = false;
@@ -512,13 +543,65 @@ private:
     std::uint32_t nextIsn();
 
     static TcpSegment makeSynAck(const TcpConnectionKey& key, const Connection& connection);
-    static TcpSegment makePureAck(const TcpConnectionKey& key, const Connection& connection);
+    // `most_recent_fragment_start`, when set, identifies the out-of-order
+    // fragment (by its current sequence_start) that should occupy the
+    // first SACK block position (see generateSackBlocks); nullopt falls
+    // back to highest-to-lowest ordering only. Ignored when
+    // !connection.sack_permitted or no out-of-order fragments remain.
+    static TcpSegment makePureAck(const TcpConnectionKey& key, const Connection& connection,
+                                   std::optional<std::uint32_t> most_recent_fragment_start = std::nullopt);
     static TcpSegment makeFin(const TcpConnectionKey& key, const Connection& connection);
 
-    // MSS (always kTcpMss, never derived from the peer) and, only when
-    // window_scaling_enabled, NOP + Window Scale -- see docs/tcp.md for
-    // the exact byte layouts. Already word-aligned; no padding needed.
+    // MSS (always kTcpMss, never derived from the peer), SACK-Permitted
+    // (only when sack_permitted), and Window Scale (only when
+    // window_scaling_enabled), in that fixed order, followed by EOL/
+    // padding to a 4-byte boundary -- see docs/tcp.md for the exact byte
+    // layouts.
     static std::vector<std::byte> buildSynAckOptions(const Connection& connection);
+
+    // Builds a kind-5 SACK option (2 + 8*N bytes, N == blocks.size(),
+    // EOL/zero-padded to a 4-byte boundary) or an empty vector if `blocks`
+    // is empty.
+    static std::vector<std::byte> buildSackOptions(const std::vector<TcpSackBlock>& blocks);
+
+    // Deterministic receiver SACK block policy (see docs/tcp.md): at most
+    // 4 blocks, one per retained out-of-order fragment, edges exact
+    // (fragment.sequence_start, fragment.sequenceEnd()). The fragment
+    // identified by `most_recent_fragment_start` (if it still exists in
+    // connection.out_of_order) occupies the first position; remaining
+    // fragments fill in descending sequence_start order. Empty if
+    // connection.out_of_order is empty.
+    static std::vector<TcpSackBlock> generateSackBlocks(
+        const Connection& connection, std::optional<std::uint32_t> most_recent_fragment_start);
+
+    // Validates each block in `blocks` against `cumulative_ack` and
+    // connection.snd_nxt (see docs/tcp.md: left_edge must be strictly
+    // after cumulative_ack, right_edge strictly after left_edge, and at
+    // or before snd_nxt), normalizes the valid subset (sorted, overlapping
+    // and touching blocks merged), then marks every pending data entry
+    // (never SYN/FIN) whose full unacknowledged range is covered by that
+    // union as sacked. Never advances snd_una, never removes an entry,
+    // never touches cwnd/ssthresh, never takes an RTT sample. A no-op if
+    // `blocks` contains nothing valid.
+    static void applySackBlocks(Connection& connection, std::uint32_t cumulative_ack,
+                                 const std::vector<TcpSackBlock>& blocks);
+
+    // The oldest pending data entry (never SYN/FIN) that starts before
+    // recovery_point, is not marked sacked, and has not already been
+    // retransmitted in the current recovery episode -- or nullptr if none
+    // qualifies. Shared by duplicate-ACK-3 entry, SACK-guided additional
+    // duplicate ACKs, and NewReno partial-ACK retransmission.
+    static PendingTransmission* selectRecoveryRetransmission(Connection& connection);
+
+    // Builds an immediate retransmission of `entry` (preserving sequence
+    // and payload, refreshing ack/window), marks it was_retransmitted and
+    // retransmitted_in_recovery, and restarts last_sent_at from `now`
+    // without touching timeout_retransmit_count, timeout_interval, or
+    // connection.current_rto.
+    static TcpSegment buildRecoveryRetransmission(const TcpConnectionKey& key,
+                                                    Connection& connection,
+                                                    PendingTransmission& entry,
+                                                    TcpClock::time_point now);
 
     // Advances snd_una to `ack` and drains/trims the pending queue to
     // match, if `ack` is ahead of the current snd_una. A no-op (all-zero,
@@ -574,14 +657,15 @@ private:
     static void applyTimeoutCongestionCollapse(Connection& connection);
 
     // Enters fast recovery on the third qualifying duplicate ACK: sets
-    // ssthresh/cwnd/recovery_point per docs/tcp.md and returns an
-    // immediate retransmission of the oldest outstanding application-data
-    // pending entry (never SYN or FIN), restarting that entry's deadline
-    // from `now` without doubling its timeout or consuming timeout retry
-    // budget. Precondition: the caller has already confirmed an eligible
-    // data entry exists.
-    static TcpSegment beginFastRecovery(const TcpConnectionKey& key, Connection& connection,
-                                         TcpClock::time_point now);
+    // ssthresh/cwnd/recovery_point per docs/tcp.md, clears every pending
+    // entry's retransmitted_in_recovery (starting a fresh episode; sacked
+    // marks are untouched), and returns an immediate retransmission of the
+    // oldest eligible entry (see selectRecoveryRetransmission) if one
+    // exists -- nullopt only if every outstanding data entry is already
+    // marked sacked.
+    static std::optional<TcpSegment> beginFastRecovery(const TcpConnectionKey& key,
+                                                         Connection& connection,
+                                                         TcpClock::time_point now);
 
     // Total application bytes currently charged against
     // kTcpSendBufferCapacity: unsent.size() plus every non-SYN/FIN
