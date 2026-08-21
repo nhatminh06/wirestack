@@ -184,6 +184,122 @@ TcpSegment TcpConnectionTable::beginFastRecovery(const TcpConnectionKey& key,
     return segment;
 }
 
+std::size_t TcpConnectionTable::appOwnedBytes(const Connection& connection) {
+    std::size_t total = connection.unsent.size();
+    for (const auto& entry : connection.pending) {
+        if (!entry.is_syn && !entry.is_fin) {
+            total += entry.payload.size();
+        }
+    }
+    return total;
+}
+
+void TcpConnectionTable::maybeSequenceFin(const TcpConnectionKey& key, Connection& connection,
+                                            TcpClock::time_point now,
+                                            std::vector<TcpSegment>& segments) {
+    if (!connection.close_requested) {
+        return;
+    }
+    if (connection.local_fin_seq.has_value()) {
+        return; // already sequenced
+    }
+    if (!connection.unsent.empty()) {
+        return; // still bytes waiting -- FIN must not precede them in sequence space
+    }
+    if (availableSendWindow(connection) < 1) {
+        return; // peer window doesn't allow it yet; retried by the next scheduling call
+    }
+
+    TcpSegment segment = makeFin(key, connection);
+
+    PendingTransmission pending;
+    pending.sequence_start = connection.snd_nxt;
+    pending.is_fin = true;
+    pending.flags = segment.flags;
+    pending.first_sent_at = now;
+    pending.last_sent_at = now;
+    pending.timeout_interval = connection.current_rto;
+    connection.pending.push_back(std::move(pending));
+
+    connection.local_fin_seq = connection.snd_nxt;
+    connection.snd_nxt += 1;
+    connection.state =
+        connection.state == TcpState::Established ? TcpState::FinWait1 : TcpState::LastAck;
+
+    segments.push_back(std::move(segment));
+}
+
+std::vector<TcpSegment> TcpConnectionTable::scheduleQueuedData(const TcpConnectionKey& key,
+                                                                  Connection& connection,
+                                                                  TcpClock::time_point now) {
+    std::vector<TcpSegment> segments;
+
+    std::uint32_t rwnd_available = availableSendWindow(connection);
+    std::uint32_t cwnd_available = availableCongestionWindow(connection);
+    std::uint32_t send_available = std::min(rwnd_available, cwnd_available);
+    std::size_t mss_for_cap = connection.effective_send_mss;
+    // Bounds one scheduling pass to at most kMaxSegmentsPerSend segments,
+    // regardless of how large cwnd/rwnd allowance has grown -- relevant
+    // when the peer negotiated a tiny MSS; the remainder is simply
+    // scheduled by a later ACK/window update rather than in one pass.
+    std::size_t pass_cap = kMaxSegmentsPerSend * mss_for_cap;
+    std::size_t to_send =
+        std::min({static_cast<std::size_t>(send_available), connection.unsent.size(), pass_cap});
+    bool draining_whole_queue = to_send == connection.unsent.size() && to_send > 0;
+
+    if (to_send > 0) {
+        std::size_t mss = connection.effective_send_mss;
+        std::uint32_t seq = connection.snd_nxt;
+        std::size_t offset = 0;
+        while (offset < to_send) {
+            std::size_t chunk = std::min(mss, to_send - offset);
+            bool is_last_chunk = offset + chunk == to_send;
+
+            TcpSegment segment;
+            segment.source_port = key.local_port;
+            segment.destination_port = key.remote_port;
+            segment.sequence_number = seq;
+            segment.acknowledgment_number = connection.rcv_nxt;
+            segment.flags.ack = true;
+            // PSH only when this chunk drains the entire application send
+            // buffer, not merely this scheduling pass's temporary
+            // allowance -- more application data may still be queued
+            // behind it.
+            segment.flags.psh = is_last_chunk && draining_whole_queue;
+            segment.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
+            segment.urgent_pointer = 0;
+            segment.payload.assign(connection.unsent.begin() + static_cast<std::ptrdiff_t>(offset),
+                                    connection.unsent.begin() +
+                                        static_cast<std::ptrdiff_t>(offset + chunk));
+
+            PendingTransmission pending;
+            pending.sequence_start = seq;
+            pending.is_syn = false;
+            pending.flags = segment.flags;
+            pending.payload = segment.payload; // owns an independent copy
+            pending.first_sent_at = now;
+            pending.last_sent_at = now;
+            pending.timeout_interval = connection.current_rto;
+            connection.pending.push_back(std::move(pending));
+
+            segments.push_back(std::move(segment));
+
+            seq += static_cast<std::uint32_t>(chunk);
+            offset += chunk;
+        }
+
+        connection.unsent.erase(connection.unsent.begin(),
+                                 connection.unsent.begin() + static_cast<std::ptrdiff_t>(to_send));
+        connection.snd_nxt = seq;
+    }
+
+    if (connection.unsent.empty()) {
+        maybeSequenceFin(key, connection, now, segments);
+    }
+
+    return segments;
+}
+
 std::uint32_t TcpConnectionTable::decodePeerWindow(const Connection& connection,
                                                      std::uint16_t raw) {
     if (!connection.window_scaling_enabled) {
@@ -515,6 +631,18 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         connection.pending_removal = true;
     }
 
+    // ACK-driven scheduling (see docs/tcp.md): this ACK/window update may
+    // have created new peer-window or congestion-window allowance, so
+    // queued send-buffer bytes (and a deferred FIN, once they drain) are
+    // scheduled immediately -- no second application call or timer tick
+    // is required. Skipped for a connection about to be removed or no
+    // longer in a sendable state (Closing/TimeWait/etc.).
+    std::vector<TcpSegment> scheduled;
+    if (!connection.pending_removal &&
+        (connection.state == TcpState::Established || connection.state == TcpState::CloseWait)) {
+        scheduled = scheduleQueuedData(key, connection, now);
+    }
+
     if (segment.payload.empty() && !segment.flags.fin) {
         // Ack information already processed above; an ordinary ACK-only
         // segment does not itself warrant a reply (that would create an
@@ -524,6 +652,7 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         TcpReceiveResult result;
         result.connection_closed = connection.pending_removal;
         result.fast_retransmit = fast_retransmit_segment;
+        result.scheduled = std::move(scheduled);
         return result;
     }
 
@@ -557,10 +686,15 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
 
     if (!any_payload_in_window && !fin_in_window) {
         // Nothing of this segment lies in the receive window: store
-        // nothing, deliver nothing, rcv_nxt unchanged, duplicate ACK.
+        // nothing, deliver nothing, rcv_nxt unchanged, duplicate ACK --
+        // unless scheduled data already carries a valid ACK, making a
+        // separate pure ACK redundant.
         TcpReceiveResult result;
-        result.reply = makePureAck(key, connection);
         result.fast_retransmit = fast_retransmit_segment;
+        result.scheduled = std::move(scheduled);
+        if (result.scheduled.empty()) {
+            result.reply = makePureAck(key, connection);
+        }
         return result;
     }
 
@@ -579,6 +713,7 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     TcpReceiveResult result;
     result.accepted_payload = releaseContiguous(connection);
     result.fast_retransmit = fast_retransmit_segment;
+    result.scheduled = std::move(scheduled);
 
     if (connection.pending_fin_seq && *connection.pending_fin_seq == connection.rcv_nxt) {
         connection.rcv_nxt += 1;
@@ -597,8 +732,10 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     // Only reply directly when nothing was released -- an out-of-order
     // arrival (still gapped) gets a duplicate ACK; a released payload is
     // ACKed by whatever the caller builds from accepted_payload instead
-    // (an echo/response), avoiding a redundant separate ACK.
-    if (result.accepted_payload.empty()) {
+    // (an echo/response), avoiding a redundant separate ACK. Scheduled
+    // data (if any) already carries a valid ACK too, so it takes the
+    // same precedence as a released payload.
+    if (result.accepted_payload.empty() && result.scheduled.empty()) {
         result.reply = makePureAck(key, connection);
     }
     return result;
@@ -814,6 +951,9 @@ std::optional<TcpConnectionSnapshot> TcpConnectionTable::snapshotOf(
         connection.in_fast_recovery,
         connection.recovery_point,
         connection.congestion_avoidance_acked_bytes,
+        connection.unsent.size(),
+        appOwnedBytes(connection),
+        connection.close_requested,
     };
 }
 
@@ -837,105 +977,57 @@ TcpSendResult TcpConnectionTable::makeOutgoingData(const TcpConnectionKey& key,
         return result;
     }
     Connection& connection = it->second;
-
-    // New application data is gated by both limits; whichever is smaller
-    // is reported as the rejection reason. A tie (equal availability)
-    // reports WindowTooSmall -- an arbitrary but documented tie-break,
-    // since either is equally true and only one error value can be
-    // returned.
-    std::uint32_t rwnd_available = availableSendWindow(connection);
-    std::uint32_t cwnd_available = availableCongestionWindow(connection);
-    if (payload.size() > rwnd_available || payload.size() > cwnd_available) {
-        result.error = (cwnd_available < rwnd_available) ? TcpSendError::CongestionWindowTooSmall
-                                                           : TcpSendError::WindowTooSmall;
+    if (connection.close_requested) {
+        // No new application data once close has been requested -- see
+        // TcpCloseResult/beginClose.
+        result.error = TcpSendError::NotSendable;
         return result;
     }
 
-    std::size_t total = payload.size();
-    std::size_t mss = connection.effective_send_mss;
-    std::size_t segment_count = (total + mss - 1) / mss;
-    if (segment_count > kMaxSegmentsPerSend) {
-        // A tiny negotiated peer MSS could otherwise fragment this send
-        // into an unbounded number of segments; reject atomically.
-        result.error = TcpSendError::TooLarge;
+    // Atomic bounded enqueue: the capacity check happens before any bytes
+    // are copied, and covers unsent bytes plus application payload still
+    // retained in pending transmissions (appOwnedBytes) -- moving bytes
+    // from `unsent` into a pending entry during scheduling does not free
+    // or double-charge capacity.
+    std::size_t owned = appOwnedBytes(connection);
+    std::size_t remaining_capacity =
+        owned >= kTcpSendBufferCapacity ? 0 : kTcpSendBufferCapacity - owned;
+    if (payload.size() > remaining_capacity) {
+        result.error = TcpSendError::BufferFull;
         return result;
     }
-    std::vector<TcpSegment> segments;
-    segments.reserve(segment_count);
 
-    std::uint32_t seq = connection.snd_nxt;
-    std::size_t offset = 0;
-    while (offset < total) {
-        std::size_t chunk = std::min(mss, total - offset);
-        bool is_last = offset + chunk == total;
+    connection.unsent.insert(connection.unsent.end(), payload.begin(), payload.end());
+    result.bytes_accepted = payload.size();
 
-        TcpSegment segment;
-        segment.source_port = key.local_port;
-        segment.destination_port = key.remote_port;
-        segment.sequence_number = seq;
-        segment.acknowledgment_number = connection.rcv_nxt;
-        segment.flags.ack = true;
-        segment.flags.psh = is_last;
-        segment.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
-        segment.urgent_pointer = 0;
-        segment.payload.assign(payload.begin() + static_cast<std::ptrdiff_t>(offset),
-                                payload.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
-        segments.push_back(segment);
+    // Schedule as much of the (now-larger) buffer as current allowance
+    // permits; the rest stays queued for a later ACK/window update.
+    result.segments = scheduleQueuedData(key, connection, now);
 
-        seq += static_cast<std::uint32_t>(chunk);
-        offset += chunk;
-    }
-
-    for (const auto& segment : segments) {
-        PendingTransmission pending;
-        pending.sequence_start = segment.sequence_number;
-        pending.is_syn = false;
-        pending.flags = segment.flags;
-        pending.payload = segment.payload; // owns an independent copy
-        pending.first_sent_at = now;
-        pending.last_sent_at = now;
-        pending.timeout_interval = connection.current_rto;
-        connection.pending.push_back(std::move(pending));
-    }
-
-    connection.snd_nxt += static_cast<std::uint32_t>(total);
-
-    result.segments = std::move(segments);
-    result.bytes_accepted = total;
     return result;
 }
 
-std::optional<TcpSegment> TcpConnectionTable::beginClose(const TcpConnectionKey& key,
-                                                           TcpClock::time_point now) {
+TcpCloseResult TcpConnectionTable::beginClose(const TcpConnectionKey& key,
+                                                TcpClock::time_point now) {
+    TcpCloseResult result;
     auto it = connections_.find(key);
     if (it == connections_.end()) {
-        return std::nullopt;
+        return result; // accepted = false
     }
     Connection& connection = it->second;
     if (connection.state != TcpState::Established && connection.state != TcpState::CloseWait) {
-        return std::nullopt;
-    }
-    if (availableSendWindow(connection) < 1) {
-        return std::nullopt; // a FIN consumes one send-window sequence number too
+        return result; // accepted = false
     }
 
-    TcpSegment segment = makeFin(key, connection);
+    result.accepted = true;
+    connection.close_requested = true; // idempotent: repeated calls are harmless no-ops below
 
-    PendingTransmission pending;
-    pending.sequence_start = connection.snd_nxt;
-    pending.is_fin = true;
-    pending.flags = segment.flags;
-    pending.first_sent_at = now;
-    pending.last_sent_at = now;
-    pending.timeout_interval = connection.current_rto;
-    connection.pending.push_back(std::move(pending));
-
-    connection.local_fin_seq = connection.snd_nxt;
-    connection.snd_nxt += 1;
-    connection.state =
-        connection.state == TcpState::Established ? TcpState::FinWait1 : TcpState::LastAck;
-
-    return segment;
+    std::vector<TcpSegment> segments;
+    maybeSequenceFin(key, connection, now, segments);
+    if (!segments.empty()) {
+        result.fin = std::move(segments.front());
+    }
+    return result;
 }
 
 TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_point now) {

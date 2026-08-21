@@ -72,6 +72,15 @@ struct TcpConnectionSnapshot {
     bool in_fast_recovery;
     std::uint32_t recovery_point;
     std::uint32_t congestion_avoidance_acked_bytes;
+
+    // Bounded application send buffer (see docs/tcp.md). unsent_bytes is
+    // the FIFO backlog not yet in sequence space; owned_bytes additionally
+    // includes application payload still retained in pending
+    // transmissions (unacknowledged, whether or not yet retransmitted),
+    // the quantity actually charged against kTcpSendBufferCapacity.
+    std::size_t unsent_bytes;
+    std::size_t owned_bytes;
+    bool close_requested;
 };
 
 struct TcpReceiveResult {
@@ -90,6 +99,17 @@ struct TcpReceiveResult {
     // through the same immediate-reply path as `reply`, addressed using
     // the current received frame, not the timer/ARP path.
     std::optional<TcpSegment> fast_retransmit;
+
+    // Application-data segments scheduled from the send buffer because
+    // this ACK/window-update created new peer-window or congestion-window
+    // allowance (see docs/tcp.md), in ascending sequence order -- may
+    // include a deferred FIN as the final entry once the unsent queue
+    // empties. Distinct from `fast_retransmit` (which resends already-
+    // sent bytes) and from `reply` (which `handle()` clears in favor of
+    // this vector whenever it is non-empty, since the last scheduled
+    // segment already carries a valid ACK and makes a separate pure ACK
+    // redundant).
+    std::vector<TcpSegment> scheduled;
 
     // Non-empty only when this call made new bytes contiguous from
     // rcv_nxt -- either because the segment itself arrived in order, or
@@ -147,6 +167,12 @@ inline constexpr std::uint32_t kMaxCongestionWindow = 1u << 30;
 // segment count so it composes with the min(10*SMSS, ...) formula below.
 inline constexpr std::uint32_t kInitialCongestionWindowFloor = 14600;
 
+// Bounded per-connection application send buffer (see docs/tcp.md).
+// Covers both unsent queued bytes and application payload still retained
+// in pending transmissions (unacknowledged application data) -- never
+// SYN/FIN sequence space or pure ACKs.
+inline constexpr std::size_t kTcpSendBufferCapacity = 256 * 1024;
+
 // Wirestack never emits IPv4 options, and only ever emits TCP options on
 // a SYN-ACK (MSS, and Window Scale when negotiated -- see
 // buildSynAckOptions), so path-MTU math still treats both headers as a
@@ -191,22 +217,41 @@ inline constexpr std::uint8_t kLocalWindowScaleShift = 2;
 inline constexpr std::uint8_t kMaxWindowScaleShift = 14;
 
 enum class TcpSendError {
-    NotSendable,       // connection unknown or not Established/CloseWait
+    NotSendable,       // connection unknown, not Established/CloseWait, or close already requested
     EmptyPayload,
-    TooLarge,                   // exceeds kMaxApplicationSendSize
-    WindowTooSmall,             // exceeds the currently available peer send window
-    CongestionWindowTooSmall,   // exceeds the currently available congestion window
-    ConstructionFailed,         // a chunk failed to serialize-size correctly
+    TooLarge,           // exceeds kMaxApplicationSendSize (a single enqueue call's own bound)
+    BufferFull,         // exceeds the currently available send-buffer capacity
+    ConstructionFailed, // a chunk failed to serialize-size correctly
 };
 
 struct TcpSendResult {
-    // Empty on rejection. In application-byte order, contiguous sequence
-    // ranges, PSH set only on the last entry.
+    // Segments actually scheduled by this call (may be empty even on
+    // acceptance, if no peer-window/congestion-window allowance exists
+    // yet -- the bytes are still enqueued and will be scheduled by a
+    // later ACK/window update). In application-byte order, contiguous
+    // sequence ranges, PSH only on the segment that drains the complete
+    // send buffer.
     std::vector<TcpSegment> segments;
-    // 0 on rejection; otherwise equals the payload size passed in (sends
-    // are atomic -- there is no partial acceptance).
+    // 0 on rejection; otherwise equals the payload size passed in --
+    // enqueue itself is atomic (all-or-nothing into the send buffer),
+    // even though scheduling onto the wire may be gradual.
     std::size_t bytes_accepted = 0;
     std::optional<TcpSendError> error;
+};
+
+// Result of requesting an application-initiated close (see docs/tcp.md).
+// Idempotent: a repeated call while already accepted/pending returns
+// accepted=true again without creating a second FIN.
+struct TcpCloseResult {
+    // False only if the connection is unknown or not currently
+    // Established/CloseWait (already closing, reset, or removed).
+    bool accepted = false;
+    // Set only when this call itself sequenced the FIN (the send buffer
+    // was already empty and the peer window allowed it). nullopt means
+    // the close intent was recorded but FIN remains deferred behind
+    // unsent bytes or an exhausted peer window; a later ACK/window
+    // update will sequence it automatically.
+    std::optional<TcpSegment> fin;
 };
 
 struct TcpDueRetransmission {
@@ -257,33 +302,37 @@ public:
     std::optional<TcpState> stateOf(const TcpConnectionKey& key) const;
     std::optional<TcpConnectionSnapshot> snapshotOf(const TcpConnectionKey& key) const;
 
-    // Segments `payload` into as many MSS-bounded PSH|ACK segments as
-    // needed (contiguous sequence ranges, PSH only on the last one),
-    // registers each for retransmission, and advances snd_nxt once by
-    // the total length. The send is atomic: on any rejection (unknown
-    // connection, connection not Established/CloseWait, empty payload,
-    // payload exceeding kMaxApplicationSendSize, or payload exceeding
-    // min(peer send window, congestion window) -- reported as
-    // WindowTooSmall or CongestionWindowTooSmall respectively, whichever
-    // is the smaller/binding limit) no bytes are accepted, no segment is
-    // queued, and snd_nxt is unchanged. Callers must retry a rejected
-    // send later, after the peer's advertised window or the congestion
-    // window changes -- there is no internal send queue or automatic
-    // retry. A retransmission (timeout or fast) is not new data and does
-    // not consume additional congestion-window allowance.
+    // Enqueues `payload` atomically into the connection's bounded send
+    // buffer (kTcpSendBufferCapacity, covering unsent bytes plus
+    // application payload still retained in pending transmissions), then
+    // immediately schedules as much of the (now-larger) buffer as the
+    // current min(peer window, congestion window) allowance permits,
+    // MSS-bounded, in send order, PSH only on the segment that drains the
+    // complete buffer. Rejected atomically (no bytes enqueued, no segment
+    // scheduled, connection state unchanged) when: the connection is
+    // unknown, not Established/CloseWait, or has already had close
+    // requested (NotSendable); payload is empty (EmptyPayload); payload
+    // exceeds kMaxApplicationSendSize in one call (TooLarge); or payload
+    // would exceed the buffer's remaining capacity (BufferFull).
+    // `segments` may be empty even on acceptance if no allowance exists
+    // yet -- the bytes remain queued and a later ACK/window update (see
+    // TcpReceiveResult::scheduled) or another enqueue call is not needed
+    // to eventually send them. A retransmission (timeout or fast) is not
+    // new data and does not consume additional buffer or congestion-
+    // window allowance.
     TcpSendResult makeOutgoingData(const TcpConnectionKey& key, std::vector<std::byte> payload,
                                     TcpClock::time_point now);
 
-    // Initiates a local close: builds a FIN|ACK segment, registers it for
-    // retransmission, and advances snd_nxt by one. Returns nullopt,
-    // leaving connection state unchanged, unless the connection exists,
-    // is Established (-> FinWait1) or CloseWait (-> LastAck), and at
-    // least one byte of peer send window is currently available (a FIN
-    // consumes one sequence number in the send window like any other
-    // byte). Calling this again for the same connection returns nullopt
-    // (state is no longer Established/CloseWait), so it cannot create a
-    // second FIN.
-    std::optional<TcpSegment> beginClose(const TcpConnectionKey& key, TcpClock::time_point now);
+    // Requests an application-initiated close: idempotent, and rejects
+    // (accepted=false) only if the connection is unknown or not currently
+    // Established/CloseWait. Once accepted, no further makeOutgoingData
+    // calls are accepted for this connection. The FIN itself is deferred
+    // behind any still-unsent send-buffer bytes and the peer window (see
+    // TcpCloseResult); it is sequenced by this call if possible, or later
+    // by TcpReceiveResult::scheduled once conditions allow. Established
+    // moves to FinWait1 when the FIN is sequenced; CloseWait moves to
+    // LastAck.
+    TcpCloseResult beginClose(const TcpConnectionKey& key, TcpClock::time_point now);
 
     // Returns segments whose retransmission deadline has passed as of
     // `now`, and removes any connection that has exhausted its
@@ -405,6 +454,19 @@ private:
         bool in_fast_recovery = false;
         std::uint32_t recovery_point = 0; // snd_nxt when fast recovery began; diagnostic only
         std::uint32_t congestion_avoidance_acked_bytes = 0;
+
+        // Bounded application send buffer (see docs/tcp.md). FIFO byte
+        // queue not yet in sequence space; application payload already
+        // in sequence space lives in `pending` entries instead (owned
+        // once, never duplicated). Capacity (kTcpSendBufferCapacity)
+        // charges unsent.size() plus every non-SYN/FIN pending entry's
+        // payload size.
+        std::vector<std::byte> unsent;
+        // Set once by beginClose; idempotent, and blocks further
+        // makeOutgoingData calls. The FIN itself is sequenced only once
+        // `unsent` is empty and the peer window allows it (see
+        // maybeSequenceFin), tracked separately by local_fin_seq above.
+        bool close_requested = false;
     };
 
     // Not a secure or RFC 6528-style initial sequence number generator --
@@ -483,6 +545,35 @@ private:
     // data entry exists.
     static TcpSegment beginFastRecovery(const TcpConnectionKey& key, Connection& connection,
                                          TcpClock::time_point now);
+
+    // Total application bytes currently charged against
+    // kTcpSendBufferCapacity: unsent.size() plus every non-SYN/FIN
+    // pending entry's payload size. Moving bytes from `unsent` into a
+    // pending entry (scheduling) does not change this total.
+    static std::size_t appOwnedBytes(const Connection& connection);
+
+    // Converts as many FIFO bytes from `connection.unsent` into
+    // MSS-bounded PSH|ACK segments as the current
+    // min(availableSendWindow, availableCongestionWindow) allowance
+    // permits, registers one pending entry per segment, advances
+    // snd_nxt, and -- once `unsent` is fully drained by this call --
+    // additionally attempts to sequence a deferred FIN (see
+    // maybeSequenceFin). Returns the segments in ascending sequence
+    // order (empty if no allowance exists). Never called for a
+    // connection outside Established/CloseWait.
+    static std::vector<TcpSegment> scheduleQueuedData(const TcpConnectionKey& key,
+                                                        Connection& connection,
+                                                        TcpClock::time_point now);
+
+    // Sequences the deferred FIN and appends it to `segments` if all of:
+    // close was requested, no FIN has been sequenced yet, `unsent` is
+    // empty, and at least one byte of peer send window is available (a
+    // FIN consumes one sequence number like any other byte; never gated
+    // by cwnd). Otherwise a no-op -- the close intent is retried by the
+    // next call to scheduleQueuedData. Established moves to FinWait1;
+    // CloseWait moves to LastAck.
+    static void maybeSequenceFin(const TcpConnectionKey& key, Connection& connection,
+                                  TcpClock::time_point now, std::vector<TcpSegment>& segments);
 
     // Moves `connection` into TimeWait, arming its expiration deadline
     // and dropping any (already-acknowledged) pending entries.

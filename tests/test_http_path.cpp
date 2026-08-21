@@ -212,7 +212,9 @@ int main() {
         const auto& sent_segment = sent.segments.front();
         CHECK(sent_segment.sequence_number == hs->server_isn + 1); // no prior sends
 
-        auto fin = connections.beginClose(key, t0);
+        auto fin_result = connections.beginClose(key, t0);
+        CHECK(fin_result.accepted);
+        auto fin = fin_result.fin;
         CHECK(fin.has_value());
         if (!fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
         CHECK(fin->sequence_number ==
@@ -328,7 +330,9 @@ int main() {
         http_sessions[key].responded = true;
         auto sent = connections.makeOutgoingData(key, response_bytes, t0);
         CHECK(!sent.segments.empty());
-        auto fin = connections.beginClose(key, t0);
+        auto fin_result = connections.beginClose(key, t0);
+        CHECK(fin_result.accepted);
+        auto fin = fin_result.fin;
         CHECK(fin.has_value());
         CHECK(connections.stateOf(key) == TcpState::FinWait1);
         if (sent.segments.empty() || !fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
@@ -397,7 +401,9 @@ int main() {
         auto response_bytes = serializeHttpResponse(selectResponse(*parsed.request));
         auto sent = connections.makeOutgoingData(key, response_bytes, t0); // intentionally dropped
         CHECK(!sent.segments.empty());
-        auto fin = connections.beginClose(key, t0);
+        auto fin_result = connections.beginClose(key, t0);
+        CHECK(fin_result.accepted);
+        auto fin = fin_result.fin;
         CHECK(fin.has_value());
         if (sent.segments.empty() || !fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
         const auto& sent_segment = sent.segments.front();
