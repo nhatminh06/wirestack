@@ -66,6 +66,8 @@ ws_setup_topology() {
     ws_in_client ip link set "${WS_CLIENT_VETH}" mtu "${WS_MTU}"
 }
 
+# Any extra arguments (e.g. --active-open <ip>:<port> --source-port
+# <port>) are appended after the required tap/ip/mac positionals.
 ws_start_wirestack() {
     [ -x "${WS_BINARY}" ] || ws_die "wirestack binary not found or not executable: ${WS_BINARY}"
 
@@ -73,7 +75,7 @@ ws_start_wirestack() {
 
     local out="${WS_EVIDENCE_DIR}/wirestack.out"
     ws_log "starting wirestack (log: ${out})"
-    "${WS_BINARY}" "${WS_TAP}" "${WS_SERVER_IP}" "${WS_SERVER_MAC}" >"${out}" 2>&1 &
+    "${WS_BINARY}" "${WS_TAP}" "${WS_SERVER_IP}" "${WS_SERVER_MAC}" "$@" >"${out}" 2>&1 &
     local ws_pid=$!
     echo "${ws_pid}" >"${WS_EVIDENCE_DIR}/${WS_WIRESTACK_PIDFILE_NAME}"
     # /proc/<pid>/comm is truncated to 15 bytes by the kernel.
