@@ -207,19 +207,20 @@ int main() {
 
         http_sessions[key].responded = true;
         auto sent = connections.makeOutgoingData(key, response_bytes, t0);
-        CHECK(sent.has_value());
-        if (!sent) return wirestack::test::failureCount() == 0 ? 0 : 1;
-        CHECK(sent->sequence_number == hs->server_isn + 1); // no prior sends
+        CHECK(!sent.segments.empty());
+        if (sent.segments.empty()) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        const auto& sent_segment = sent.segments.front();
+        CHECK(sent_segment.sequence_number == hs->server_isn + 1); // no prior sends
 
         auto fin = connections.beginClose(key, t0);
         CHECK(fin.has_value());
         if (!fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
         CHECK(fin->sequence_number ==
-              sent->sequence_number + static_cast<std::uint32_t>(sent->payload.size()));
+              sent_segment.sequence_number + static_cast<std::uint32_t>(sent_segment.payload.size()));
         CHECK(connections.stateOf(key) == TcpState::FinWait1);
 
         // Re-parse both outgoing segments through the real wire format.
-        auto resp_frame = buildFrame(*sent, local_ip, clientIp(), local_mac, clientMac());
+        auto resp_frame = buildFrame(sent_segment, local_ip, clientIp(), local_mac, clientMac());
         auto parsed_resp = parseFrame(resp_frame);
         CHECK(parsed_resp.has_value());
         if (parsed_resp) {
@@ -230,7 +231,7 @@ int main() {
             CHECK(parsed_resp->tcp.source_port == 8080);
             CHECK(parsed_resp->tcp.destination_port == hs->syn.source_port);
             CHECK(parsed_resp->tcp.payload == response_bytes);
-            CHECK(parsed_resp->tcp.sequence_number == sent->sequence_number);
+            CHECK(parsed_resp->tcp.sequence_number == sent_segment.sequence_number);
         }
 
         auto fin_frame = buildFrame(*fin, local_ip, clientIp(), local_mac, clientMac());
@@ -326,13 +327,14 @@ int main() {
 
         http_sessions[key].responded = true;
         auto sent = connections.makeOutgoingData(key, response_bytes, t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
         auto fin = connections.beginClose(key, t0);
         CHECK(fin.has_value());
         CHECK(connections.stateOf(key) == TcpState::FinWait1);
-        if (!sent || !fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        if (sent.segments.empty() || !fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        const auto& sent_segment = sent.segments.front();
 
-        auto resp_frame = buildFrame(*sent, local_ip, clientIp(), local_mac, clientMac());
+        auto resp_frame = buildFrame(sent_segment, local_ip, clientIp(), local_mac, clientMac());
         auto parsed_resp = parseFrame(resp_frame);
         CHECK(parsed_resp.has_value());
         if (parsed_resp) CHECK(parsed_resp->tcp.payload == response_bytes);
@@ -394,17 +396,18 @@ int main() {
 
         auto response_bytes = serializeHttpResponse(selectResponse(*parsed.request));
         auto sent = connections.makeOutgoingData(key, response_bytes, t0); // intentionally dropped
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
         auto fin = connections.beginClose(key, t0);
         CHECK(fin.has_value());
-        if (!sent || !fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        if (sent.segments.empty() || !fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        const auto& sent_segment = sent.segments.front();
 
         auto before = connections.snapshotOf(key);
         auto due = connections.pollRetransmissions(t0 + kInitialRto);
         CHECK(due.retransmissions.size() == 1);
         if (due.retransmissions.size() == 1) {
             CHECK(due.retransmissions[0].segment.payload == response_bytes);
-            CHECK(due.retransmissions[0].segment.sequence_number == sent->sequence_number);
+            CHECK(due.retransmissions[0].segment.sequence_number == sent_segment.sequence_number);
         }
         auto after = connections.snapshotOf(key);
         CHECK(before.has_value() && after.has_value());

@@ -4,13 +4,18 @@
 
 using wirestack::Ipv4Address;
 using wirestack::kInitialRto;
+using wirestack::kMaxApplicationSendSize;
 using wirestack::kMaxRetransmits;
+using wirestack::kMaxReassemblyFragments;
 using wirestack::kMaxRto;
+using wirestack::kTcpMss;
+using wirestack::kTcpReceiveCapacity;
 using wirestack::kTimeWaitDuration;
 using wirestack::TcpClock;
 using wirestack::TcpConnectionKey;
 using wirestack::TcpConnectionTable;
 using wirestack::TcpSegment;
+using wirestack::TcpSendError;
 using wirestack::TcpState;
 
 namespace {
@@ -93,6 +98,26 @@ TcpSegment makeRst(std::uint16_t local_port, std::uint16_t remote_port, std::uin
     return segment;
 }
 
+// An ACK-only segment that advertises an explicit window, for tests that
+// need to control the peer's advertised send window directly (makeAck
+// always advertises the fixed 65535 used elsewhere).
+TcpSegment makeWindowUpdate(std::uint16_t local_port, std::uint16_t remote_port,
+                             std::uint32_t seq, std::uint32_t ack, std::uint16_t window) {
+    TcpSegment segment;
+    segment.source_port = remote_port;
+    segment.destination_port = local_port;
+    segment.sequence_number = seq;
+    segment.acknowledgment_number = ack;
+    segment.flags.ack = true;
+    segment.window_size = window;
+    segment.urgent_pointer = 0;
+    return segment;
+}
+
+std::vector<std::byte> makeFilledPayload(std::size_t length, std::byte value = std::byte{'x'}) {
+    return std::vector<std::byte>(length, value);
+}
+
 std::vector<std::byte> toBytes(std::initializer_list<std::uint8_t> values) {
     std::vector<std::byte> out;
     out.reserve(values.size());
@@ -121,6 +146,23 @@ std::uint32_t establish(TcpConnectionTable& table, const TcpConnectionKey& key,
         table.handle(key, makeSyn(key.local_port, key.remote_port, client_isn), now).reply;
     std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
     table.handle(key, makeAck(key.local_port, key.remote_port, client_isn + 1, server_isn + 1),
+                 now);
+    return server_isn;
+}
+
+// Same as establish(), but the handshake-completing ACK advertises
+// `window` instead of the fixed 65535 makeAck() always uses -- needed for
+// send-window tests that must control the peer's advertised window from
+// the start.
+std::uint32_t establishWithWindow(TcpConnectionTable& table, const TcpConnectionKey& key,
+                                   std::uint32_t client_isn, std::uint16_t window,
+                                   TcpClock::time_point now = t0) {
+    auto syn_ack =
+        table.handle(key, makeSyn(key.local_port, key.remote_port, client_isn), now).reply;
+    std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+    table.handle(key,
+                 makeWindowUpdate(key.local_port, key.remote_port, client_isn + 1,
+                                  server_isn + 1, window),
                  now);
     return server_isn;
 }
@@ -348,14 +390,15 @@ int main() {
 
         auto snapshot_before = table.snapshotOf(key);
         auto payload = toBytes("echoed data");
-        auto segment = table.makeOutgoingData(key, payload, t0);
-        CHECK(segment.has_value());
-        if (segment && snapshot_before) {
-            CHECK(segment->sequence_number == snapshot_before->snd_nxt);
-            CHECK(segment->acknowledgment_number == snapshot_before->rcv_nxt);
-            CHECK(segment->flags.psh);
-            CHECK(segment->flags.ack);
-            CHECK(segment->payload == payload);
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty() && snapshot_before) {
+            const auto& segment = sent.segments.front();
+            CHECK(segment.sequence_number == snapshot_before->snd_nxt);
+            CHECK(segment.acknowledgment_number == snapshot_before->rcv_nxt);
+            CHECK(segment.flags.psh);
+            CHECK(segment.flags.ack);
+            CHECK(segment.payload == payload);
         }
 
         auto snapshot_after = table.snapshotOf(key);
@@ -369,16 +412,16 @@ int main() {
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey unknown_key{localIp(), 8080, remoteIp(), 11111};
-        CHECK(!table.makeOutgoingData(unknown_key, toBytes("x"), t0).has_value());
+        CHECK(table.makeOutgoingData(unknown_key, toBytes("x"), t0).segments.empty());
 
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         table.handle(key, makeSyn(8080, 54321, 1000), t0); // SynReceived, not yet Established
-        CHECK(!table.makeOutgoingData(key, toBytes("x"), t0).has_value());
+        CHECK(table.makeOutgoingData(key, toBytes("x"), t0).segments.empty());
         CHECK(table.stateOf(key) == TcpState::SynReceived);
 
         establish(table, key, 1000);
         auto snapshot_before = table.snapshotOf(key);
-        CHECK(!table.makeOutgoingData(key, {}, t0).has_value()); // empty payload
+        CHECK(table.makeOutgoingData(key, {}, t0).segments.empty()); // empty payload
         auto snapshot_after = table.snapshotOf(key);
         CHECK(snapshot_before.has_value() && snapshot_after.has_value());
         if (snapshot_before && snapshot_after) {
@@ -395,7 +438,7 @@ int main() {
 
         auto payload = toBytes("echoed data");
         auto sent = table.makeOutgoingData(key, payload, t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
 
         auto ack_result = table.handle(
             key, makeAck(8080, 54321, 1001, server_isn + 1 + static_cast<std::uint32_t>(payload.size())), t0);
@@ -468,7 +511,11 @@ int main() {
     }
 
     // overlapping payload: sequence number behind rcv_nxt but extends
-    // past it -- no partial delivery, rcv_nxt unchanged
+    // past it -- the already-delivered prefix is trimmed and discarded,
+    // and the new suffix (starting exactly at rcv_nxt) is delivered
+    // immediately since nothing precedes it. Milestone 10 replaces the
+    // earlier whole-segment overlap rejection with this prefix-trimming
+    // policy (see docs/tcp.md).
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
@@ -476,16 +523,18 @@ int main() {
 
         table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("hello")), t0);
         // rcv_nxt is now 1006; this segment starts at 1003 (before
-        // rcv_nxt) but its 10-byte payload would extend to 1013.
+        // rcv_nxt) but its 10-byte payload extends to 1013 -- bytes
+        // 1003..1005 are already-delivered duplicates (trimmed away),
+        // bytes 1006..1012 are new and delivered.
         auto overlap_payload = toBytes("XXXXXXXXXX");
         auto result =
             table.handle(key, makeData(8080, 54321, 1003, server_isn + 1, overlap_payload), t0);
-        CHECK(result.accepted_payload.empty());
+        CHECK(result.accepted_payload == toBytes("XXXXXXX")); // 7 trailing bytes, prefix trimmed
 
         auto snapshot = table.snapshotOf(key);
         CHECK(snapshot.has_value());
         if (snapshot) {
-            CHECK(snapshot->rcv_nxt == 1006);
+            CHECK(snapshot->rcv_nxt == 1013);
         }
     }
 
@@ -527,10 +576,10 @@ int main() {
         CHECK(result.accepted_payload.size() == 6);
 
         auto echoed = table.makeOutgoingData(key, result.accepted_payload, t0);
-        CHECK(echoed.has_value());
-        if (echoed) {
-            CHECK(echoed->payload == payload);
-            CHECK(echoed->payload.size() == 6);
+        CHECK(!echoed.segments.empty());
+        if (!echoed.segments.empty()) {
+            CHECK(echoed.segments.front().payload == payload);
+            CHECK(echoed.segments.front().payload.size() == 6);
         }
     }
 
@@ -569,7 +618,7 @@ int main() {
         // Drain snd_nxt close to the wraparound boundary with one send.
         std::vector<std::byte> filler(10, std::byte{0});
         auto first_send = table.makeOutgoingData(key2, filler, t0);
-        CHECK(first_send.has_value());
+        CHECK(!first_send.segments.empty());
         auto snap2 = table.snapshotOf(key2);
         CHECK(snap2.has_value());
         if (snap2) {
@@ -584,11 +633,11 @@ int main() {
         establish(table, key3, 0xffffffff - 10);
         std::vector<std::byte> small_payload(20, std::byte{0xaa});
         auto wrap_send = table.makeOutgoingData(key3, small_payload, t0); // crosses the boundary
-        CHECK(wrap_send.has_value());
+        CHECK(!wrap_send.segments.empty());
         auto snap3 = table.snapshotOf(key3);
         CHECK(snap3.has_value());
-        if (snap3 && wrap_send) {
-            CHECK(snap3->snd_nxt == wrap_send->sequence_number + small_payload.size());
+        if (snap3 && !wrap_send.segments.empty()) {
+            CHECK(snap3->snd_nxt == wrap_send.segments.front().sequence_number + small_payload.size());
         }
         // Acknowledge exactly up to the new (wrapped) snd_nxt.
         auto ack_result =
@@ -659,7 +708,7 @@ int main() {
         CHECK(received.accepted_payload == client_payload);
 
         auto echo = table.makeOutgoingData(key, received.accepted_payload, t0);
-        CHECK(echo.has_value());
+        CHECK(!echo.segments.empty());
         auto snapshot_before = table.snapshotOf(key);
         CHECK(snapshot_before.has_value());
         if (snapshot_before) {
@@ -671,9 +720,10 @@ int main() {
 
         auto due = table.pollRetransmissions(t0 + kInitialRto);
         CHECK(due.retransmissions.size() == 1);
-        if (due.retransmissions.size() == 1 && echo) {
+        if (due.retransmissions.size() == 1 && !echo.segments.empty()) {
             CHECK(due.retransmissions[0].segment.payload == client_payload);
-            CHECK(due.retransmissions[0].segment.sequence_number == echo->sequence_number);
+            CHECK(due.retransmissions[0].segment.sequence_number ==
+                  echo.segments.front().sequence_number);
             CHECK(due.retransmissions[0].segment.flags.psh);
             CHECK(due.retransmissions[0].segment.flags.ack);
         }
@@ -683,11 +733,12 @@ int main() {
             CHECK(snapshot_after_retransmit->snd_nxt == snapshot_before->snd_nxt);
         }
 
-        if (echo) {
+        if (!echo.segments.empty()) {
+            const auto& echo_segment = echo.segments.front();
             table.handle(key,
                          makeAck(8080, 54321, 1001 + static_cast<std::uint32_t>(client_payload.size()),
-                                 echo->sequence_number +
-                                     static_cast<std::uint32_t>(echo->payload.size())),
+                                 echo_segment.sequence_number +
+                                     static_cast<std::uint32_t>(echo_segment.payload.size())),
                          t0 + kInitialRto);
         }
         auto final_snapshot = table.snapshotOf(key);
@@ -824,13 +875,14 @@ int main() {
         establish(table, data_key_b, 200, t0);
         auto sent_a = table.makeOutgoingData(data_key_a, toBytes("a-data"), t0);
         table.makeOutgoingData(data_key_b, toBytes("b-data"), t0);
-        CHECK(sent_a.has_value());
+        CHECK(!sent_a.segments.empty());
 
-        if (sent_a) {
+        if (!sent_a.segments.empty()) {
+            const auto& sent_a_segment = sent_a.segments.front();
             table.handle(data_key_a,
                          makeAck(8080, 20001, 101,
-                                 sent_a->sequence_number +
-                                     static_cast<std::uint32_t>(sent_a->payload.size())),
+                                 sent_a_segment.sequence_number +
+                                     static_cast<std::uint32_t>(sent_a_segment.payload.size())),
                          t0);
         }
         auto snap_a = table.snapshotOf(data_key_a);
@@ -869,7 +921,7 @@ int main() {
         auto a = table.makeOutgoingData(key, toBytes("AAA"), t0);
         auto b = table.makeOutgoingData(key, toBytes("BB"), t0);
         auto c = table.makeOutgoingData(key, toBytes("C"), t0);
-        CHECK(a.has_value() && b.has_value() && c.has_value());
+        CHECK(!a.segments.empty() && !b.segments.empty() && !c.segments.empty());
 
         auto snapshot = table.snapshotOf(key);
         CHECK(snapshot.has_value());
@@ -877,21 +929,24 @@ int main() {
             CHECK(snapshot->pending_count == 3);
         }
 
-        if (b) {
+        if (!b.segments.empty()) {
+            const auto& b_segment = b.segments.front();
             std::uint32_t ack_through_b =
-                b->sequence_number + static_cast<std::uint32_t>(b->payload.size());
+                b_segment.sequence_number + static_cast<std::uint32_t>(b_segment.payload.size());
             auto result = table.handle(key, makeAck(8080, 54321, 1001, ack_through_b), t0);
             CHECK(!result.reply.has_value());
         }
 
         auto after = table.snapshotOf(key);
         CHECK(after.has_value());
-        if (after && b && c) {
+        if (after && !b.segments.empty() && !c.segments.empty()) {
+            const auto& b_segment = b.segments.front();
+            const auto& c_segment = c.segments.front();
             CHECK(after->pending_count == 1);
             CHECK(after->snd_una ==
-                  b->sequence_number + static_cast<std::uint32_t>(b->payload.size()));
+                  b_segment.sequence_number + static_cast<std::uint32_t>(b_segment.payload.size()));
             CHECK(after->snd_nxt ==
-                  c->sequence_number + static_cast<std::uint32_t>(c->payload.size()));
+                  c_segment.sequence_number + static_cast<std::uint32_t>(c_segment.payload.size()));
         }
     }
 
@@ -903,16 +958,17 @@ int main() {
         establish(table, key, 1000, t0);
 
         auto sent = table.makeOutgoingData(key, toBytes("abcdef"), t0);
-        CHECK(sent.has_value());
-        if (sent) {
-            std::uint32_t partial_ack = sent->sequence_number + 2; // acks "ab"
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty()) {
+            const auto& sent_segment = sent.segments.front();
+            std::uint32_t partial_ack = sent_segment.sequence_number + 2; // acks "ab"
             table.handle(key, makeAck(8080, 54321, 1001, partial_ack), t0);
 
             auto snapshot = table.snapshotOf(key);
             CHECK(snapshot.has_value());
             if (snapshot) {
                 CHECK(snapshot->snd_una == partial_ack);
-                CHECK(snapshot->snd_nxt == sent->sequence_number + 6);
+                CHECK(snapshot->snd_nxt == sent_segment.sequence_number + 6);
                 CHECK(snapshot->pending_count == 1);
             }
 
@@ -933,9 +989,9 @@ int main() {
 
         auto payload = toBytes({0xaa, 0x00, 0xbb, 0xcc, 0xdd});
         auto sent = table.makeOutgoingData(key, payload, t0);
-        CHECK(sent.has_value());
-        if (sent) {
-            std::uint32_t partial_ack = sent->sequence_number + 2; // acks {0xaa, 0x00}
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty()) {
+            std::uint32_t partial_ack = sent.segments.front().sequence_number + 2; // acks {0xaa, 0x00}
             table.handle(key, makeAck(8080, 54321, 1001, partial_ack), t0);
 
             auto due = table.pollRetransmissions(t0 + kInitialRto);
@@ -952,10 +1008,11 @@ int main() {
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         establish(table, key, 1000, t0);
         auto sent = table.makeOutgoingData(key, toBytes("full"), t0);
-        CHECK(sent.has_value());
-        if (sent) {
+        CHECK(!sent.segments.empty());
+        if (!sent.segments.empty()) {
+            const auto& sent_segment = sent.segments.front();
             std::uint32_t full_ack =
-                sent->sequence_number + static_cast<std::uint32_t>(sent->payload.size());
+                sent_segment.sequence_number + static_cast<std::uint32_t>(sent_segment.payload.size());
             table.handle(key, makeAck(8080, 54321, 1001, full_ack), t0);
             auto snapshot = table.snapshotOf(key);
             CHECK(snapshot.has_value());
@@ -971,7 +1028,7 @@ int main() {
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         establish(table, key, 1000, t0);
         auto sent = table.makeOutgoingData(key, toBytes("data"), t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
         auto before = table.snapshotOf(key);
         CHECK(before.has_value());
         if (before) {
@@ -1070,7 +1127,7 @@ int main() {
         CHECK(first.accepted_payload == payload);
 
         auto echo = table.makeOutgoingData(key, first.accepted_payload, t0);
-        CHECK(echo.has_value());
+        CHECK(!echo.segments.empty());
 
         auto duplicate = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, payload), t0);
         CHECK(duplicate.accepted_payload.empty());
@@ -1089,9 +1146,10 @@ int main() {
         auto snapshot_before = table.snapshotOf(key);
         auto due = table.pollRetransmissions(t0 + kInitialRto);
         CHECK(due.retransmissions.size() == 1);
-        if (due.retransmissions.size() == 1 && echo) {
+        if (due.retransmissions.size() == 1 && !echo.segments.empty()) {
             CHECK(due.retransmissions[0].segment.payload == payload);
-            CHECK(due.retransmissions[0].segment.sequence_number == echo->sequence_number);
+            CHECK(due.retransmissions[0].segment.sequence_number ==
+                  echo.segments.front().sequence_number);
         }
         auto snapshot_after = table.snapshotOf(key);
         CHECK(snapshot_before.has_value() && snapshot_after.has_value());
@@ -1099,11 +1157,12 @@ int main() {
             CHECK(snapshot_after->snd_nxt == snapshot_before->snd_nxt);
         }
 
-        if (echo) {
+        if (!echo.segments.empty()) {
+            const auto& echo_segment = echo.segments.front();
             table.handle(key,
                          makeAck(8080, 54321, 1001 + static_cast<std::uint32_t>(payload.size()),
-                                 echo->sequence_number +
-                                     static_cast<std::uint32_t>(echo->payload.size())),
+                                 echo_segment.sequence_number +
+                                     static_cast<std::uint32_t>(echo_segment.payload.size())),
                          t0 + kInitialRto);
         }
         auto final_snapshot = table.snapshotOf(key);
@@ -1282,18 +1341,19 @@ int main() {
 
         auto payload = toBytes("still here");
         auto sent = table.makeOutgoingData(key, payload, t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
         auto snapshot = table.snapshotOf(key);
         CHECK(snapshot.has_value());
         if (snapshot) {
             CHECK(snapshot->pending_count == 1);
         }
 
-        if (sent) {
+        if (!sent.segments.empty()) {
+            const auto& sent_segment = sent.segments.front();
             table.handle(key,
                          makeAck(8080, 54321, 1002,
-                                 sent->sequence_number +
-                                     static_cast<std::uint32_t>(sent->payload.size())),
+                                 sent_segment.sequence_number +
+                                     static_cast<std::uint32_t>(sent_segment.payload.size())),
                          t0);
         }
         auto after = table.snapshotOf(key);
@@ -1627,6 +1687,582 @@ int main() {
         }
         CHECK(!table.stateOf(key_a).has_value());
         CHECK(table.stateOf(key_b) == TcpState::Established);
+    }
+
+    // ================= Milestone 10: segmentation =================
+
+    // exact MSS: one segment
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto payload = makeFilledPayload(kTcpMss);
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(sent.segments.size() == 1);
+        if (sent.segments.size() == 1) {
+            CHECK(sent.segments[0].payload.size() == kTcpMss);
+            CHECK(sent.segments[0].flags.psh);
+            CHECK(sent.segments[0].flags.ack);
+        }
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->pending_count == 1);
+    }
+
+    // MSS + 1: two segments, MSS then 1, PSH only on the final one
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establish(table, key, 1000);
+        auto payload = makeFilledPayload(kTcpMss + 1);
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(sent.segments.size() == 2);
+        if (sent.segments.size() == 2) {
+            CHECK(sent.segments[0].payload.size() == kTcpMss);
+            CHECK(sent.segments[1].payload.size() == 1);
+            CHECK(!sent.segments[0].flags.psh);
+            CHECK(sent.segments[1].flags.psh);
+            CHECK(sent.segments[0].flags.ack && sent.segments[1].flags.ack);
+            CHECK(sent.segments[0].sequence_number == server_isn + 1);
+            CHECK(sent.segments[1].sequence_number == server_isn + 1 + kTcpMss);
+        }
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->pending_count == 2);
+            CHECK(snapshot->snd_nxt == server_isn + 1 + kTcpMss + 1);
+        }
+    }
+
+    // multiple segments: 3*MSS + 17 bytes -> 4 segments, exact reconstruction
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establish(table, key, 1000);
+        std::size_t total = 3 * kTcpMss + 17;
+        std::vector<std::byte> payload;
+        payload.reserve(total);
+        for (std::size_t i = 0; i < total; ++i) {
+            payload.push_back(static_cast<std::byte>(i % 256));
+        }
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(sent.segments.size() == 4);
+        if (sent.segments.size() == 4) {
+            CHECK(sent.segments[0].payload.size() == kTcpMss);
+            CHECK(sent.segments[1].payload.size() == kTcpMss);
+            CHECK(sent.segments[2].payload.size() == kTcpMss);
+            CHECK(sent.segments[3].payload.size() == 17);
+            for (std::size_t i = 0; i < 3; ++i) CHECK(!sent.segments[i].flags.psh);
+            CHECK(sent.segments[3].flags.psh);
+
+            std::uint32_t expected_seq = server_isn + 1;
+            std::vector<std::byte> reconstructed;
+            for (const auto& seg : sent.segments) {
+                CHECK(seg.sequence_number == expected_seq);
+                CHECK(seg.flags.ack);
+                CHECK(seg.payload.size() <= kTcpMss);
+                expected_seq += static_cast<std::uint32_t>(seg.payload.size());
+                reconstructed.insert(reconstructed.end(), seg.payload.begin(), seg.payload.end());
+            }
+            CHECK(reconstructed == payload);
+        }
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->pending_count == 4);
+            CHECK(snapshot->snd_nxt == server_isn + 1 + static_cast<std::uint32_t>(total));
+        }
+    }
+
+    // no empty trailing segment for an exact multiple of MSS
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto payload = makeFilledPayload(2 * kTcpMss);
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(sent.segments.size() == 2);
+        for (const auto& seg : sent.segments) CHECK(!seg.payload.empty());
+    }
+
+    // ================= Milestone 10: send window =================
+
+    // payload exactly fills the available window
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 100);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(sent.segments.size() == 1);
+        CHECK(sent.bytes_accepted == 100);
+    }
+
+    // payload exceeds the window by one: rejected, no state change
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 100);
+        auto before = table.snapshotOf(key);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(101), t0);
+        CHECK(sent.segments.empty());
+        CHECK(sent.error == TcpSendError::WindowTooSmall);
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->snd_nxt == before->snd_nxt);
+            CHECK(after->pending_count == before->pending_count);
+        }
+    }
+
+    // zero window rejects new data
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0);
+        auto sent = table.makeOutgoingData(key, toBytes("x"), t0);
+        CHECK(sent.segments.empty());
+        CHECK(sent.error == TcpSendError::WindowTooSmall);
+    }
+
+    // window below MSS: one smaller segment when the payload fits
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 50);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(50), t0);
+        CHECK(sent.segments.size() == 1);
+        if (sent.segments.size() == 1) CHECK(sent.segments[0].payload.size() == 50);
+    }
+
+    // a larger window fits several MSS-sized segments
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 5000);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(3000), t0);
+        CHECK(sent.segments.size() == 3); // 1460 + 1460 + 80
+    }
+
+    // ACK opens additional window
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 1000, 100);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(!sent.segments.empty());
+
+        auto blocked = table.makeOutgoingData(key, toBytes("x"), t0); // no window left
+        CHECK(blocked.segments.empty());
+
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, server_isn + 1 + 100, 200), t0);
+        auto reopened = table.makeOutgoingData(key, makeFilledPayload(200), t0);
+        CHECK(!reopened.segments.empty());
+    }
+
+    // a stale (earlier-sequence) window update cannot replace a newer one
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 1000, 1000);
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, server_isn + 1, 2000), t0);
+        table.handle(key, makeWindowUpdate(8080, 54321, 1000, server_isn + 1, 10), t0); // stale
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->snd_wnd == 2000);
+    }
+
+    // retransmission of already-outstanding data remains possible during
+    // a zero window
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 1000, 100);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(!sent.segments.empty());
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, server_isn + 1, 0), t0);
+        CHECK(table.makeOutgoingData(key, toBytes("x"), t0).segments.empty());
+
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        if (due.retransmissions.size() == 1) {
+            CHECK(due.retransmissions[0].segment.payload.size() == 100);
+        }
+    }
+
+    // FIN rejected without one byte of window, accepted after it reopens
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 1000, 0);
+        CHECK(!table.beginClose(key, t0).has_value());
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, server_isn + 1, 10), t0);
+        CHECK(table.beginClose(key, t0).has_value());
+    }
+
+    // ================= Milestone 10: out-of-order reassembly =================
+
+    // two segments in order: each delivered immediately, no buffering
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        auto r1 = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
+        CHECK(r1.accepted_payload == toBytes("AAA"));
+        auto r2 = table.handle(key, makeData(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0);
+        CHECK(r2.accepted_payload == toBytes("BBB"));
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->rcv_nxt == 1007);
+            CHECK(snapshot->reassembly_fragment_count == 0);
+        }
+    }
+
+    // two segments in reverse order: the second arrival is buffered, not
+    // delivered; the first arrival releases both concatenated in order
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        auto late = table.handle(key, makeData(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0);
+        CHECK(late.accepted_payload.empty());
+        CHECK(late.reply.has_value());
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->reassembly_fragment_count == 1);
+            CHECK(snapshot->reassembly_buffered_bytes == 3);
+            CHECK(snapshot->advertised_window == kTcpReceiveCapacity - 3);
+        }
+
+        auto gap_fill = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
+        CHECK(gap_fill.accepted_payload == toBytes("AAABBB"));
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) {
+            CHECK(after->rcv_nxt == 1007);
+            CHECK(after->reassembly_fragment_count == 0);
+            CHECK(after->advertised_window == kTcpReceiveCapacity);
+        }
+    }
+
+    // three segments in reverse order (C, B, A)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        CHECK(table.handle(key, makeData(8080, 54321, 1007, server_isn + 1, toBytes("CCC")), t0)
+                  .accepted_payload.empty());
+        CHECK(table.handle(key, makeData(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0)
+                  .accepted_payload.empty());
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->reassembly_fragment_count == 1); // B and C coalesced
+
+        auto released = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
+        CHECK(released.accepted_payload == toBytes("AAABBBCCC"));
+    }
+
+    // gap in the middle: A then C buffered, B fills the gap
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        CHECK(table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0)
+                  .accepted_payload == toBytes("AAA"));
+        CHECK(table.handle(key, makeData(8080, 54321, 1007, server_isn + 1, toBytes("CCC")), t0)
+                  .accepted_payload.empty());
+        auto released = table.handle(key, makeData(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0);
+        CHECK(released.accepted_payload == toBytes("BBBCCC"));
+    }
+
+    // duplicate segment: no re-delivery, no fragment growth
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeData(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0);
+        auto before = table.snapshotOf(key);
+        auto dup = table.handle(key, makeData(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0);
+        CHECK(dup.accepted_payload.empty());
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->reassembly_fragment_count == before->reassembly_fragment_count);
+            CHECK(after->reassembly_buffered_bytes == before->reassembly_buffered_bytes);
+        }
+    }
+
+    // partial left overlap: new segment covers part of a buffered
+    // fragment plus new bytes before it; existing bytes are kept
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeData(8080, 54321, 1010, server_isn + 1, toBytes("XXXXXXXXXX")), t0); // 1010..1020
+        // New segment 1005..1015 overlaps the front of the buffered
+        // fragment; only 1005..1010 is genuinely new.
+        table.handle(key, makeData(8080, 54321, 1005, server_isn + 1, toBytes("YYYYYYYYYY")), t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->reassembly_buffered_bytes == 15); // 1005..1020
+
+        auto released = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("ZZZZ")), t0);
+        // 1001..1005 new (Z), 1005..1010 new (Y), 1010..1020 first-arrival (X).
+        CHECK(released.accepted_payload == toBytes("ZZZZYYYYYXXXXXXXXXX"));
+    }
+
+    // partial right overlap: new segment covers the tail of a buffered
+    // fragment plus new bytes after it
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeData(8080, 54321, 1010, server_isn + 1, toBytes("XXXXXXXXXX")), t0); // 1010..1020
+        table.handle(key, makeData(8080, 54321, 1015, server_isn + 1, toBytes("YYYYYYYYYY")), t0); // 1015..1025
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->reassembly_buffered_bytes == 15); // 1010..1025
+
+        auto released = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("ZZZZZZZZZ")), t0);
+        CHECK(released.accepted_payload == toBytes("ZZZZZZZZZXXXXXXXXXXYYYYY"));
+    }
+
+    // one new segment covering two buffered fragments (fills both gaps
+    // around them and merges everything on release)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeData(8080, 54321, 1010, server_isn + 1, toBytes("11111")), t0); // 1010..1015
+        table.handle(key, makeData(8080, 54321, 1020, server_isn + 1, toBytes("22222")), t0); // 1020..1025
+        auto covering =
+            table.handle(key, makeData(8080, 54321, 1005, server_isn + 1, makeFilledPayload(25, std::byte{'0'})), t0);
+        // 1005..1030 -- covers both existing fragments; only the gaps
+        // (1005..1010 and 1015..1020) plus the tail (1025..1030) are new.
+        CHECK(covering.accepted_payload.empty()); // still gapped at rcv_nxt (1001..1005 missing)
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->reassembly_buffered_bytes == 25); // 1005..1030, one fragment
+
+        auto released = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("ABCD")), t0);
+        CHECK(released.accepted_payload ==
+              toBytes("ABCD0000011111000002222200000")); // 1001..1030 fully contiguous
+    }
+
+    // conflicting overlap: first-arrival-wins keeps the originally
+    // buffered bytes even when new data disagrees
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeData(8080, 54321, 1010, server_isn + 1, toBytes("AAAA")), t0); // first
+        table.handle(key, makeData(8080, 54321, 1010, server_isn + 1, toBytes("ZZZZ")), t0); // conflicting
+        auto released = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, makeFilledPayload(9, std::byte{'m'})), t0);
+        CHECK(released.accepted_payload == toBytes("mmmmmmmmmAAAA")); // original bytes kept
+    }
+
+    // segment entirely before rcv_nxt: pure duplicate, no state change
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
+        auto before = table.snapshotOf(key);
+        auto dup = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
+        CHECK(dup.accepted_payload.empty());
+        CHECK(dup.reply.has_value());
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) CHECK(before->rcv_nxt == after->rcv_nxt);
+    }
+
+    // segment entirely after the receive window: rejected wholesale
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        std::uint32_t far_seq = 1001 + static_cast<std::uint32_t>(kTcpReceiveCapacity) + 1000;
+        auto result = table.handle(key, makeData(8080, 54321, far_seq, server_isn + 1, toBytes("late")), t0);
+        CHECK(result.accepted_payload.empty());
+        CHECK(result.reply.has_value());
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->reassembly_fragment_count == 0);
+    }
+
+    // segment crossing the right window edge: only the in-window prefix
+    // is retained
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        std::uint32_t edge_seq = 1001 + static_cast<std::uint32_t>(kTcpReceiveCapacity) - 3;
+        auto result =
+            table.handle(key, makeData(8080, 54321, edge_seq, server_isn + 1, toBytes("XXXXXX")), t0);
+        CHECK(result.accepted_payload.empty()); // still gapped, not at rcv_nxt
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->reassembly_buffered_bytes == 3); // only the first 3 bytes fit
+    }
+
+    // fragment-count limit: 128 disjoint fragments accepted, the 129th dropped
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        for (std::size_t i = 0; i < kMaxReassemblyFragments; ++i) {
+            std::uint32_t seq = 1001 + static_cast<std::uint32_t>(2 + 2 * i); // spaced, never touching
+            table.handle(key, makeData(8080, 54321, seq, server_isn + 1, toBytes({0xaa})), t0);
+        }
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        if (before) CHECK(before->reassembly_fragment_count == kMaxReassemblyFragments);
+
+        std::uint32_t extra_seq =
+            1001 + static_cast<std::uint32_t>(2 + 2 * kMaxReassemblyFragments);
+        table.handle(key, makeData(8080, 54321, extra_seq, server_isn + 1, toBytes({0xbb})), t0);
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) CHECK(after->reassembly_fragment_count == kMaxReassemblyFragments); // unchanged
+    }
+
+    // byte-capacity limit: the advertised window naturally bounds
+    // buffering to kTcpReceiveCapacity
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        // One big out-of-order fragment right up to (but not filling)
+        // capacity, then confirm the window has shrunk by exactly that much.
+        std::size_t big = kTcpReceiveCapacity - 1000;
+        auto big_payload = makeFilledPayload(big, std::byte{'q'});
+        table.handle(key, makeData(8080, 54321, 1002, server_isn + 1, big_payload), t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->reassembly_buffered_bytes == big);
+            CHECK(snapshot->advertised_window == kTcpReceiveCapacity - big);
+        }
+    }
+
+    // wraparound reassembly: rcv_nxt crosses 0xffffffff -> 0, delivered
+    // out of order
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 0xfffffffb); // rcv_nxt starts at 0xfffffffc
+        auto late = table.handle(key, makeData(8080, 54321, 0, server_isn + 1, toBytes("Y")), t0); // wrapped
+        CHECK(late.accepted_payload.empty());
+        auto released =
+            table.handle(key, makeData(8080, 54321, 0xfffffffc, server_isn + 1, toBytes("XXXX")), t0);
+        CHECK(released.accepted_payload == toBytes("XXXXY"));
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->rcv_nxt == 1);
+    }
+
+    // ================= Milestone 10: out-of-order FIN =================
+
+    // out-of-order FIN retained, released once the gap fills
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        auto late_fin = table.handle(key, makeFin(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0);
+        CHECK(late_fin.accepted_payload.empty());
+        CHECK(!late_fin.peer_closed);
+        CHECK(table.stateOf(key) == TcpState::Established);
+
+        auto gap_fill = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
+        CHECK(gap_fill.accepted_payload == toBytes("AAABBB"));
+        CHECK(gap_fill.peer_closed); // EOF signaled exactly once, on the releasing call
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+    }
+
+    // duplicate buffered FIN does not re-signal EOF
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1), t0); // in-order FIN -> CloseWait
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+        auto dup = table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1), t0);
+        CHECK(!dup.peer_closed);
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+    }
+
+    // FIN beyond the receive window is not retained
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        std::uint32_t far_seq = 1001 + static_cast<std::uint32_t>(kTcpReceiveCapacity) + 1000;
+        auto result = table.handle(key, makeFin(8080, 54321, far_seq, server_isn + 1), t0);
+        CHECK(!result.peer_closed);
+        CHECK(table.stateOf(key) == TcpState::Established);
+    }
+
+    // FIN riding along with overlapping payload: only the new suffix is
+    // accepted, and the FIN (right after the original payload's end)
+    // is retained/consumed only once that position becomes contiguous
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0); // rcv_nxt=1004
+        // Overlapping FIN segment: starts at 1001 (already delivered),
+        // 3-byte payload again, then FIN at 1004 -- exactly at rcv_nxt.
+        auto result = table.handle(key, makeFin(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
+        CHECK(result.accepted_payload.empty()); // nothing new in the payload itself
+        CHECK(result.peer_closed); // but the FIN at 1004 is exactly in-order
+        CHECK(table.stateOf(key) == TcpState::CloseWait);
+    }
+
+    // FIN sequence wraparound
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 0xfffffffe); // rcv_nxt starts at 0xffffffff
+        auto result = table.handle(key, makeFin(8080, 54321, 0xffffffff, server_isn + 1), t0);
+        CHECK(result.peer_closed);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->rcv_nxt == 0);
+    }
+
+    // RST clears a pending (retained) out-of-order FIN along with
+    // everything else
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeFin(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0); // retained
+        auto result = table.handle(key, makeRst(8080, 54321, 1001), t0);
+        CHECK(result.connection_reset);
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // timeout removal clears a pending out-of-order FIN along with the
+    // rest of the connection
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establish(table, key, 1000);
+        table.handle(key, makeFin(8080, 54321, 1004, server_isn + 1, toBytes("BBB")), t0); // retained
+        auto fin = table.beginClose(key, t0); // our own FIN, to give pollRetransmissions something to time out
+        CHECK(fin.has_value());
+        auto t = t0;
+        std::chrono::milliseconds rto = kInitialRto;
+        for (int i = 0; i < kMaxRetransmits; ++i) {
+            t += rto;
+            table.pollRetransmissions(t);
+            rto = std::min(rto * 2, std::chrono::duration_cast<std::chrono::milliseconds>(kMaxRto));
+        }
+        t += rto;
+        auto exhausted = table.pollRetransmissions(t);
+        CHECK(exhausted.timed_out.size() == 1);
+        CHECK(!table.stateOf(key).has_value());
     }
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;

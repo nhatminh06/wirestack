@@ -18,6 +18,14 @@ bool sequenceLessOrEqual(std::uint32_t a, std::uint32_t b) {
     return static_cast<std::int32_t>(b - a) >= 0;
 }
 
+std::uint32_t sequenceMax(std::uint32_t a, std::uint32_t b) {
+    return sequenceGreater(a, b) ? a : b;
+}
+
+std::uint32_t sequenceMin(std::uint32_t a, std::uint32_t b) {
+    return sequenceGreater(a, b) ? b : a;
+}
+
 } // namespace
 
 TcpSegment makeClosedPortReset(const TcpSegment& incoming) {
@@ -49,6 +57,43 @@ std::uint32_t TcpConnectionTable::nextIsn() {
     return isn;
 }
 
+std::size_t TcpConnectionTable::bufferedReceiveBytes(const Connection& connection) {
+    std::size_t total = 0;
+    for (const auto& fragment : connection.out_of_order) {
+        total += fragment.payload.size();
+    }
+    if (connection.pending_fin_seq) {
+        total += 1;
+    }
+    return total;
+}
+
+std::uint16_t TcpConnectionTable::advertisedWindowFor(const Connection& connection) {
+    std::size_t buffered = bufferedReceiveBytes(connection);
+    std::size_t available = buffered >= kTcpReceiveCapacity ? 0 : kTcpReceiveCapacity - buffered;
+    return static_cast<std::uint16_t>(std::min<std::size_t>(available, 65535));
+}
+
+std::uint32_t TcpConnectionTable::availableSendWindow(const Connection& connection) {
+    std::uint32_t flight = connection.snd_nxt - connection.snd_una;
+    if (flight >= connection.snd_wnd) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(connection.snd_wnd) - flight;
+}
+
+void TcpConnectionTable::updateSendWindow(Connection& connection, const TcpSegment& segment) {
+    bool accept = sequenceGreater(segment.sequence_number, connection.snd_wl1) ||
+                  (segment.sequence_number == connection.snd_wl1 &&
+                   sequenceLessOrEqual(connection.snd_wl2, segment.acknowledgment_number));
+    if (!accept) {
+        return; // stale segment -- keep the newer window advertisement
+    }
+    connection.snd_wnd = segment.window_size;
+    connection.snd_wl1 = segment.sequence_number;
+    connection.snd_wl2 = segment.acknowledgment_number;
+}
+
 TcpSegment TcpConnectionTable::makeSynAck(const TcpConnectionKey& key,
                                            const Connection& connection) {
     TcpSegment reply;
@@ -58,7 +103,7 @@ TcpSegment TcpConnectionTable::makeSynAck(const TcpConnectionKey& key,
     reply.acknowledgment_number = connection.remote_isn + 1;
     reply.flags.syn = true;
     reply.flags.ack = true;
-    reply.window_size = 65535;
+    reply.window_size = advertisedWindowFor(connection);
     reply.urgent_pointer = 0;
     return reply;
 }
@@ -71,7 +116,7 @@ TcpSegment TcpConnectionTable::makePureAck(const TcpConnectionKey& key,
     reply.sequence_number = connection.snd_nxt;
     reply.acknowledgment_number = connection.rcv_nxt;
     reply.flags.ack = true;
-    reply.window_size = 65535;
+    reply.window_size = advertisedWindowFor(connection);
     reply.urgent_pointer = 0;
     return reply;
 }
@@ -84,7 +129,7 @@ TcpSegment TcpConnectionTable::makeFin(const TcpConnectionKey& key, const Connec
     reply.acknowledgment_number = connection.rcv_nxt;
     reply.flags.fin = true;
     reply.flags.ack = true;
-    reply.window_size = 65535;
+    reply.window_size = advertisedWindowFor(connection);
     reply.urgent_pointer = 0;
     return reply;
 }
@@ -125,6 +170,79 @@ void TcpConnectionTable::startTimeWait(Connection& connection, TcpClock::time_po
     connection.pending.clear();
 }
 
+void TcpConnectionTable::insertReassemblyFragment(Connection& connection,
+                                                    std::uint32_t sequence_start,
+                                                    std::vector<std::byte> payload) {
+    // Normalize to offsets from rcv_nxt: by construction (the caller
+    // already trimmed to the receive window) these are small plain
+    // numbers bounded by the window, so ordinary integer comparisons are
+    // correct here with no wraparound-specific handling needed -- the
+    // wraparound-aware work already happened in the caller's window
+    // acceptance test.
+    std::uint32_t base = connection.rcv_nxt;
+    std::uint32_t new_start = sequence_start - base;
+    std::uint32_t new_end = new_start + static_cast<std::uint32_t>(payload.size());
+
+    // First-arrival-wins: subtract every existing fragment's range from
+    // the new range, so already-buffered bytes are never overwritten.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> gaps = {{new_start, new_end}};
+    for (const auto& fragment : connection.out_of_order) {
+        std::uint32_t f_start = fragment.sequence_start - base;
+        std::uint32_t f_end = f_start + static_cast<std::uint32_t>(fragment.payload.size());
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> next_gaps;
+        for (auto [s, e] : gaps) {
+            if (f_end <= s || f_start >= e) {
+                next_gaps.push_back({s, e}); // no overlap with this fragment
+                continue;
+            }
+            if (f_start > s) next_gaps.push_back({s, f_start}); // new bytes before it
+            if (f_end < e) next_gaps.push_back({f_end, e});     // new bytes after it
+        }
+        gaps = std::move(next_gaps);
+    }
+
+    for (auto [gap_start, gap_end] : gaps) {
+        if (gap_start >= gap_end) continue;
+        if (connection.out_of_order.size() >= kMaxReassemblyFragments) {
+            break; // bounded: remaining genuinely-new bytes are dropped
+        }
+        std::vector<std::byte> piece(payload.begin() + (gap_start - new_start),
+                                      payload.begin() + (gap_end - new_start));
+        connection.out_of_order.push_back(
+            TcpReassemblyFragment{base + gap_start, std::move(piece)});
+    }
+
+    std::sort(connection.out_of_order.begin(), connection.out_of_order.end(),
+              [base](const TcpReassemblyFragment& a, const TcpReassemblyFragment& b) {
+                  return (a.sequence_start - base) < (b.sequence_start - base);
+              });
+
+    // Coalesce fragments that now touch, keeping the steady-state
+    // fragment count low.
+    std::vector<TcpReassemblyFragment> merged;
+    merged.reserve(connection.out_of_order.size());
+    for (auto& fragment : connection.out_of_order) {
+        if (!merged.empty() && merged.back().sequenceEnd() == fragment.sequence_start) {
+            merged.back().payload.insert(merged.back().payload.end(), fragment.payload.begin(),
+                                          fragment.payload.end());
+        } else {
+            merged.push_back(std::move(fragment));
+        }
+    }
+    connection.out_of_order = std::move(merged);
+}
+
+std::vector<std::byte> TcpConnectionTable::releaseContiguous(Connection& connection) {
+    std::vector<std::byte> released;
+    auto it = connection.out_of_order.begin();
+    while (it != connection.out_of_order.end() && it->sequence_start == connection.rcv_nxt) {
+        released.insert(released.end(), it->payload.begin(), it->payload.end());
+        connection.rcv_nxt += static_cast<std::uint32_t>(it->payload.size());
+        it = connection.out_of_order.erase(it);
+    }
+    return released;
+}
+
 TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& key,
                                                           Connection& connection,
                                                           const TcpSegment& segment,
@@ -156,6 +274,7 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         return {};
     }
     retireAcknowledged(connection, segment.acknowledgment_number);
+    updateSendWindow(connection, segment);
 
     bool local_fin_acked = connection.local_fin_seq.has_value() &&
                             sequenceLessOrEqual(*connection.local_fin_seq + 1, connection.snd_una);
@@ -179,44 +298,76 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         return result;
     }
 
-    if (segment.sequence_number == connection.rcv_nxt) {
+    // Window acceptance test, using the window as advertised before this
+    // segment's own bytes are considered (task rule 18/22).
+    std::uint32_t window = advertisedWindowFor(connection);
+    std::uint32_t window_end = connection.rcv_nxt + window;
+    std::uint32_t seg_start = segment.sequence_number;
+    std::uint32_t seg_end = seg_start + static_cast<std::uint32_t>(segment.payload.size());
+
+    std::uint32_t usable_start = sequenceMax(connection.rcv_nxt, seg_start);
+    std::uint32_t usable_end = sequenceMin(seg_end, window_end);
+    bool any_payload_in_window = sequenceGreater(usable_end, usable_start);
+
+    // A peer FIN can only be newly retained while the peer's FIN hasn't
+    // already been consumed -- Established/FinWait1/FinWait2. In every
+    // other synchronized state, a FIN flag here is necessarily a
+    // retransmission of one already consumed and is handled by the
+    // duplicate-ACK fallback below.
+    bool fin_events_open = connection.state == TcpState::Established ||
+                            connection.state == TcpState::FinWait1 ||
+                            connection.state == TcpState::FinWait2;
+    // The FIN's own sequence position must itself lie within the window;
+    // a FIN whose preceding payload was right-edge-trimmed away is never
+    // retained (its position is already >= window_end).
+    bool fin_in_window = fin_events_open && segment.flags.fin &&
+                          sequenceLessOrEqual(connection.rcv_nxt, seg_end) &&
+                          sequenceGreater(window_end, seg_end);
+
+    if (!any_payload_in_window && !fin_in_window) {
+        // Nothing of this segment lies in the receive window: store
+        // nothing, deliver nothing, rcv_nxt unchanged, duplicate ACK.
         TcpReceiveResult result;
-        if (!segment.payload.empty()) {
-            result.accepted_payload = segment.payload;
-            connection.rcv_nxt += static_cast<std::uint32_t>(segment.payload.size());
-        }
-
-        if (segment.flags.fin) {
-            connection.rcv_nxt += 1;
-            result.peer_closed = true;
-
-            if (connection.state == TcpState::Established) {
-                connection.state = TcpState::CloseWait;
-            } else if (connection.state == TcpState::FinWait1) {
-                connection.state = TcpState::Closing;
-            } else if (connection.state == TcpState::FinWait2) {
-                startTimeWait(connection, now);
-            }
-
-            // Only ACK the FIN directly when no payload was also
-            // delivered -- an echo built from accepted_payload already
-            // ACKs the post-FIN rcv_nxt, making a separate pure ACK
-            // redundant.
-            if (result.accepted_payload.empty()) {
-                result.reply = makePureAck(key, connection);
-            }
-        }
-
+        result.reply = makePureAck(key, connection);
         return result;
     }
 
-    // Duplicate, out-of-order, or overlapping data (including a
-    // retransmitted FIN already consumed) -- all resolve to the same
-    // behavior: nothing is delivered, rcv_nxt is unchanged, no
-    // peer_closed, and a duplicate ACK for the current rcv_nxt is sent.
-    // No reassembly.
+    if (any_payload_in_window) {
+        std::uint32_t prefix_trim = usable_start - seg_start;
+        std::uint32_t usable_len = usable_end - usable_start;
+        std::vector<std::byte> usable_payload(
+            segment.payload.begin() + prefix_trim,
+            segment.payload.begin() + prefix_trim + usable_len);
+        insertReassemblyFragment(connection, usable_start, std::move(usable_payload));
+    }
+    if (fin_in_window) {
+        connection.pending_fin_seq = seg_end;
+    }
+
     TcpReceiveResult result;
-    result.reply = makePureAck(key, connection);
+    result.accepted_payload = releaseContiguous(connection);
+
+    if (connection.pending_fin_seq && *connection.pending_fin_seq == connection.rcv_nxt) {
+        connection.rcv_nxt += 1;
+        connection.pending_fin_seq.reset();
+        result.peer_closed = true;
+
+        if (connection.state == TcpState::Established) {
+            connection.state = TcpState::CloseWait;
+        } else if (connection.state == TcpState::FinWait1) {
+            connection.state = TcpState::Closing;
+        } else if (connection.state == TcpState::FinWait2) {
+            startTimeWait(connection, now);
+        }
+    }
+
+    // Only reply directly when nothing was released -- an out-of-order
+    // arrival (still gapped) gets a duplicate ACK; a released payload is
+    // ACKed by whatever the caller builds from accepted_payload instead
+    // (an echo/response), avoiding a redundant separate ACK.
+    if (result.accepted_payload.empty()) {
+        result.reply = makePureAck(key, connection);
+    }
     return result;
 }
 
@@ -347,6 +498,12 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
             connection.snd_una = connection.local_isn; // pre-ack; retireAcknowledged advances it
             connection.snd_nxt = connection.local_isn + 1;
             retireAcknowledged(connection, connection.local_isn + 1); // drains the pending SYN-ACK
+            // Initialize the peer send window directly from the
+            // handshake-completing ACK -- the first advertisement, so no
+            // staleness test is needed.
+            connection.snd_wnd = segment.window_size;
+            connection.snd_wl1 = segment.sequence_number;
+            connection.snd_wl2 = segment.acknowledgment_number;
         }
         return {};
     }
@@ -369,46 +526,86 @@ std::optional<TcpConnectionSnapshot> TcpConnectionTable::snapshotOf(
         return std::nullopt;
     }
     const Connection& connection = it->second;
-    return TcpConnectionSnapshot{connection.state, connection.rcv_nxt, connection.snd_una,
-                                  connection.snd_nxt, connection.pending.size()};
+    return TcpConnectionSnapshot{connection.state,
+                                  connection.rcv_nxt,
+                                  connection.snd_una,
+                                  connection.snd_nxt,
+                                  connection.pending.size(),
+                                  connection.snd_wnd,
+                                  connection.out_of_order.size(),
+                                  bufferedReceiveBytes(connection),
+                                  advertisedWindowFor(connection)};
 }
 
-std::optional<TcpSegment> TcpConnectionTable::makeOutgoingData(const TcpConnectionKey& key,
-                                                                 std::vector<std::byte> payload,
-                                                                 TcpClock::time_point now) {
-    if (payload.empty() || payload.size() > kMaxTcpSegmentLength - 20) {
-        return std::nullopt;
+TcpSendResult TcpConnectionTable::makeOutgoingData(const TcpConnectionKey& key,
+                                                     std::vector<std::byte> payload,
+                                                     TcpClock::time_point now) {
+    TcpSendResult result;
+    if (payload.empty()) {
+        result.error = TcpSendError::EmptyPayload;
+        return result;
+    }
+    if (payload.size() > kMaxApplicationSendSize) {
+        result.error = TcpSendError::TooLarge;
+        return result;
     }
 
     auto it = connections_.find(key);
     if (it == connections_.end() || (it->second.state != TcpState::Established &&
                                       it->second.state != TcpState::CloseWait)) {
-        return std::nullopt;
+        result.error = TcpSendError::NotSendable;
+        return result;
     }
     Connection& connection = it->second;
 
-    TcpSegment segment;
-    segment.source_port = key.local_port;
-    segment.destination_port = key.remote_port;
-    segment.sequence_number = connection.snd_nxt;
-    segment.acknowledgment_number = connection.rcv_nxt;
-    segment.flags.psh = true;
-    segment.flags.ack = true;
-    segment.window_size = 65535;
-    segment.urgent_pointer = 0;
-    segment.payload = std::move(payload);
+    if (payload.size() > availableSendWindow(connection)) {
+        result.error = TcpSendError::WindowTooSmall;
+        return result;
+    }
 
-    PendingTransmission pending;
-    pending.sequence_start = connection.snd_nxt;
-    pending.is_syn = false;
-    pending.flags = segment.flags;
-    pending.payload = segment.payload; // owns an independent copy
-    pending.last_sent = now;
-    connection.pending.push_back(std::move(pending));
+    std::size_t total = payload.size();
+    std::size_t segment_count = (total + kTcpMss - 1) / kTcpMss;
+    std::vector<TcpSegment> segments;
+    segments.reserve(segment_count);
 
-    connection.snd_nxt += static_cast<std::uint32_t>(segment.payload.size());
+    std::uint32_t seq = connection.snd_nxt;
+    std::size_t offset = 0;
+    while (offset < total) {
+        std::size_t chunk = std::min(kTcpMss, total - offset);
+        bool is_last = offset + chunk == total;
 
-    return segment;
+        TcpSegment segment;
+        segment.source_port = key.local_port;
+        segment.destination_port = key.remote_port;
+        segment.sequence_number = seq;
+        segment.acknowledgment_number = connection.rcv_nxt;
+        segment.flags.ack = true;
+        segment.flags.psh = is_last;
+        segment.window_size = advertisedWindowFor(connection);
+        segment.urgent_pointer = 0;
+        segment.payload.assign(payload.begin() + static_cast<std::ptrdiff_t>(offset),
+                                payload.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
+        segments.push_back(segment);
+
+        seq += static_cast<std::uint32_t>(chunk);
+        offset += chunk;
+    }
+
+    for (const auto& segment : segments) {
+        PendingTransmission pending;
+        pending.sequence_start = segment.sequence_number;
+        pending.is_syn = false;
+        pending.flags = segment.flags;
+        pending.payload = segment.payload; // owns an independent copy
+        pending.last_sent = now;
+        connection.pending.push_back(std::move(pending));
+    }
+
+    connection.snd_nxt += static_cast<std::uint32_t>(total);
+
+    result.segments = std::move(segments);
+    result.bytes_accepted = total;
+    return result;
 }
 
 std::optional<TcpSegment> TcpConnectionTable::beginClose(const TcpConnectionKey& key,
@@ -420,6 +617,9 @@ std::optional<TcpSegment> TcpConnectionTable::beginClose(const TcpConnectionKey&
     Connection& connection = it->second;
     if (connection.state != TcpState::Established && connection.state != TcpState::CloseWait) {
         return std::nullopt;
+    }
+    if (availableSendWindow(connection) < 1) {
+        return std::nullopt; // a FIN consumes one send-window sequence number too
     }
 
     TcpSegment segment = makeFin(key, connection);
@@ -479,7 +679,9 @@ TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_poin
         segment.acknowledgment_number =
             oldest.is_syn ? connection.remote_isn + 1 : connection.rcv_nxt;
         segment.flags = oldest.flags;
-        segment.window_size = 65535;
+        // Refreshed to the current advertised window, same as the
+        // acknowledgment number just above, before checksum serialization.
+        segment.window_size = advertisedWindowFor(connection);
         segment.urgent_pointer = 0;
         segment.payload = oldest.payload;
 

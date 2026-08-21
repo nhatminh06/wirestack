@@ -149,7 +149,7 @@ int main() {
 
         // Leave a pending outgoing segment so removal-on-RST is provable.
         auto sent = connections.makeOutgoingData(key, std::vector<std::byte>{std::byte{0x42}}, t0);
-        CHECK(sent.has_value());
+        CHECK(!sent.segments.empty());
 
         TcpSegment client_rst;
         client_rst.source_port = syn->source_port;
