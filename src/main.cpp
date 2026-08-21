@@ -337,6 +337,15 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.reply);
     }
 
+    if (result.fast_retransmit) {
+        // A duplicate-ACK-triggered fast retransmission is sent through
+        // the same immediate-reply path, addressed using the current
+        // received frame -- not the timer/ARP-cache path used by ordinary
+        // timeout retransmissions, which have no current frame to read a
+        // destination MAC from.
+        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.fast_retransmit);
+    }
+
     if (!result.accepted_payload.empty()) {
         std::printf("tcp data src=%s:%u len=%zu\n", ip_packet.source.toString().c_str(),
                     static_cast<unsigned int>(segment.source_port),

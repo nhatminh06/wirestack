@@ -83,6 +83,14 @@ struct TcpReceiveResult {
     // same time as a non-empty accepted_payload.
     std::optional<TcpSegment> reply;
 
+    // Set exactly on the call whose ACK is the third qualifying duplicate
+    // ACK (see docs/tcp.md): an immediate retransmission of the oldest
+    // outstanding application-data segment, distinct from `reply` and
+    // from ordinary timeout-triggered retransmission. The caller sends it
+    // through the same immediate-reply path as `reply`, addressed using
+    // the current received frame, not the timer/ARP path.
+    std::optional<TcpSegment> fast_retransmit;
+
     // Non-empty only when this call made new bytes contiguous from
     // rcv_nxt -- either because the segment itself arrived in order, or
     // because it filled the last gap needed to release previously
@@ -229,10 +237,11 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 // receive reassembly with duplicate/overlap trimming, cumulative ACK
 // processing with Slow Start/Congestion Avoidance growth, RTT-adaptive
 // timeout-based retransmission of sequence-consuming segments (SYN-ACK,
-// application data, FIN -- never pure ACKs), passive/active/simultaneous
-// close, deterministic TIME_WAIT, and acceptable inbound RST. No fast
-// retransmit, no fast recovery, no SACK, no TCP timestamps, no active
-// open.
+// application data, FIN -- never pure ACKs), duplicate-ACK fast
+// retransmit and classic fast recovery, passive/active/simultaneous
+// close, deterministic TIME_WAIT, and acceptable inbound RST. No SACK,
+// no NewReno partial-ACK recovery, no CUBIC/BBR, no ECN, no TCP
+// timestamps, no active open.
 class TcpConnectionTable {
 public:
     explicit TcpConnectionTable(std::uint16_t listen_port);
@@ -260,8 +269,8 @@ public:
     // queued, and snd_nxt is unchanged. Callers must retry a rejected
     // send later, after the peer's advertised window or the congestion
     // window changes -- there is no internal send queue or automatic
-    // retry. A timeout retransmission is not new data and does not
-    // consume additional congestion-window allowance.
+    // retry. A retransmission (timeout or fast) is not new data and does
+    // not consume additional congestion-window allowance.
     TcpSendResult makeOutgoingData(const TcpConnectionKey& key, std::vector<std::byte> payload,
                                     TcpClock::time_point now);
 
@@ -298,7 +307,16 @@ private:
         TcpClock::time_point first_sent_at;
         TcpClock::time_point last_sent_at;
         TcpClock::duration timeout_interval = kInitialRto; // this entry's own backed-off timeout
-        int retransmit_count = 0; // > 0 also means "not eligible for an RTT sample" (Karn's rule)
+        // Timeout retry budget only -- incremented solely by
+        // pollRetransmissions on an actual RTO expiry. A fast
+        // retransmission never touches this (see was_retransmitted).
+        int timeout_retransmit_count = 0;
+        // Karn ambiguity: true once this entry has been retransmitted by
+        // ANY path (timeout or duplicate-ACK fast retransmit), making an
+        // eventual ACK of it ineligible for an RTT sample. Deliberately
+        // separate from timeout_retransmit_count -- a fast retransmission
+        // sets this without consuming the timeout retry budget.
+        bool was_retransmitted = false;
         // Set once an ACK has taken an RTT sample from this entry (full or
         // partial retirement). Distinct from Karn eligibility: a
         // never-retransmitted entry may still be ineligible for a *second*
@@ -414,9 +432,9 @@ private:
     // recordRttSample) from the newest fully-or-partially-retired entry
     // that was never retransmitted and has not already contributed a
     // sample, if any -- Karn's rule falls out for free, since a
-    // retransmitted entry is simply never an eligible candidate, and
-    // rtt_sample_taken prevents a still-partially-outstanding entry from
-    // being sampled a second time by a later ACK.
+    // retransmitted entry (was_retransmitted) is simply never an eligible
+    // candidate, and rtt_sample_taken prevents a still-partially-
+    // outstanding entry from being sampled a second time by a later ACK.
     static TcpAckRetirementResult retireAcknowledged(Connection& connection, std::uint32_t ack,
                                                        TcpClock::time_point now);
 
@@ -455,6 +473,16 @@ private:
     // application-data entry. Never called for a SYN-ACK or FIN timeout
     // -- see pollRetransmissions.
     static void applyTimeoutCongestionCollapse(Connection& connection);
+
+    // Enters fast recovery on the third qualifying duplicate ACK: sets
+    // ssthresh/cwnd/recovery_point per docs/tcp.md and returns an
+    // immediate retransmission of the oldest outstanding application-data
+    // pending entry (never SYN or FIN), restarting that entry's deadline
+    // from `now` without doubling its timeout or consuming timeout retry
+    // budget. Precondition: the caller has already confirmed an eligible
+    // data entry exists.
+    static TcpSegment beginFastRecovery(const TcpConnectionKey& key, Connection& connection,
+                                         TcpClock::time_point now);
 
     // Moves `connection` into TimeWait, arming its expiration deadline
     // and dropping any (already-acknowledged) pending entries.
