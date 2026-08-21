@@ -127,8 +127,7 @@ inline constexpr std::size_t kIpv4HeaderLength = 20;
 inline constexpr std::size_t kTcpHeaderLength = 20;
 inline constexpr std::size_t kTcpMss = 1460; // 1500 - 20 - 20, Wirestack's own path MSS
 
-// RFC 1191-style fallback when a peer's SYN carries no MSS option at
-// all -- the classic IPv4 default, not a Wirestack invention.
+// IPv4 default peer MSS fallback: 536 bytes when the SYN omits MSS.
 inline constexpr std::uint16_t kDefaultPeerMss = 536;
 
 // Bounds an atomic application send (see makeOutgoingData) -- matches the
@@ -389,9 +388,11 @@ private:
 
     // The LOGICAL receive-window right edge actually promised to the
     // peer -- the wire value advertisedWindowFor(connection, true) would
-    // produce, re-expanded by the local scale. Used only for the receive
-    // acceptance test, so Wirestack never accepts bytes beyond what it
-    // actually advertised even though its internal buffer is larger.
+    // produce, re-expanded by Wirestack's OWN local_window_scale (this is
+    // Wirestack's own advertised window, not a peer-received one -- see
+    // expandLocalAdvertisedWindow). Used only for the receive acceptance
+    // test, so Wirestack never accepts bytes beyond what it actually
+    // advertised even though its internal buffer is larger.
     static std::uint32_t advertisedLogicalWindowFor(const Connection& connection);
 
     // snd_wnd - flight_size (snd_nxt - snd_una), or 0 if the peer's
@@ -399,13 +400,25 @@ private:
     // bytes.
     static std::uint32_t availableSendWindow(const Connection& connection);
 
-    // raw << peer_window_scale when scaling was negotiated, else raw
-    // unchanged. Never applied to a SYN or SYN-ACK's own window field.
-    static std::uint32_t decodeWindow(const Connection& connection, std::uint16_t raw);
+    // Decodes a window field RECEIVED FROM THE PEER: raw << peer_window_scale
+    // when scaling was negotiated, else raw unchanged. Never applied to a
+    // SYN or SYN-ACK's own window field. Not to be confused with
+    // expandLocalAdvertisedWindow, which uses the other (local) shift.
+    static std::uint32_t decodePeerWindow(const Connection& connection, std::uint16_t raw);
+
+    // Re-expands a WIRE VALUE WIRESTACK ITSELF ADVERTISED (produced by
+    // advertisedWindowFor) back into the logical byte count it promised:
+    // wire << local_window_scale when scaling was negotiated, else wire
+    // unchanged. peer_window_scale plays no part here -- decoding an
+    // incoming peer window and reconstructing Wirestack's own advertised
+    // window are independent negotiated shifts and must never share one
+    // helper implicitly.
+    static std::uint32_t expandLocalAdvertisedWindow(const Connection& connection,
+                                                       std::uint16_t wire);
 
     // Applies the RFC 793 SND.WL1/WL2 acceptance test so a stale segment
     // can never replace a newer window advertisement, then updates
-    // snd_wnd/snd_wl1/snd_wl2 (via decodeWindow) if the new segment is
+    // snd_wnd/snd_wl1/snd_wl2 (via decodePeerWindow) if the new segment is
     // accepted.
     static void updateSendWindow(Connection& connection, const TcpSegment& segment);
 

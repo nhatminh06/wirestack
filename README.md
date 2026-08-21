@@ -33,7 +33,7 @@ negotiation and adaptive retransmission timing):
 - TCP segment parsing/serialization with the IPv4 pseudo-header checksum, a
   4-tuple `TcpConnectionTable`, a passive handshake (LISTEN implicit /
   SYN_RECEIVED / ESTABLISHED) that parses and negotiates a SYN's MSS and
-  Window Scale options (RFC-1191-style 536-byte MSS fallback, Window Scale
+  Window Scale options (IPv4 default 536-byte MSS fallback, Window Scale
   clamped to 14, both fixed for the connection's lifetime), sequence-space
   tracking, MSS-bounded outgoing segmentation (sized to the negotiated
   peer MSS, atomically capped at 128 segments per send) with atomic

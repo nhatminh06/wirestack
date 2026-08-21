@@ -2864,5 +2864,184 @@ int main() {
         CHECK(!table.stateOf(key).has_value());
     }
 
+    // ================= PR #5 fix 1: local vs peer window scale =================
+
+    // snd_wnd decodes using the PEER's scale; the receive-acceptance
+    // boundary expands using Wirestack's own LOCAL scale (fixed at 2) --
+    // these must stay independent even when the peer offers a very
+    // different shift.
+    {
+        auto check = [&](std::uint8_t peer_scale) {
+            TcpConnectionTable table(8080);
+            TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+            std::uint32_t server_isn = establishWithWindowScale(table, key, 1000, peer_scale, t0);
+
+            TcpSegment window_update = makeAck(8080, 54321, 1001, server_isn + 1);
+            window_update.window_size = 100;
+            table.handle(key, window_update, t0);
+            auto snapshot = table.snapshotOf(key);
+            CHECK(snapshot.has_value());
+            if (snapshot) {
+                CHECK(snapshot->peer_window_scale == peer_scale);
+                CHECK(snapshot->local_window_scale == 2);
+                CHECK(snapshot->snd_wnd == (static_cast<std::uint32_t>(100) << peer_scale));
+            }
+
+            // Right edge of Wirestack's own advertised logical window is
+            // governed by local_window_scale (2) alone: kTcpReceiveCapacity
+            // (262140) bytes from rcv_nxt, regardless of peer_scale.
+            std::uint32_t last_in_window =
+                1001 + static_cast<std::uint32_t>(kTcpReceiveCapacity) - 1;
+            table.handle(key, makeData(8080, 54321, last_in_window, server_isn + 1, toBytes({0xaa})),
+                         t0);
+            auto after_last = table.snapshotOf(key);
+            CHECK(after_last.has_value());
+            if (after_last) {
+                // Far out-of-order (rcv_nxt is still 1001) but within the
+                // window -- buffered, not rejected.
+                CHECK(after_last->reassembly_fragment_count == 1);
+                CHECK(after_last->reassembly_buffered_bytes <= kTcpReceiveCapacity);
+            }
+        };
+        check(0);
+        check(3);
+        check(14);
+    }
+
+    // One byte beyond the local logical window's right edge is rejected --
+    // in particular, with peer_scale=14, incorrectly expanding Wirestack's
+    // own window using the PEER's shift would have advertised an
+    // approximately 1 GiB window (65535 << 14) and wrongly accepted this
+    // byte.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establishWithWindowScale(table, key, 1000, 14, t0);
+        auto snapshot_before = table.snapshotOf(key);
+        CHECK(snapshot_before.has_value());
+        if (snapshot_before) {
+            CHECK(snapshot_before->peer_window_scale == 14);
+            CHECK(snapshot_before->local_window_scale == 2);
+        }
+
+        std::uint32_t one_past_window = 1001 + static_cast<std::uint32_t>(kTcpReceiveCapacity);
+        auto result = table.handle(
+            key, makeData(8080, 54321, one_past_window, server_isn + 1, toBytes({0xaa})), t0);
+        CHECK(result.accepted_payload.empty());
+        auto snapshot_after = table.snapshotOf(key);
+        CHECK(snapshot_after.has_value());
+        if (snapshot_after) {
+            CHECK(snapshot_after->reassembly_fragment_count == 0); // rejected, nothing stored
+        }
+    }
+
+    // ================= PR #5 fix 2: SYN-ACK options survive retransmission =================
+
+    // MSS only: initial and timeout-retransmitted SYN-ACK both carry
+    // "02 04 05 b4", Data Offset 6, 24-byte header.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto initial_reply = table.handle(key, makeSynWithOptions(8080, 54321, 1000, {}), t0).reply;
+        CHECK(initial_reply.has_value());
+        if (!initial_reply) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        CHECK(initial_reply->options == toBytes({0x02, 0x04, 0x05, 0xb4}));
+
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        if (due.retransmissions.size() == 1) {
+            const auto& retransmitted = due.retransmissions[0].segment;
+            CHECK(retransmitted.options == toBytes({0x02, 0x04, 0x05, 0xb4}));
+            CHECK(retransmitted.sequence_number == initial_reply->sequence_number);
+            CHECK(retransmitted.acknowledgment_number == initial_reply->acknowledgment_number);
+            CHECK(retransmitted.flags.syn && retransmitted.flags.ack);
+            CHECK(retransmitted.window_size == 65535); // still unscaled
+
+            auto serialized = serializeTcpSegment(retransmitted, localIp(), remoteIp());
+            CHECK(std::holds_alternative<std::vector<std::byte>>(serialized));
+            if (auto* bytes = std::get_if<std::vector<std::byte>>(&serialized)) {
+                CHECK(bytes->size() == 24);
+                CHECK((*bytes)[12] >> 4 == std::byte{6}); // Data Offset 6
+                auto reparsed = parseTcpSegment(*bytes, localIp(), remoteIp()); // validates checksum
+                CHECK(std::holds_alternative<TcpSegment>(reparsed));
+                if (auto* segment = std::get_if<TcpSegment>(&reparsed)) {
+                    CHECK(segment->options == toBytes({0x02, 0x04, 0x05, 0xb4}));
+                }
+            }
+        }
+
+        // Retransmission does not renegotiate.
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->peer_mss == 536); // no MSS offered -> fallback, unchanged
+            CHECK(!snapshot->window_scaling_enabled);
+        }
+
+        // Karn's rule: the ACK completing the handshake after a SYN-ACK
+        // retransmission must not produce an RTT sample.
+        table.handle(key, makeAck(8080, 54321, 1001, initial_reply->sequence_number + 1),
+                     t0 + kInitialRto);
+        CHECK(table.stateOf(key) == TcpState::Established);
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) CHECK(!after->has_rtt_sample);
+    }
+
+    // MSS and Window Scale: initial and timeout-retransmitted SYN-ACK both
+    // carry "02 04 05 b4 01 03 03 02", Data Offset 7, 28-byte header.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> syn_options = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                                std::byte{0xb4}, std::byte{1}, std::byte{3},
+                                                std::byte{3},    std::byte{5}};
+        auto initial_reply =
+            table.handle(key, makeSynWithOptions(8080, 54321, 1000, syn_options), t0).reply;
+        CHECK(initial_reply.has_value());
+        if (!initial_reply) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        CHECK(initial_reply->options == toBytes({0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x02}));
+
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        if (due.retransmissions.size() == 1) {
+            const auto& retransmitted = due.retransmissions[0].segment;
+            CHECK(retransmitted.options ==
+                  toBytes({0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x02}));
+            CHECK(retransmitted.sequence_number == initial_reply->sequence_number);
+            CHECK(retransmitted.acknowledgment_number == initial_reply->acknowledgment_number);
+            CHECK(retransmitted.flags.syn && retransmitted.flags.ack);
+            CHECK(retransmitted.window_size == 65535); // still unscaled
+
+            auto serialized = serializeTcpSegment(retransmitted, localIp(), remoteIp());
+            CHECK(std::holds_alternative<std::vector<std::byte>>(serialized));
+            if (auto* bytes = std::get_if<std::vector<std::byte>>(&serialized)) {
+                CHECK(bytes->size() == 28);
+                CHECK((*bytes)[12] >> 4 == std::byte{7}); // Data Offset 7
+                auto reparsed = parseTcpSegment(*bytes, localIp(), remoteIp()); // validates checksum
+                CHECK(std::holds_alternative<TcpSegment>(reparsed));
+                if (auto* segment = std::get_if<TcpSegment>(&reparsed)) {
+                    CHECK(segment->options ==
+                          toBytes({0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x02}));
+                }
+            }
+        }
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->window_scaling_enabled);
+            CHECK(snapshot->peer_window_scale == 5); // unchanged by the retransmission
+            CHECK(snapshot->local_window_scale == 2);
+        }
+
+        table.handle(key, makeAck(8080, 54321, 1001, initial_reply->sequence_number + 1),
+                     t0 + kInitialRto);
+        CHECK(table.stateOf(key) == TcpState::Established);
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) CHECK(!after->has_rtt_sample);
+    }
+
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }

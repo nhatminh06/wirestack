@@ -44,10 +44,10 @@ that SYN's own `parseTcpOptions` result:
 
 - A parse error produces no connection, no SYN-ACK, and no RST -- the
   segment is simply dropped.
-- `peer_mss = maximum_segment_size.value_or(536)` -- 536 is the
-  RFC 1191-style IPv4 default MSS assumed when the peer's SYN omits the
-  option entirely. `effective_send_mss = min(1460, peer_mss)`, the MSS
-  actually used to size Wirestack's own outgoing segments to this peer.
+- `peer_mss = maximum_segment_size.value_or(536)` -- the IPv4 default
+  peer MSS fallback: 536 bytes when the SYN omits MSS entirely.
+  `effective_send_mss = min(1460, peer_mss)`, the MSS actually used to
+  size Wirestack's own outgoing segments to this peer.
 - If `window_scale` is present, `window_scaling_enabled = true`,
   `peer_window_scale = min(window_scale, 14)` (RFC 1323's own clamp),
   `local_window_scale = 2` (Wirestack's fixed local shift). Otherwise all
@@ -233,8 +233,11 @@ queued.
 legitimately updated it (`snd_wl1`/`snd_wl2`, RFC 793's SND.WL1/WL2), so
 a segment that arrives out of order can never replace a newer window
 advertisement with a stale one. Every incoming window field is decoded
-through `decodeWindow`: `window_scaling_enabled ? (raw << peer_window_scale)
-: raw`. This applies to the handshake-completing ACK's initial `snd_wnd`
+through `decodePeerWindow`: `window_scaling_enabled ? (raw <<
+peer_window_scale) : raw` -- the PEER's own negotiated shift, distinct
+from and never to be confused with Wirestack's own `local_window_scale`
+(see "Receive windows and reassembly" below). This applies to the
+handshake-completing ACK's initial `snd_wnd`
 and to every later `updateSendWindow` call -- but never to the SYN or
 SYN-ACK's own window fields, which are defined to stay raw/unscaled
 regardless of negotiation (RFC 1323). `snd_wnd` is updated on every valid
@@ -280,10 +283,18 @@ true, or `min(available, 65535)` otherwise (clamped either way to fit
 regardless of negotiation (window scaling never applies to the
 handshake), and `connection.window_scaling_enabled` everywhere else (pure
 ACK, data, FIN, and their retransmissions). The receive-acceptance
-boundary itself always uses the *logical* window
-(`advertisedLogicalWindowFor`, the wire value re-expanded by the scale)
-so Wirestack never accepts bytes beyond what it actually advertised, even
-though its internal buffer is larger than 65535 bytes. A retransmitted
+boundary itself always uses the *logical* window (`advertisedLogicalWindowFor`,
+the wire value re-expanded through `expandLocalAdvertisedWindow` using
+Wirestack's OWN `local_window_scale`) so Wirestack never accepts bytes
+beyond what it actually advertised, even though its internal buffer is
+larger than 65535 bytes. This is deliberately a separate helper from
+`decodePeerWindow` above: reconstructing a window Wirestack itself
+advertised must use `local_window_scale`, never the peer's
+`peer_window_scale` -- the two shifts are independently negotiated and
+can differ (e.g. a peer offering shift 14 while Wirestack's own shift
+stays fixed at 2), so applying the wrong one would silently
+over-advertise (or, worse, over-accept) by orders of magnitude. A
+retransmitted
 segment refreshes both its acknowledgment number and its window field
 before checksum serialization, the same as the already-existing
 acknowledgment-number refresh.

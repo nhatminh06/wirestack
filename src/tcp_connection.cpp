@@ -83,7 +83,7 @@ std::uint16_t TcpConnectionTable::advertisedWindowFor(const Connection& connecti
 
 std::uint32_t TcpConnectionTable::advertisedLogicalWindowFor(const Connection& connection) {
     std::uint16_t wire = advertisedWindowFor(connection, connection.window_scaling_enabled);
-    return decodeWindow(connection, wire);
+    return expandLocalAdvertisedWindow(connection, wire);
 }
 
 std::uint32_t TcpConnectionTable::availableSendWindow(const Connection& connection) {
@@ -94,11 +94,20 @@ std::uint32_t TcpConnectionTable::availableSendWindow(const Connection& connecti
     return connection.snd_wnd - flight;
 }
 
-std::uint32_t TcpConnectionTable::decodeWindow(const Connection& connection, std::uint16_t raw) {
+std::uint32_t TcpConnectionTable::decodePeerWindow(const Connection& connection,
+                                                     std::uint16_t raw) {
     if (!connection.window_scaling_enabled) {
         return raw;
     }
     return static_cast<std::uint32_t>(raw) << connection.peer_window_scale;
+}
+
+std::uint32_t TcpConnectionTable::expandLocalAdvertisedWindow(const Connection& connection,
+                                                                 std::uint16_t wire) {
+    if (!connection.window_scaling_enabled) {
+        return wire;
+    }
+    return static_cast<std::uint32_t>(wire) << connection.local_window_scale;
 }
 
 void TcpConnectionTable::updateSendWindow(Connection& connection, const TcpSegment& segment) {
@@ -108,7 +117,7 @@ void TcpConnectionTable::updateSendWindow(Connection& connection, const TcpSegme
     if (!accept) {
         return; // stale segment -- keep the newer window advertisement
     }
-    connection.snd_wnd = decodeWindow(connection, segment.window_size);
+    connection.snd_wnd = decodePeerWindow(connection, segment.window_size);
     connection.snd_wl1 = segment.sequence_number;
     connection.snd_wl2 = segment.acknowledgment_number;
 }
@@ -596,7 +605,7 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
             // handshake-completing ACK -- the first advertisement, so no
             // staleness test is needed. This ACK is not itself a SYN or
             // SYN-ACK, so window scaling (if negotiated) already applies.
-            connection.snd_wnd = decodeWindow(connection, segment.window_size);
+            connection.snd_wnd = decodePeerWindow(connection, segment.window_size);
             connection.snd_wl1 = segment.sequence_number;
             connection.snd_wl2 = segment.acknowledgment_number;
         }
@@ -803,6 +812,13 @@ TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_poin
             advertisedWindowFor(connection, !oldest.is_syn && connection.window_scaling_enabled);
         segment.urgent_pointer = 0;
         segment.payload = oldest.payload;
+        if (oldest.is_syn) {
+            // A timeout-retransmitted SYN-ACK must carry the same
+            // negotiated options (MSS, Window Scale) as the original --
+            // otherwise a retransmission silently drops Data Offset bytes
+            // the peer already parsed from the first copy.
+            segment.options = buildSynAckOptions(connection);
+        }
 
         oldest.retransmit_count += 1;
         oldest.last_sent_at = now;
