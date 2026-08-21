@@ -18,8 +18,8 @@ partial-ACK recovery and a bounded segment-granular SACK scoreboard):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
-| HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented and deterministically tested; live curl verification still required |
+| TCP         | passive handshake with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented, deterministically tested, and live-qualified against a real Linux client (see docs/interoperability.md) for the handshake, timeout retransmission, SYN-ACK loss recovery, and receiver-side SACK -- sender-side multi-segment SACK recovery remains deterministic-test-only |
+| HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented, deterministically tested, and live-qualified with a real `curl --http1.0` request (see docs/interoperability.md) |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
 - Ethernet II frame parsing and serialization
@@ -81,11 +81,18 @@ partial-ACK recovery and a bounded segment-granular SACK scoreboard):
 See [docs/tap.md](docs/tap.md), [docs/arp.md](docs/arp.md),
 [docs/ipv4.md](docs/ipv4.md), [docs/icmp.md](docs/icmp.md),
 [docs/udp.md](docs/udp.md), [docs/tcp.md](docs/tcp.md), and
-[docs/http.md](docs/http.md) for setup, permissions, and how to test. Real
-Linux interoperability (ARP resolution, `ping` receiving Echo Replies, UDP
-echo, a completed TCP handshake, and a `curl --http1.0` request) is
-manually verifiable but has not been exercised in every development
-environment this project has run in — see those docs for exact commands.
+[docs/http.md](docs/http.md) for setup, permissions, and manual
+single-command checks. [docs/interoperability.md](docs/interoperability.md)
+documents an automated, isolated-namespace harness
+(`tools/integration/run.sh`) that reproducibly proves ARP resolution,
+ICMP echo, UDP echo, a real TCP handshake, a real `curl --http1.0`
+request, ordinary and reset connection close, HTTP response timeout
+retransmission, SYN-ACK loss recovery, and out-of-order TCP segment
+delivery with receiver-side SACK generation, all against a real Linux
+kernel client with packet-capture evidence. Sender-side multi-segment
+SACK recovery is not exercised by that harness (the current HTTP
+response is under one MSS) and remains covered only by the deterministic
+tests in `tests/test_tcp_sack_path.cpp`.
 
 Not implemented: TCP active-open/DSACK/RFC 6675 pipe-based recovery/PRR/
 Limited Transmit/CUBIC/BBR/ECN/timestamps (persist is implemented, but
@@ -102,6 +109,7 @@ include/wirestack/   public headers
 src/                  implementation, wirestack executable
 tests/                unit tests (CTest, no external test framework)
 tools/                command-line utilities (tap_send)
+tools/integration/    isolated-namespace Linux interoperability harness
 docs/                 protocol notes
 ```
 
