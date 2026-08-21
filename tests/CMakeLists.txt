@@ -85,3 +85,11 @@ add_test(NAME test_http COMMAND test_http)
 add_executable(test_http_path test_http_path.cpp)
 target_link_libraries(test_http_path PRIVATE wirestack_core)
 add_test(NAME test_http_path COMMAND test_http_path)
+
+add_executable(test_tcp_segmentation_path test_tcp_segmentation_path.cpp)
+target_link_libraries(test_tcp_segmentation_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_segmentation_path COMMAND test_tcp_segmentation_path)
+
+add_executable(test_tcp_reassembly_path test_tcp_reassembly_path.cpp)
+target_link_libraries(test_tcp_reassembly_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_reassembly_path COMMAND test_tcp_reassembly_path)
