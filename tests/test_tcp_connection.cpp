@@ -8,9 +8,13 @@ using wirestack::kMaxApplicationSendSize;
 using wirestack::kMaxRetransmits;
 using wirestack::kMaxReassemblyFragments;
 using wirestack::kMaxRto;
+using wirestack::kMaxSegmentsPerSend;
+using wirestack::kMinRto;
 using wirestack::kTcpMss;
 using wirestack::kTcpReceiveCapacity;
 using wirestack::kTimeWaitDuration;
+using wirestack::parseTcpSegment;
+using wirestack::serializeTcpSegment;
 using wirestack::TcpClock;
 using wirestack::TcpConnectionKey;
 using wirestack::TcpConnectionTable;
@@ -192,6 +196,28 @@ std::uint32_t establishWithWindowScale(TcpConnectionTable& table, const TcpConne
     std::vector<std::byte> options = {std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4},
                                        std::byte{1}, std::byte{3}, std::byte{3},
                                        static_cast<std::byte>(peer_scale)};
+    auto syn_ack = table
+                       .handle(key,
+                               makeSynWithOptions(key.local_port, key.remote_port, client_isn,
+                                                   options),
+                               now)
+                       .reply;
+    std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+    table.handle(key, makeAck(key.local_port, key.remote_port, client_isn + 1, server_isn + 1),
+                 now);
+    return server_isn;
+}
+
+// Negotiates the given peer MSS (or none, if `peer_mss` is nullopt) and
+// completes the handshake.
+std::uint32_t establishWithPeerMss(TcpConnectionTable& table, const TcpConnectionKey& key,
+                                    std::uint32_t client_isn, std::optional<std::uint16_t> peer_mss,
+                                    TcpClock::time_point now = t0) {
+    std::vector<std::byte> options;
+    if (peer_mss) {
+        options = {std::byte{2}, std::byte{4}, static_cast<std::byte>((*peer_mss >> 8) & 0xff),
+                    static_cast<std::byte>(*peer_mss & 0xff)};
+    }
     auto syn_ack = table
                        .handle(key,
                                makeSynWithOptions(key.local_port, key.remote_port, client_isn,
@@ -2311,6 +2337,530 @@ int main() {
         t += rto;
         auto exhausted = table.pollRetransmissions(t);
         CHECK(exhausted.timed_out.size() == 1);
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // ================= Milestone 11: SYN-ACK option vectors =================
+
+    // Without peer Window Scale: MSS only, 24-byte header, Data Offset 6.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto reply = table.handle(key, makeSynWithOptions(8080, 54321, 1000, {}), t0).reply;
+        CHECK(reply.has_value());
+        if (reply) {
+            CHECK(reply->options == toBytes({0x02, 0x04, 0x05, 0xb4}));
+            CHECK(reply->window_size == 65535); // unscaled
+
+            auto serialized = serializeTcpSegment(*reply, localIp(), remoteIp());
+            CHECK(std::holds_alternative<std::vector<std::byte>>(serialized));
+            if (auto* bytes = std::get_if<std::vector<std::byte>>(&serialized)) {
+                CHECK(bytes->size() == 24); // 20-byte header + 4-byte options
+                CHECK((*bytes)[12] >> 4 == std::byte{6}); // Data Offset 6
+
+                auto reparsed = parseTcpSegment(*bytes, localIp(), remoteIp()); // validates checksum
+                CHECK(std::holds_alternative<TcpSegment>(reparsed));
+                if (auto* segment = std::get_if<TcpSegment>(&reparsed)) {
+                    CHECK(segment->flags.syn && segment->flags.ack);
+                    CHECK(segment->options == toBytes({0x02, 0x04, 0x05, 0xb4}));
+                }
+            }
+        }
+    }
+
+    // With peer Window Scale: MSS + NOP + Window Scale, 28-byte header,
+    // Data Offset 7. Local scale is always kLocalWindowScaleShift (2),
+    // never derived from what the peer offered.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> syn_options = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                                std::byte{0xb4}, std::byte{1}, std::byte{3},
+                                                std::byte{3},    std::byte{7}};
+        auto reply =
+            table.handle(key, makeSynWithOptions(8080, 54321, 1000, syn_options), t0).reply;
+        CHECK(reply.has_value());
+        if (reply) {
+            CHECK(reply->options ==
+                  toBytes({0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x02}));
+            CHECK(reply->window_size == 65535); // still unscaled
+
+            auto serialized = serializeTcpSegment(*reply, localIp(), remoteIp());
+            CHECK(std::holds_alternative<std::vector<std::byte>>(serialized));
+            if (auto* bytes = std::get_if<std::vector<std::byte>>(&serialized)) {
+                CHECK(bytes->size() == 28);
+                CHECK((*bytes)[12] >> 4 == std::byte{7}); // Data Offset 7
+                CHECK(std::holds_alternative<TcpSegment>(
+                    parseTcpSegment(*bytes, localIp(), remoteIp())));
+            }
+        }
+    }
+
+    // ================= Milestone 11: effective MSS =================
+
+    {
+        auto check = [&](std::optional<std::uint16_t> peer_mss, std::uint16_t expected) {
+            TcpConnectionTable table(8080);
+            TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+            establishWithPeerMss(table, key, 1000, peer_mss, t0);
+            auto snapshot = table.snapshotOf(key);
+            CHECK(snapshot.has_value());
+            if (snapshot) {
+                CHECK(snapshot->peer_mss == peer_mss.value_or(536));
+                CHECK(snapshot->effective_send_mss == expected);
+            }
+        };
+        check(1460, 1460);
+        check(1200, 1200);
+        check(536, 536);
+        check(2000, 1460);       // capped at local path MSS
+        check(std::nullopt, 536); // absent -> IPv4 default fallback
+    }
+
+    // peer MSS 536, payload 1200 -> segments of 536, 536, 128
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithPeerMss(table, key, 1000, std::uint16_t{536}, t0);
+        auto payload = makeFilledPayload(1200);
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(sent.segments.size() == 3);
+        if (sent.segments.size() == 3) {
+            CHECK(sent.segments[0].payload.size() == 536);
+            CHECK(sent.segments[1].payload.size() == 536);
+            CHECK(sent.segments[2].payload.size() == 128);
+            CHECK(!sent.segments[0].flags.psh);
+            CHECK(!sent.segments[1].flags.psh);
+            CHECK(sent.segments[2].flags.psh);
+            CHECK(sent.segments[1].sequence_number == sent.segments[0].sequence_number + 536);
+            CHECK(sent.segments[2].sequence_number == sent.segments[1].sequence_number + 536);
+            std::vector<std::byte> reconstructed;
+            for (const auto& seg : sent.segments) {
+                reconstructed.insert(reconstructed.end(), seg.payload.begin(), seg.payload.end());
+            }
+            CHECK(reconstructed == payload);
+        }
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->pending_count == 3);
+    }
+
+    // segment-count bound: a tiny negotiated peer MSS cannot fragment a
+    // send into an unbounded number of segments
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithPeerMss(table, key, 1000, std::uint16_t{1}, t0); // effective_send_mss = 1
+        auto before = table.snapshotOf(key);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(kMaxSegmentsPerSend + 1), t0);
+        CHECK(sent.segments.empty());
+        CHECK(sent.error == TcpSendError::TooLarge);
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) CHECK(after->snd_nxt == before->snd_nxt);
+    }
+
+    // ================= Milestone 11: Window Scale negotiation =================
+
+    // not offered
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000); // makeSyn() carries MSS only, no Window Scale
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(!snapshot->window_scaling_enabled);
+            CHECK(snapshot->peer_window_scale == 0);
+            CHECK(snapshot->local_window_scale == 0);
+        }
+    }
+
+    // peer scale 0, 2, 14, and 15 (clamped to 14)
+    {
+        auto check = [&](std::uint8_t offered, std::uint8_t expected_stored) {
+            TcpConnectionTable table(8080);
+            TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+            establishWithWindowScale(table, key, 1000, offered, t0);
+            auto snapshot = table.snapshotOf(key);
+            CHECK(snapshot.has_value());
+            if (snapshot) {
+                CHECK(snapshot->window_scaling_enabled);
+                CHECK(snapshot->peer_window_scale == expected_stored);
+                CHECK(snapshot->local_window_scale == 2);
+            }
+        };
+        check(0, 0);
+        check(2, 2);
+        check(14, 14);
+        check(15, 14);
+    }
+
+    // final ACK's window field is scaled once negotiated (data-segment
+    // window decoding uses the same path)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> options = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                            std::byte{0xb4}, std::byte{1}, std::byte{3},
+                                            std::byte{3},    std::byte{2}};
+        auto syn_ack = table.handle(key, makeSynWithOptions(8080, 54321, 1000, options), t0).reply;
+        CHECK(syn_ack.has_value());
+        std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+        TcpSegment final_ack = makeAck(8080, 54321, 1001, server_isn + 1);
+        final_ack.window_size = 100; // raw wire value
+        table.handle(key, final_ack, t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->snd_wnd == (100u << 2)); // decoded: 400
+    }
+
+    // outgoing receive-window encoding: floor division, never
+    // over-advertises
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establishWithWindowScale(table, key, 1000, 2, t0);
+        // 1 byte out-of-order: available = capacity - 1 = 262139;
+        // floor(262139 / 4) = 65534 (262139 = 4*65534 + 3) -- rounds
+        // down, never up.
+        table.handle(key, makeData(8080, 54321, 1003, server_isn + 1, toBytes({0xaa})), t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->advertised_window == 65534);
+    }
+
+    // receive acceptance matches the encoded logical window, not the
+    // (larger) internal capacity
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establishWithWindowScale(table, key, 1000, 2, t0);
+        std::uint32_t edge_seq = 1001 + static_cast<std::uint32_t>(kTcpReceiveCapacity);
+        auto result =
+            table.handle(key, makeData(8080, 54321, edge_seq, server_isn + 1, toBytes("x")), t0);
+        CHECK(result.accepted_payload.empty());
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->reassembly_fragment_count == 0); // rejected, nothing stored
+    }
+
+    // zero window (scaled) rejects new data; window reopens; a stale
+    // scaled-window update is rejected
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::uint32_t server_isn = establishWithWindowScale(table, key, 1000, 2, t0);
+
+        TcpSegment zero = makeAck(8080, 54321, 1001, server_isn + 1);
+        zero.window_size = 0;
+        table.handle(key, zero, t0);
+        CHECK(table.makeOutgoingData(key, toBytes("x"), t0).segments.empty());
+
+        TcpSegment newer = makeAck(8080, 54321, 1001, server_isn + 1);
+        newer.window_size = 500; // logical 2000
+        table.handle(key, newer, t0);
+        CHECK(!table.makeOutgoingData(key, toBytes("x"), t0).segments.empty());
+
+        TcpSegment stale = makeAck(8080, 54321, 1000, server_isn + 1); // earlier sequence number
+        stale.window_size = 10;
+        table.handle(key, stale, t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->snd_wnd == (500u << 2)); // stale update ignored
+    }
+
+    // ================= Milestone 11: RTT and adaptive RTO =================
+
+    // initial state: no sample yet, RTO = 1 second
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        table.handle(key, makeSyn(8080, 54321, 1000), t0); // SynReceived, no ACK yet
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(!snapshot->has_rtt_sample);
+            CHECK(snapshot->current_rto == kInitialRto);
+        }
+    }
+
+    // first sample: R=200ms -> SRTT=200ms, RTTVAR=100ms, RTO clamped to 1s
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto syn_ack = table.handle(key, makeSyn(8080, 54321, 1000), t0).reply;
+        CHECK(syn_ack.has_value());
+        std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+        auto ack_time = t0 + std::chrono::milliseconds(200);
+        table.handle(key, makeAck(8080, 54321, 1001, server_isn + 1), ack_time);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->has_rtt_sample);
+            CHECK(snapshot->srtt == std::chrono::milliseconds(200));
+            CHECK(snapshot->rttvar == std::chrono::milliseconds(100));
+            CHECK(snapshot->current_rto == kInitialRto); // 600ms raw, clamped to the 1s minimum
+        }
+    }
+
+    // second sample: existing SRTT=200/RTTVAR=100, new R=1000ms ->
+    // RTTVAR=275ms, SRTT=300ms, RTO=1400ms (exact known vector)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto syn_ack = table.handle(key, makeSyn(8080, 54321, 1000), t0).reply;
+        std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+        auto ack_time = t0 + std::chrono::milliseconds(200);
+        table.handle(key, makeAck(8080, 54321, 1001, server_isn + 1), ack_time); // first sample
+
+        auto sent = table.makeOutgoingData(key, toBytes("x"), ack_time);
+        CHECK(!sent.segments.empty());
+        auto second_ack_time = ack_time + std::chrono::milliseconds(1000);
+        std::uint32_t ack_num = sent.segments.front().sequence_number +
+                                 static_cast<std::uint32_t>(sent.segments.front().payload.size());
+        table.handle(key, makeAck(8080, 54321, 1001, ack_num), second_ack_time);
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->rttvar == std::chrono::milliseconds(275));
+            CHECK(snapshot->srtt == std::chrono::milliseconds(300));
+            CHECK(snapshot->current_rto == std::chrono::milliseconds(1400));
+        }
+    }
+
+    // minimum clamp: a tiny consistent RTT never drives RTO below 1s
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto syn_ack = table.handle(key, makeSyn(8080, 54321, 1000), t0).reply;
+        std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+        table.handle(key, makeAck(8080, 54321, 1001, server_isn + 1),
+                     t0 + std::chrono::milliseconds(10));
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->current_rto == kMinRto);
+    }
+
+    // maximum clamp: a huge RTT sample never drives RTO above 60s
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto syn_ack = table.handle(key, makeSyn(8080, 54321, 1000), t0).reply;
+        std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+        table.handle(key, makeAck(8080, 54321, 1001, server_isn + 1), t0 + std::chrono::seconds(100));
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->current_rto == kMaxRto);
+    }
+
+    // Karn's rule: an ACK of a retransmitted segment produces no sample
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto sent = table.makeOutgoingData(key, toBytes("data"), t0);
+        CHECK(!sent.segments.empty());
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        auto before = table.snapshotOf(key);
+        std::uint32_t ack_num = sent.segments.front().sequence_number +
+                                 static_cast<std::uint32_t>(sent.segments.front().payload.size());
+        table.handle(key, makeAck(8080, 54321, 1001, ack_num),
+                     t0 + kInitialRto + std::chrono::milliseconds(500));
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->srtt == before->srtt);
+            CHECK(after->rttvar == before->rttvar);
+            CHECK(after->current_rto == before->current_rto);
+        }
+    }
+
+    // duplicate ACK produces no sample
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto sent = table.makeOutgoingData(key, toBytes("data"), t0);
+        std::uint32_t ack_num = sent.segments.front().sequence_number +
+                                 static_cast<std::uint32_t>(sent.segments.front().payload.size());
+        table.handle(key, makeAck(8080, 54321, 1001, ack_num), t0 + std::chrono::milliseconds(50));
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        if (before) {
+            table.handle(key, makeAck(8080, 54321, 1001, before->snd_una),
+                         t0 + std::chrono::milliseconds(999)); // duplicate
+        }
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) CHECK(after->srtt == before->srtt);
+    }
+
+    // invalid ACK (beyond snd_nxt) produces no sample and no state change
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        if (before) {
+            table.handle(key, makeAck(8080, 54321, 1001, before->snd_nxt + 1000),
+                         t0 + std::chrono::seconds(5));
+        }
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->srtt == before->srtt);
+            CHECK(after->snd_una == before->snd_una);
+        }
+    }
+
+    // one cumulative ACK covering multiple segments produces at most one
+    // sample -- verified against the exact single-sample formula applied
+    // to the pre-existing (degenerate, R=0) handshake estimate
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000); // handshake sample: R=0 (SYN-ACK and final ACK both at t0)
+        auto a = table.makeOutgoingData(key, toBytes("AAA"), t0);
+        auto b = table.makeOutgoingData(key, toBytes("BBB"), t0 + std::chrono::milliseconds(100));
+        auto c = table.makeOutgoingData(key, toBytes("CCC"), t0 + std::chrono::milliseconds(200));
+        CHECK(!a.segments.empty() && !b.segments.empty() && !c.segments.empty());
+
+        std::uint32_t cumulative_ack = c.segments.front().sequence_number +
+                                        static_cast<std::uint32_t>(c.segments.front().payload.size());
+        auto ack_time = t0 + std::chrono::milliseconds(700); // R for C = 500ms
+        table.handle(key, makeAck(8080, 54321, 1001, cumulative_ack), ack_time);
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            // Single subsequent-sample update from (srtt=0, rttvar=0), R=500ms.
+            CHECK(snapshot->rttvar == std::chrono::milliseconds(125));
+            CHECK(snapshot->srtt == std::chrono::microseconds(62500));
+        }
+    }
+
+    // recovery after backoff: a later clean sample lowers the RTO again
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000);
+        auto sent = table.makeOutgoingData(key, toBytes("data"), t0);
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        auto after_backoff = table.snapshotOf(key);
+        CHECK(after_backoff.has_value());
+        if (after_backoff) CHECK(after_backoff->current_rto == kInitialRto * 2);
+
+        std::uint32_t ack_num = sent.segments.front().sequence_number +
+                                 static_cast<std::uint32_t>(sent.segments.front().payload.size());
+        table.handle(key, makeAck(8080, 54321, 1001, ack_num),
+                     t0 + kInitialRto + std::chrono::milliseconds(10)); // Karn's rule, no sample
+
+        auto clean_time = t0 + kInitialRto + std::chrono::milliseconds(500);
+        auto sent2 = table.makeOutgoingData(key, toBytes("more"), clean_time);
+        CHECK(!sent2.segments.empty());
+        auto clean_ack_time = clean_time + std::chrono::milliseconds(100);
+        std::uint32_t ack_num2 = sent2.segments.front().sequence_number +
+                                  static_cast<std::uint32_t>(sent2.segments.front().payload.size());
+        table.handle(key, makeAck(8080, 54321, 1001, ack_num2), clean_ack_time);
+
+        auto after_recovery = table.snapshotOf(key);
+        CHECK(after_recovery.has_value());
+        if (after_recovery && after_backoff) {
+            CHECK(after_recovery->current_rto < after_backoff->current_rto);
+        }
+    }
+
+    // ================= Milestone 11: multi-connection and duplicate-SYN isolation =================
+
+    // MSS, Window Scale, and RTT/RTO state remain independent per connection
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key_a{localIp(), 8080, remoteIp(), 11111};
+        TcpConnectionKey key_b{localIp(), 8080, remoteIp(), 22222};
+        establishWithPeerMss(table, key_a, 1000, std::uint16_t{536}, t0);
+        establishWithWindowScale(table, key_b, 2000, 4, t0);
+
+        auto snap_a = table.snapshotOf(key_a);
+        auto snap_b = table.snapshotOf(key_b);
+        CHECK(snap_a.has_value() && snap_b.has_value());
+        if (snap_a && snap_b) {
+            CHECK(snap_a->effective_send_mss == 536);
+            CHECK(!snap_a->window_scaling_enabled);
+            CHECK(snap_b->effective_send_mss == 1460);
+            CHECK(snap_b->window_scaling_enabled);
+            CHECK(snap_b->peer_window_scale == 4);
+        }
+
+        auto sent_a = table.makeOutgoingData(key_a, toBytes("x"), t0);
+        CHECK(!sent_a.segments.empty());
+        table.handle(key_a,
+                     makeAck(8080, 11111, 1001, sent_a.segments.front().sequence_number + 1),
+                     t0 + std::chrono::milliseconds(300));
+
+        auto after_a = table.snapshotOf(key_a);
+        auto after_b = table.snapshotOf(key_b);
+        CHECK(after_a.has_value() && after_b.has_value());
+        if (after_a && after_b) {
+            CHECK(after_a->srtt > TcpClock::duration{});
+            CHECK(after_b->srtt == TcpClock::duration{}); // untouched by A's activity
+        }
+    }
+
+    // duplicate SYN with different options: original negotiation remains
+    // authoritative, identical SYN-ACK bytes are replayed
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> original_options = {std::byte{2}, std::byte{4}, std::byte{0x02},
+                                                      std::byte{0x18}}; // MSS 536
+        auto first_reply =
+            table.handle(key, makeSynWithOptions(8080, 54321, 1000, original_options), t0).reply;
+        CHECK(first_reply.has_value());
+
+        std::vector<std::byte> different_options = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                                       std::byte{0xb4}, std::byte{1}, std::byte{3},
+                                                       std::byte{3},    std::byte{5}};
+        auto second_reply = table
+                                 .handle(key,
+                                         makeSynWithOptions(8080, 54321, 1000, different_options),
+                                         t0 + std::chrono::milliseconds(100))
+                                 .reply;
+        CHECK(second_reply.has_value());
+        if (first_reply && second_reply) {
+            CHECK(first_reply->options == second_reply->options);
+            CHECK(first_reply->sequence_number == second_reply->sequence_number);
+        }
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->peer_mss == 536);
+            CHECK(!snapshot->window_scaling_enabled);
+        }
+    }
+
+    // malformed SYN options: no SYN-ACK, no connection state, no RST
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto result = table.handle(key, makeSynWithOptions(8080, 54321, 1000, toBytes({2})), t0);
+        CHECK(!result.reply.has_value());
+        CHECK(!table.stateOf(key).has_value());
+    }
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto result = table.handle(
+            key,
+            makeSynWithOptions(8080, 54321, 1000,
+                                toBytes({2, 4, 0x05, 0xb4, 2, 4, 0x02, 0x18})), // duplicate MSS
+            t0);
+        CHECK(!result.reply.has_value());
         CHECK(!table.stateOf(key).has_value());
     }
 

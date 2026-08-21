@@ -8,9 +8,12 @@
 #include "test_util.hpp"
 
 using wirestack::Ipv4Address;
+using wirestack::parseTcpOptions;
 using wirestack::parseTcpSegment;
 using wirestack::serializeTcpSegment;
+using wirestack::TcpOptionParseError;
 using wirestack::TcpParseError;
+using wirestack::TcpParsedOptions;
 using wirestack::TcpSegment;
 using wirestack::TcpSerializeError;
 
@@ -390,6 +393,213 @@ int main() {
         if (auto* bytes = std::get_if<std::vector<std::byte>>(&result)) {
             CHECK(bytes->size() == 60);
         }
+    }
+
+    // ================= parseTcpOptions =================
+
+    // empty options
+    {
+        auto result = parseTcpOptions({});
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(!parsed->maximum_segment_size.has_value());
+            CHECK(!parsed->window_scale.has_value());
+        }
+    }
+
+    // EOL only
+    {
+        auto result = parseTcpOptions(toBytes({0}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+    }
+
+    // NOP only / repeated NOP
+    {
+        CHECK(std::holds_alternative<TcpParsedOptions>(parseTcpOptions(toBytes({1}))));
+        CHECK(std::holds_alternative<TcpParsedOptions>(parseTcpOptions(toBytes({1, 1, 1, 1}))));
+    }
+
+    // MSS 1460
+    {
+        auto result = parseTcpOptions(toBytes({2, 4, 0x05, 0xb4}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->maximum_segment_size == 1460);
+        }
+    }
+
+    // MSS 536
+    {
+        auto result = parseTcpOptions(toBytes({2, 4, 0x02, 0x18}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->maximum_segment_size == 536);
+        }
+    }
+
+    // MSS zero: invalid
+    {
+        auto result = parseTcpOptions(toBytes({2, 4, 0x00, 0x00}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::InvalidMss);
+        }
+    }
+
+    // Window Scale 0, 2, 14 -- raw parse only, no clamping here (clamping
+    // to 14 happens at negotiation time in tcp_connection.cpp, tested
+    // there; the raw parser reports exactly what was on the wire).
+    {
+        auto ws0 = parseTcpOptions(toBytes({3, 3, 0}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(ws0));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&ws0)) CHECK(parsed->window_scale == 0);
+
+        auto ws2 = parseTcpOptions(toBytes({3, 3, 2}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(ws2));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&ws2)) CHECK(parsed->window_scale == 2);
+
+        auto ws14 = parseTcpOptions(toBytes({3, 3, 14}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(ws14));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&ws14)) CHECK(parsed->window_scale == 14);
+
+        // Window Scale 15: parses successfully as the raw byte 15 --
+        // clamping to 14 is a negotiation-time policy, not a parse error.
+        auto ws15 = parseTcpOptions(toBytes({3, 3, 15}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(ws15));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&ws15)) CHECK(parsed->window_scale == 15);
+    }
+
+    // MSS + NOP + Window Scale together
+    {
+        auto result = parseTcpOptions(toBytes({2, 4, 0x05, 0xb4, 1, 3, 3, 2}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->maximum_segment_size == 1460);
+            CHECK(parsed->window_scale == 2);
+        }
+    }
+
+    // unknown well-formed option: skipped safely, no error, no fields set
+    {
+        auto result = parseTcpOptions(toBytes({8, 4, 0xaa, 0xbb}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(!parsed->maximum_segment_size.has_value());
+            CHECK(!parsed->window_scale.has_value());
+        }
+    }
+
+    // unknown option before a known option
+    {
+        auto result = parseTcpOptions(toBytes({8, 4, 0xaa, 0xbb, 2, 4, 0x05, 0xb4}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(parsed->maximum_segment_size == 1460);
+        }
+    }
+
+    // EOL followed by padding: parsing stops at EOL, padding ignored safely
+    {
+        auto result = parseTcpOptions(toBytes({0, 1, 1, 1}));
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
+        if (auto* parsed = std::get_if<TcpParsedOptions>(&result)) {
+            CHECK(!parsed->maximum_segment_size.has_value());
+        }
+    }
+
+    // missing length byte
+    {
+        auto result = parseTcpOptions(toBytes({2}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::MissingLength);
+        }
+    }
+
+    // length zero / length one
+    {
+        auto zero = parseTcpOptions(toBytes({2, 0}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(zero));
+        if (auto* err = std::get_if<TcpOptionParseError>(&zero)) {
+            CHECK(*err == TcpOptionParseError::InvalidLength);
+        }
+
+        auto one = parseTcpOptions(toBytes({2, 1}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(one));
+        if (auto* err = std::get_if<TcpOptionParseError>(&one)) {
+            CHECK(*err == TcpOptionParseError::InvalidLength);
+        }
+    }
+
+    // length beyond remaining bytes
+    {
+        auto result = parseTcpOptions(toBytes({2, 10, 0, 0}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::TruncatedOption);
+        }
+    }
+
+    // truncated MSS (declared length extends past the buffer)
+    {
+        auto result = parseTcpOptions(toBytes({2, 4, 0x05}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::TruncatedOption);
+        }
+    }
+
+    // wrong MSS length (present and in-bounds, but not exactly 4)
+    {
+        auto result = parseTcpOptions(toBytes({2, 3, 0x05, 0xb4}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::TruncatedOption);
+        }
+    }
+
+    // truncated Window Scale
+    {
+        auto result = parseTcpOptions(toBytes({3, 3}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::TruncatedOption);
+        }
+    }
+
+    // wrong Window Scale length
+    {
+        auto result = parseTcpOptions(toBytes({3, 4, 2, 0}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::TruncatedOption);
+        }
+    }
+
+    // duplicate MSS
+    {
+        auto result = parseTcpOptions(toBytes({2, 4, 0x05, 0xb4, 2, 4, 0x02, 0x18}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::DuplicateMss);
+        }
+    }
+
+    // duplicate Window Scale
+    {
+        auto result = parseTcpOptions(toBytes({3, 3, 2, 3, 3, 4}));
+        CHECK(std::holds_alternative<TcpOptionParseError>(result));
+        if (auto* err = std::get_if<TcpOptionParseError>(&result)) {
+            CHECK(*err == TcpOptionParseError::DuplicateWindowScale);
+        }
+    }
+
+    // 40-byte option boundary: the maximum possible options region,
+    // filled with NOPs, parses without reading out of bounds
+    {
+        std::vector<std::byte> options(40, std::byte{1}); // all NOP
+        auto result = parseTcpOptions(options);
+        CHECK(std::holds_alternative<TcpParsedOptions>(result));
     }
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;
