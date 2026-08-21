@@ -297,7 +297,28 @@ std::vector<TcpSegment> TcpConnectionTable::scheduleQueuedData(const TcpConnecti
         maybeSequenceFin(key, connection, now, segments);
     }
 
+    updatePersistState(connection, now);
+
     return segments;
+}
+
+bool TcpConnectionTable::persistEligible(const Connection& connection) {
+    return (connection.state == TcpState::Established ||
+            connection.state == TcpState::CloseWait) &&
+           !connection.unsent.empty() && connection.snd_wnd == 0 &&
+           connection.snd_nxt == connection.snd_una &&
+           !connection.local_fin_seq.has_value();
+}
+
+void TcpConnectionTable::updatePersistState(Connection& connection, TcpClock::time_point now) {
+    if (!persistEligible(connection)) {
+        connection.persist_deadline.reset();
+        return;
+    }
+    if (!connection.persist_deadline) {
+        connection.persist_interval = kInitialPersistInterval;
+        connection.persist_deadline = now + connection.persist_interval;
+    }
 }
 
 std::uint32_t TcpConnectionTable::decodePeerWindow(const Connection& connection,
@@ -641,6 +662,8 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     if (!connection.pending_removal &&
         (connection.state == TcpState::Established || connection.state == TcpState::CloseWait)) {
         scheduled = scheduleQueuedData(key, connection, now);
+    } else {
+        updatePersistState(connection, now);
     }
 
     if (segment.payload.empty() && !segment.flags.fin) {
@@ -954,6 +977,8 @@ std::optional<TcpConnectionSnapshot> TcpConnectionTable::snapshotOf(
         connection.unsent.size(),
         appOwnedBytes(connection),
         connection.close_requested,
+        connection.persist_deadline.has_value(),
+        connection.persist_deadline,
     };
 }
 
@@ -1027,7 +1052,49 @@ TcpCloseResult TcpConnectionTable::beginClose(const TcpConnectionKey& key,
     if (!segments.empty()) {
         result.fin = std::move(segments.front());
     }
+    updatePersistState(connection, now);
     return result;
+}
+
+TcpPersistPollResult TcpConnectionTable::pollPersistProbes(TcpClock::time_point now) {
+    TcpPersistPollResult result;
+    for (auto& [key, connection] : connections_) {
+        if (!connection.persist_deadline || now < *connection.persist_deadline) {
+            continue;
+        }
+        if (!persistEligible(connection)) {
+            connection.persist_deadline.reset();
+            continue;
+        }
+
+        TcpSegment segment;
+        segment.source_port = key.local_port;
+        segment.destination_port = key.remote_port;
+        segment.sequence_number = connection.snd_nxt - 1;
+        segment.acknowledgment_number = connection.rcv_nxt;
+        segment.flags.ack = true;
+        segment.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
+        segment.urgent_pointer = 0;
+        segment.payload.assign(connection.unsent.begin(), connection.unsent.begin() + 1);
+
+        result.probes.push_back(TcpPersistProbe{key, std::move(segment)});
+
+        connection.persist_interval =
+            std::min<TcpClock::duration>(connection.persist_interval * 2, kMaxPersistInterval);
+        connection.persist_deadline = now + connection.persist_interval;
+    }
+    return result;
+}
+
+std::optional<TcpClock::time_point> TcpConnectionTable::nextPersistDeadline() const {
+    std::optional<TcpClock::time_point> earliest;
+    for (const auto& [key, connection] : connections_) {
+        if (connection.persist_deadline &&
+            (!earliest || *connection.persist_deadline < *earliest)) {
+            earliest = connection.persist_deadline;
+        }
+    }
+    return earliest;
 }
 
 TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_point now) {

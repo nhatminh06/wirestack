@@ -81,6 +81,12 @@ struct TcpConnectionSnapshot {
     std::size_t unsent_bytes;
     std::size_t owned_bytes;
     bool close_requested;
+
+    // Zero-window persist (see docs/tcp.md). Narrow scope: armed only
+    // when unsent data exists, the peer window is zero, and no sequence
+    // space is outstanding.
+    bool persist_armed;
+    std::optional<TcpClock::time_point> persist_deadline;
 };
 
 struct TcpReceiveResult {
@@ -172,6 +178,13 @@ inline constexpr std::uint32_t kInitialCongestionWindowFloor = 14600;
 // in pending transmissions (unacknowledged application data) -- never
 // SYN/FIN sequence space or pure ACKs.
 inline constexpr std::size_t kTcpSendBufferCapacity = 256 * 1024;
+
+// Deterministic zero-window persist timer, independent of the ordinary
+// retransmission timer/backoff -- see docs/tcp.md for the narrow
+// eligibility scope (armed only when unsent data exists, the peer window
+// is zero, and no sequence space is outstanding).
+inline constexpr std::chrono::milliseconds kInitialPersistInterval{1000};
+inline constexpr std::chrono::milliseconds kMaxPersistInterval{60000};
 
 // Wirestack never emits IPv4 options, and only ever emits TCP options on
 // a SYN-ACK (MSS, and Window Scale when negotiated -- see
@@ -268,6 +281,16 @@ struct TcpTimeoutPollResult {
     std::vector<TcpConnectionKey> time_wait_expired;
 };
 
+// One zero-window persist probe due for transmission (see docs/tcp.md).
+struct TcpPersistProbe {
+    TcpConnectionKey key;
+    TcpSegment segment;
+};
+
+struct TcpPersistPollResult {
+    std::vector<TcpPersistProbe> probes;
+};
+
 // Builds a reset for a segment addressed to an unbound port, or a bound
 // port with no matching connection where the segment is not a valid new
 // SYN. Stateless -- needs nothing beyond the inbound segment itself.
@@ -343,6 +366,16 @@ public:
     // Earliest pending-retransmission deadline across all connections,
     // or nullopt if nothing is pending. Intended to size a poll() timeout.
     std::optional<TcpClock::time_point> nextRetransmissionDeadline() const;
+
+    // Returns zero-window persist probes whose deadline has passed as of
+    // `now`, advancing each connection's persist backoff. See
+    // docs/tcp.md for the exact eligibility scope and probe semantics.
+    TcpPersistPollResult pollPersistProbes(TcpClock::time_point now);
+
+    // Earliest armed persist deadline across all connections, or nullopt
+    // if none is armed. Intended to size a poll() timeout alongside
+    // nextRetransmissionDeadline().
+    std::optional<TcpClock::time_point> nextPersistDeadline() const;
 
 private:
     struct PendingTransmission {
@@ -467,6 +500,10 @@ private:
         // `unsent` is empty and the peer window allows it (see
         // maybeSequenceFin), tracked separately by local_fin_seq above.
         bool close_requested = false;
+
+        // Zero-window persist (see docs/tcp.md). nullopt when not armed.
+        std::optional<TcpClock::time_point> persist_deadline;
+        TcpClock::duration persist_interval = kInitialPersistInterval;
     };
 
     // Not a secure or RFC 6528-style initial sequence number generator --
@@ -574,6 +611,18 @@ private:
     // CloseWait moves to LastAck.
     static void maybeSequenceFin(const TcpConnectionKey& key, Connection& connection,
                                   TcpClock::time_point now, std::vector<TcpSegment>& segments);
+
+    // True only when ALL of: state is Established/CloseWait; `unsent` is
+    // non-empty; snd_wnd == 0; no sequence space is outstanding
+    // (snd_nxt == snd_una); no FIN already sequenced. Deliberately
+    // excludes zero-window-with-outstanding-data, which stays on
+    // ordinary retransmission timing.
+    static bool persistEligible(const Connection& connection);
+
+    // Arms persist at now + kInitialPersistInterval if newly eligible and
+    // not already armed; cancels (resets persist_deadline) if no longer
+    // eligible; otherwise leaves the existing deadline/backoff untouched.
+    static void updatePersistState(Connection& connection, TcpClock::time_point now);
 
     // Moves `connection` into TimeWait, arming its expiration deadline
     // and dropping any (already-acknowledged) pending entries.

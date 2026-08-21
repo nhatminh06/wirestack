@@ -4,10 +4,12 @@
 
 using wirestack::Ipv4Address;
 using wirestack::kInitialRto;
+using wirestack::kInitialPersistInterval;
 using wirestack::kInitialSsthresh;
 using wirestack::kMaxApplicationSendSize;
 using wirestack::kMaxCongestionWindow;
 using wirestack::kMaxRetransmits;
+using wirestack::kMaxPersistInterval;
 using wirestack::kMaxReassemblyFragments;
 using wirestack::kMaxRto;
 using wirestack::kMaxSegmentsPerSend;
@@ -4666,6 +4668,183 @@ int main() {
 
         auto rejected = table.makeOutgoingData(key, toBytes("x"), t0);
         CHECK(rejected.error.has_value());
+    }
+
+    // ================= Milestone 13: zero-window persist =================
+
+    // arming: zero peer window, unsent data queued, no outstanding
+    // sequence space -> deadline = now + 1s
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0, t0);
+        auto sent = table.makeOutgoingData(key, toBytes("persisted"), t0);
+        CHECK(sent.segments.empty());
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->persist_armed);
+            CHECK(snapshot->persist_deadline.has_value());
+            if (snapshot->persist_deadline) CHECK(*snapshot->persist_deadline == t0 + kInitialPersistInterval);
+        }
+    }
+
+    // ineligible: no queued data, nonzero window, outstanding sequence
+    // space, only a deferred FIN
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0, t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(!snapshot->persist_armed); // no queued data yet
+    }
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0); // nonzero window
+        table.makeOutgoingData(key, toBytes("x"), t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(!snapshot->persist_armed);
+    }
+    {
+        // outstanding sequence space with a zero window: ordinary
+        // retransmission applies, not persist.
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 1000, 10, t0);
+        table.makeOutgoingData(key, makeFilledPayload(10), t0); // fills the window, outstanding
+        // Window update that does not acknowledge the outstanding 10
+        // bytes (ack == snd_una), just lowers the window to zero.
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, server_isn + 1, 0), t0);
+        table.makeOutgoingData(key, toBytes("more"), t0); // queued behind it
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(!snapshot->persist_armed); // snd_nxt != snd_una
+    }
+    {
+        // only a deferred FIN, no unsent data: persist must not arm.
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0, t0);
+        table.beginClose(key, t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(!snapshot->persist_armed);
+    }
+
+    // probe fields: seq = snd_nxt - 1, ack = rcv_nxt, one-byte payload,
+    // no options, current advertised window; no state consumption
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 1000, 0, t0);
+        auto data = toBytes("ZW");
+        table.makeOutgoingData(key, data, t0);
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+
+        auto due = table.pollPersistProbes(t0 + kInitialPersistInterval);
+        CHECK(due.probes.size() == 1);
+        if (due.probes.size() == 1) {
+            const auto& probe = due.probes[0].segment;
+            CHECK(probe.sequence_number == server_isn + 1 - 1); // snd_nxt - 1
+            CHECK(probe.acknowledgment_number == 1001);
+            CHECK(probe.flags.ack);
+            CHECK(!probe.flags.psh);
+            CHECK(probe.payload.size() == 1);
+            CHECK(probe.payload.front() == data.front());
+            CHECK(probe.options.empty());
+        }
+
+        auto after = table.snapshotOf(key);
+        CHECK(before.has_value() && after.has_value());
+        if (before && after) {
+            CHECK(after->snd_nxt == before->snd_nxt);
+            CHECK(after->snd_una == before->snd_una);
+            CHECK(after->unsent_bytes == before->unsent_bytes);
+            CHECK(after->owned_bytes == before->owned_bytes);
+            CHECK(after->pending_count == before->pending_count);
+            CHECK(after->cwnd == before->cwnd);
+            CHECK(after->ssthresh == before->ssthresh);
+            CHECK(after->current_rto == before->current_rto);
+            CHECK(after->has_rtt_sample == before->has_rtt_sample);
+        }
+    }
+
+    // backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s (repeated probes reuse
+    // the same sequence number and byte; no duplicate pending entries)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0, t0);
+        table.makeOutgoingData(key, toBytes("p"), t0);
+
+        std::vector<std::chrono::milliseconds> expected = {
+            std::chrono::milliseconds(1000),  std::chrono::milliseconds(2000),
+            std::chrono::milliseconds(4000),  std::chrono::milliseconds(8000),
+            std::chrono::milliseconds(16000), std::chrono::milliseconds(32000),
+            std::chrono::milliseconds(60000), std::chrono::milliseconds(60000),
+        };
+        auto t = t0;
+        std::optional<std::uint32_t> first_seq;
+        for (auto interval : expected) {
+            t += interval;
+            auto due = table.pollPersistProbes(t);
+            CHECK(due.probes.size() == 1);
+            if (due.probes.size() == 1) {
+                if (!first_seq) first_seq = due.probes[0].segment.sequence_number;
+                CHECK(due.probes[0].segment.sequence_number == *first_seq); // same probe each time
+            }
+            auto snapshot = table.snapshotOf(key);
+            CHECK(snapshot.has_value());
+            if (snapshot) CHECK(snapshot->pending_count == 0); // never a pending entry
+        }
+    }
+
+    // cancellation: window reopens, queue empties, RST, timeout
+    // exhaustion, close completion
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0, t0);
+        table.makeOutgoingData(key, toBytes("p"), t0);
+        auto armed = table.snapshotOf(key);
+        CHECK(armed.has_value());
+        if (armed) CHECK(armed->persist_armed);
+
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, 1001, 65535), t0);
+        auto reopened = table.snapshotOf(key);
+        CHECK(reopened.has_value());
+        if (reopened) CHECK(!reopened->persist_armed);
+    }
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0, t0);
+        table.makeOutgoingData(key, toBytes("p"), t0);
+        table.handle(key, makeRst(8080, 54321, 1001), t0);
+        CHECK(!table.stateOf(key).has_value());
+        auto due = table.pollPersistProbes(t0 + kInitialPersistInterval);
+        CHECK(due.probes.empty()); // connection gone, nothing to probe
+    }
+
+    // wraparound: the sequence subtraction is unsigned and wraps
+    // naturally, matching every other sequence computation in this file
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 0, t0);
+        table.makeOutgoingData(key, toBytes("p"), t0);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            std::uint32_t expected_probe_seq = snapshot->snd_nxt - 1; // wraps if snd_nxt == 0
+            auto due = table.pollPersistProbes(t0 + kInitialPersistInterval);
+            CHECK(due.probes.size() == 1);
+            if (due.probes.size() == 1) CHECK(due.probes[0].segment.sequence_number == expected_probe_seq);
+        }
     }
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;

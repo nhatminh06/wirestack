@@ -540,10 +540,16 @@ int main(int argc, char** argv) {
     std::array<std::byte, kReceiveBufferSize> buffer{};
     for (;;) {
         // Size the poll timeout to the earliest pending TCP retransmission
-        // deadline (if any) so retransmissions fire even when no packet
-        // arrives, without busy-looping.
+        // or zero-window persist deadline (if any) so timers fire even
+        // when no packet arrives, without busy-looping.
         int timeout_ms = -1;
-        if (auto deadline = tcp_connections.nextRetransmissionDeadline()) {
+        auto retransmission_deadline = tcp_connections.nextRetransmissionDeadline();
+        auto persist_deadline = tcp_connections.nextPersistDeadline();
+        std::optional<wirestack::TcpClock::time_point> deadline = retransmission_deadline;
+        if (persist_deadline && (!deadline || *persist_deadline < *deadline)) {
+            deadline = persist_deadline;
+        }
+        if (deadline) {
             auto now = wirestack::TcpClock::now();
             auto remaining = *deadline > now
                                   ? std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -597,6 +603,17 @@ int main(int argc, char** argv) {
             }
             sendTcpSegment(tap, *local_ip, *local_mac, retransmission.key.remote_ip, *mac,
                            retransmission.segment);
+        }
+        auto persist_due = tcp_connections.pollPersistProbes(now);
+        for (const auto& probe : persist_due.probes) {
+            auto mac = arp_cache.lookup(probe.key.remote_ip);
+            if (!mac) {
+                std::printf("tcp: cannot send persist probe to %s:%u: no known MAC address\n",
+                            probe.key.remote_ip.toString().c_str(),
+                            static_cast<unsigned int>(probe.key.remote_port));
+                continue;
+            }
+            sendTcpSegment(tap, *local_ip, *local_mac, probe.key.remote_ip, *mac, probe.segment);
         }
         for (const auto& key : due.timed_out) {
             std::printf("tcp: connection to %s:%u timed out after %d retransmissions\n",
