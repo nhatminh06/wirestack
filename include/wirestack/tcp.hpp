@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
@@ -72,5 +73,35 @@ using TcpSerializeResult = std::variant<std::vector<std::byte>, TcpSerializeErro
 // the caller; data offset is derived from its size.
 TcpSerializeResult serializeTcpSegment(const TcpSegment& segment, Ipv4Address source,
                                         Ipv4Address destination);
+
+// Only the options Wirestack understands (see docs/tcp.md): Maximum
+// Segment Size and Window Scale. Every other well-formed option kind is
+// safely skipped, not stored -- Wirestack negotiates nothing else.
+struct TcpParsedOptions {
+    std::optional<std::uint16_t> maximum_segment_size;
+    // Raw parsed shift count, not yet clamped to the 14-bit maximum a
+    // real window field can represent -- callers that use this for
+    // arithmetic must clamp it themselves (see tcp_connection.cpp).
+    std::optional<std::uint8_t> window_scale;
+};
+
+enum class TcpOptionParseError {
+    MissingLength,        // a non-EOL/NOP kind byte with nothing after it
+    InvalidLength,        // declared length < 2
+    TruncatedOption,      // declared length extends past the option bytes,
+                           // or doesn't match what a known option kind requires
+    DuplicateMss,
+    DuplicateWindowScale,
+    InvalidMss,           // MSS value of exactly 0
+};
+
+using TcpOptionParseResult = std::variant<TcpParsedOptions, TcpOptionParseError>;
+
+// `options` is the raw option-bytes region already extracted from a
+// TcpSegment (i.e. `segment.options`). Stops at an explicit End of
+// Option List; a No-Operation advances one byte; any other well-formed
+// kind is safely skipped by its own declared length. Never reads past
+// `options.size()`.
+TcpOptionParseResult parseTcpOptions(std::span<const std::byte> options);
 
 } // namespace wirestack

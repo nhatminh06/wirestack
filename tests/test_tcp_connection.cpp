@@ -32,6 +32,11 @@ Ipv4Address remoteIp() {
     return *Ipv4Address::parse("10.0.0.1");
 }
 
+// Carries an MSS=1460 option by default, matching a well-behaved peer --
+// this keeps every pre-Milestone-11 test's effective_send_mss at 1460
+// exactly as before option negotiation existed, with zero assertion
+// changes. Tests that specifically exercise negotiation (other peer MSS
+// values, Window Scale, malformed options) use makeSynWithOptions below.
 TcpSegment makeSyn(std::uint16_t local_port, std::uint16_t remote_port, std::uint32_t seq) {
     TcpSegment segment;
     segment.source_port = remote_port;
@@ -41,6 +46,17 @@ TcpSegment makeSyn(std::uint16_t local_port, std::uint16_t remote_port, std::uin
     segment.flags.syn = true;
     segment.window_size = 65535;
     segment.urgent_pointer = 0;
+    segment.options = {std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4}};
+    return segment;
+}
+
+// Same as makeSyn, but with explicit raw option bytes -- for tests that
+// need a specific peer MSS, Window Scale, no options at all, or a
+// malformed options blob.
+TcpSegment makeSynWithOptions(std::uint16_t local_port, std::uint16_t remote_port,
+                               std::uint32_t seq, std::vector<std::byte> options) {
+    TcpSegment segment = makeSyn(local_port, remote_port, seq);
+    segment.options = std::move(options);
     return segment;
 }
 
@@ -163,6 +179,27 @@ std::uint32_t establishWithWindow(TcpConnectionTable& table, const TcpConnection
     table.handle(key,
                  makeWindowUpdate(key.local_port, key.remote_port, client_isn + 1,
                                   server_isn + 1, window),
+                 now);
+    return server_isn;
+}
+
+// Negotiates Window Scale (MSS=1460 + Window Scale=`peer_scale` on the
+// SYN) and completes the handshake, leaving the connection Established
+// with window_scaling_enabled/local_window_scale set.
+std::uint32_t establishWithWindowScale(TcpConnectionTable& table, const TcpConnectionKey& key,
+                                        std::uint32_t client_isn, std::uint8_t peer_scale,
+                                        TcpClock::time_point now = t0) {
+    std::vector<std::byte> options = {std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4},
+                                       std::byte{1}, std::byte{3}, std::byte{3},
+                                       static_cast<std::byte>(peer_scale)};
+    auto syn_ack = table
+                       .handle(key,
+                               makeSynWithOptions(key.local_port, key.remote_port, client_isn,
+                                                   options),
+                               now)
+                       .reply;
+    std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+    table.handle(key, makeAck(key.local_port, key.remote_port, client_isn + 1, server_isn + 1),
                  now);
     return server_isn;
 }
@@ -1614,7 +1651,9 @@ int main() {
 
     // --- FIN retransmission regression: backoff, ACK retirement, exhaustion ---
 
-    // backoff sequence identical to data's: 1s, 2s, 4s, 8s, 8s
+    // backoff sequence identical to data's: 1s, 2s, 4s, 8s, 16s. Under
+    // the 60s cap (task rule 26, replacing the earlier 8s cap), five
+    // retransmits of a 1s-starting entry never actually reach the cap.
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
@@ -1626,7 +1665,7 @@ int main() {
         std::vector<TcpClock::duration> offsets = {kInitialRto, std::chrono::milliseconds(2000),
                                                      std::chrono::milliseconds(4000),
                                                      std::chrono::milliseconds(8000),
-                                                     std::chrono::milliseconds(8000)};
+                                                     std::chrono::milliseconds(16000)};
         for (std::size_t i = 0; i < offsets.size(); ++i) {
             t += offsets[i];
             auto due = table.pollRetransmissions(t);
@@ -1674,12 +1713,12 @@ int main() {
         std::vector<TcpClock::duration> offsets = {kInitialRto, std::chrono::milliseconds(2000),
                                                      std::chrono::milliseconds(4000),
                                                      std::chrono::milliseconds(8000),
-                                                     std::chrono::milliseconds(8000)};
+                                                     std::chrono::milliseconds(16000)};
         for (auto offset : offsets) {
             t += offset;
             table.pollRetransmissions(t);
         }
-        t += std::chrono::milliseconds(8000);
+        t += std::chrono::milliseconds(32000); // the 6th deadline, at the now-32s-backed-off timeout
         auto exhausted = table.pollRetransmissions(t);
         CHECK(exhausted.timed_out.size() == 1);
         if (exhausted.timed_out.size() == 1) {
@@ -1932,7 +1971,11 @@ int main() {
         if (snapshot) {
             CHECK(snapshot->reassembly_fragment_count == 1);
             CHECK(snapshot->reassembly_buffered_bytes == 3);
-            CHECK(snapshot->advertised_window == kTcpReceiveCapacity - 3);
+            // Wire-clamped: this connection never negotiated Window
+            // Scale, so the advertised window is pinned at 65535 as long
+            // as the true available space (capacity - buffered, still
+            // far above 65535 here) exceeds that clamp.
+            CHECK(snapshot->advertised_window == 65535);
         }
 
         auto gap_fill = table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, toBytes("AAA")), t0);
@@ -1942,7 +1985,7 @@ int main() {
         if (after) {
             CHECK(after->rcv_nxt == 1007);
             CHECK(after->reassembly_fragment_count == 0);
-            CHECK(after->advertised_window == kTcpReceiveCapacity);
+            CHECK(after->advertised_window == 65535);
         }
     }
 
@@ -2092,12 +2135,14 @@ int main() {
     }
 
     // segment crossing the right window edge: only the in-window prefix
-    // is retained
+    // is retained. This connection never negotiates Window Scale, so its
+    // actual advertised window is wire-clamped at 65535 even though the
+    // internal buffer capacity (kTcpReceiveCapacity) is larger.
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         std::uint32_t server_isn = establish(table, key, 1000);
-        std::uint32_t edge_seq = 1001 + static_cast<std::uint32_t>(kTcpReceiveCapacity) - 3;
+        std::uint32_t edge_seq = 1001 + 65535u - 3;
         auto result =
             table.handle(key, makeData(8080, 54321, edge_seq, server_isn + 1, toBytes("XXXXXX")), t0);
         CHECK(result.accepted_payload.empty()); // still gapped, not at rcv_nxt
@@ -2128,11 +2173,14 @@ int main() {
     }
 
     // byte-capacity limit: the advertised window naturally bounds
-    // buffering to kTcpReceiveCapacity
+    // buffering to kTcpReceiveCapacity. Requires Window Scale negotiated
+    // -- an unscaled connection can never advertise (or thus buffer)
+    // more than the wire-clamped 65535 bytes regardless of the larger
+    // internal capacity (see the scaled-window tests for that case).
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
-        std::uint32_t server_isn = establish(table, key, 1000);
+        std::uint32_t server_isn = establishWithWindowScale(table, key, 1000, 2);
         // One big out-of-order fragment right up to (but not filling)
         // capacity, then confirm the window has shrunk by exactly that much.
         std::size_t big = kTcpReceiveCapacity - 1000;
@@ -2142,7 +2190,8 @@ int main() {
         CHECK(snapshot.has_value());
         if (snapshot) {
             CHECK(snapshot->reassembly_buffered_bytes == big);
-            CHECK(snapshot->advertised_window == kTcpReceiveCapacity - big);
+            // Wire value is floor-divided by the negotiated scale (2).
+            CHECK(snapshot->advertised_window == (kTcpReceiveCapacity - big) >> 2);
         }
     }
 
