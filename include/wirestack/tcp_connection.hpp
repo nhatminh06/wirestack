@@ -14,6 +14,7 @@
 namespace wirestack {
 
 enum class TcpState {
+    SynSent,
     SynReceived,
     Established,
     FinWait1,
@@ -158,6 +159,14 @@ struct TcpReceiveResult {
     // key their own state off this connection (e.g. an application
     // buffer) can use either flag to know the connection is gone.
     bool connection_closed = false;
+
+    // True exactly on the call whose valid SYN-ACK completed an active
+    // open (SynSent -> Established). Distinct from the passive path,
+    // which the caller detects instead by observing stateOf() transition
+    // through SynReceived (see main.cpp) -- this flag exists only because
+    // that trick doesn't work for SynSent (a rejected/invalid segment
+    // here never changes state, so there is nothing to diff against).
+    bool connection_established = false;
 };
 
 // Adaptive RTO policy (RFC 6298-style SRTT/RTTVAR estimator, expressed in
@@ -282,6 +291,21 @@ struct TcpCloseResult {
     std::optional<TcpSegment> fin;
 };
 
+enum class TcpConnectError {
+    InvalidPort,          // local_port == 0 or remote_port == 0
+    DuplicateConnection,  // the four-tuple already has connection state
+};
+
+struct TcpConnectResult {
+    bool accepted = false;
+    // The active SYN to transmit, set only when accepted -- not queued
+    // for retransmission by the caller; beginConnect already registered
+    // it with the same PendingTransmission/timer machinery used
+    // everywhere else (see docs/tcp.md).
+    std::optional<TcpSegment> syn;
+    std::optional<TcpConnectError> error;
+};
+
 struct TcpDueRetransmission {
     TcpConnectionKey key;
     TcpSegment segment;
@@ -323,13 +347,27 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 // application data, FIN -- never pure ACKs), duplicate-ACK fast
 // retransmit, NewReno-style partial-ACK recovery, and a bounded
 // segment-granular SACK scoreboard (see docs/tcp.md), passive/active/
-// simultaneous close, deterministic TIME_WAIT, and acceptable inbound
-// RST. No DSACK, no SACK reneging recovery beyond clearing marks on RTO,
-// no RFC 6675 pipe algorithm, no CUBIC/BBR, no ECN, no TCP timestamps, no
-// active open.
+// simultaneous close, deterministic TIME_WAIT, acceptable inbound RST,
+// and active open (beginConnect, SynSent, MSS/Window Scale/SACK-Permitted
+// negotiation from a peer SYN-ACK, RST-refused connect, connect timeout).
+// No DSACK, no SACK reneging recovery beyond clearing marks on RTO, no
+// RFC 6675 pipe algorithm, no CUBIC/BBR, no ECN, no TCP timestamps, no
+// TCP simultaneous open, no ephemeral-port allocation.
 class TcpConnectionTable {
 public:
     explicit TcpConnectionTable(std::uint16_t listen_port);
+
+    // Begins an active open: creates connection state in SynSent for the
+    // exact four-tuple `key` and returns the SYN to transmit. Rejected
+    // atomically (no ISN consumed, no state created, no segment returned)
+    // when local_port or remote_port is 0, or when `key` already has
+    // connection state (a prior active or passive connection, in any
+    // state) -- the caller must pick a different source port or wait for
+    // the existing state to clear. Does not resolve the peer MAC or send
+    // anything itself; the caller is responsible for transmitting `syn`
+    // (see docs/tcp.md for the runtime demonstration's neighbor-resolution
+    // limitation).
+    TcpConnectResult beginConnect(const TcpConnectionKey& key, TcpClock::time_point now);
 
     // Updates connection state for `segment` (keyed by `key`) at time
     // `now` and returns any reply to transmit plus any newly accepted
@@ -397,7 +435,12 @@ public:
 private:
     struct PendingTransmission {
         std::uint32_t sequence_start;
-        bool is_syn = false; // true only for the handshake SYN-ACK entry
+        bool is_syn = false; // true for the passive SYN-ACK entry OR an active SYN entry
+        // true only for an active-open SYN entry (a subset of is_syn),
+        // distinguishing it from a passive SYN-ACK entry -- retransmission
+        // must not assume every is_syn entry carries SYN|ACK with a
+        // meaningful ack number (see pollRetransmissions).
+        bool is_active_syn = false;
         bool is_fin = false; // true only for a locally-initiated FIN entry
         TcpFlags flags;
         std::vector<std::byte> payload; // owned; empty when is_syn or is_fin
@@ -464,7 +507,13 @@ private:
 
     struct Connection {
         TcpState state;
-        std::uint32_t remote_isn;
+        // Meaningful only once remote_isn_known is true -- an active-open
+        // connection starts in SynSent with no valid peer sequence state
+        // yet (see docs/tcp.md); a passively-created connection always
+        // has this true from construction (its remote_isn comes from the
+        // peer's initial SYN, known immediately).
+        std::uint32_t remote_isn = 0;
+        bool remote_isn_known = true;
         std::uint32_t local_isn;
         std::uint32_t rcv_nxt = 0;
         std::uint32_t snd_una = 0;
@@ -543,6 +592,9 @@ private:
     std::uint32_t nextIsn();
 
     static TcpSegment makeSynAck(const TcpConnectionKey& key, const Connection& connection);
+    // The active-open SYN: SYN only (no ACK), sequence=local_isn,
+    // acknowledgment=0, unscaled window (see docs/tcp.md).
+    static TcpSegment makeActiveSyn(const TcpConnectionKey& key, const Connection& connection);
     // `most_recent_fragment_start`, when set, identifies the out-of-order
     // fragment (by its current sequence_start) that should occupy the
     // first SACK block position (see generateSackBlocks); nullopt falls
@@ -558,6 +610,12 @@ private:
     // padding to a 4-byte boundary -- see docs/tcp.md for the exact byte
     // layouts.
     static std::vector<std::byte> buildSynAckOptions(const Connection& connection);
+
+    // Active SYN's own option advertisement: MSS (kTcpMss), SACK-Permitted
+    // (always offered), Window Scale (always offered, kLocalWindowScaleShift)
+    // -- same local capability policy as buildSynAckOptions, but offered
+    // unconditionally since no peer options have been seen yet.
+    static std::vector<std::byte> buildActiveSynOptions();
 
     // Builds a kind-5 SACK option (2 + 8*N bytes, N == blocks.size(),
     // EOL/zero-padded to a 4-byte boundary) or an empty vector if `blocks`
@@ -780,6 +838,13 @@ private:
     // FinWait1, FinWait2, CloseWait, Closing, LastAck.
     static TcpReceiveResult handleSynchronized(const TcpConnectionKey& key, Connection& connection,
                                                 const TcpSegment& segment, TcpClock::time_point now);
+
+    // Active-open SynSent: validates and processes a candidate SYN-ACK
+    // (see docs/tcp.md), or drops/resets per section 9/14/16 of the
+    // active-open design. Never delivers payload, never partially
+    // processes a FIN, never enters a simultaneous-open state.
+    static TcpReceiveResult handleSynSent(const TcpConnectionKey& key, Connection& connection,
+                                           const TcpSegment& segment, TcpClock::time_point now);
 
     // TimeWait has no payload/application events and only reacts to a
     // duplicate FIN (restarts the deadline) or an acceptable RST.
