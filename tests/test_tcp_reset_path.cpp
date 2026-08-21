@@ -123,6 +123,48 @@ int main() {
         }
     }
 
+    // --- Closed-port reset for an ACK-bearing segment (no prior SYN) ---
+    // Regression test: makeClosedPortReset's ACK-set branch only ever set
+    // reset.sequence_number, leaving reset.acknowledgment_number
+    // default-constructed (indeterminate) before being serialized onto
+    // the wire. Live capture against the real TAP path caught this as a
+    // different nonzero acknowledgment field on every run.
+    {
+        TcpConnectionTable connections(8080); // 8081 below is unbound
+
+        TcpSegment probe;
+        probe.source_port = 54321;
+        probe.destination_port = 8081;
+        probe.sequence_number = 111111;
+        probe.acknowledgment_number = 222222;
+        probe.flags.ack = true;
+        probe.window_size = 65535;
+
+        auto probe_frame = buildFrame(probe, clientIp(), local_ip, clientMac(), local_mac);
+        auto parsed_probe = parseFrame(probe_frame);
+        CHECK(parsed_probe.has_value());
+        if (!parsed_probe) return wirestack::test::failureCount() == 0 ? 0 : 1;
+
+        TcpConnectionKey key{local_ip, 8081, clientIp(), 54321};
+        auto reply = connections.handle(key, *parsed_probe, t0).reply;
+        CHECK(reply.has_value());
+        if (!reply) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        CHECK(reply->flags.rst);
+        CHECK(!reply->flags.ack);
+        CHECK(reply->sequence_number == 222222); // probe's own ack number
+        CHECK(reply->acknowledgment_number == 0);
+
+        auto reset_frame = buildFrame(*reply, local_ip, clientIp(), local_mac, clientMac());
+        auto parsed_reset = parseFrame(reset_frame);
+        CHECK(parsed_reset.has_value());
+        if (parsed_reset) {
+            CHECK(parsed_reset->flags.rst);
+            CHECK(!parsed_reset->flags.ack);
+            CHECK(parsed_reset->sequence_number == 222222);
+            CHECK(parsed_reset->acknowledgment_number == 0);
+        }
+    }
+
     // --- Inbound RST against an established connection ---
     {
         TcpConnectionTable connections(8080);
