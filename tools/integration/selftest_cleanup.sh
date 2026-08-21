@@ -154,6 +154,77 @@ else
     selftest_fail "fully owned resources are deleted and verified gone"
 fi
 
+
+# --- case 8: a still-running recorded background client (early exit) ------
+#
+# Simulates ws_test_http_retransmission/ws_test_synack_loss returning
+# early -- before their own `wait` -- leaving a genuinely live background
+# process behind with only a pid file (real process/pid, not a stub, so
+# ws_record_identity and ws_verify_identity exercise real /proc reads).
+selftest_reset
+sleep 300 &
+early_pid=$!
+echo "${early_pid}" >"${WS_EVIDENCE_DIR}/fake_client.pid"
+ws_record_identity "${early_pid}" "${WS_EVIDENCE_DIR}/fake_client.pid" sleep
+ws_cleanup >/dev/null 2>&1
+rc=$?
+if [ "${rc}" = "0" ] && ! kill -0 "${early_pid}" 2>/dev/null; then
+    selftest_pass "a still-running recorded background client is stopped by cleanup"
+else
+    selftest_fail "a still-running recorded background client is stopped by cleanup"
+    kill -9 "${early_pid}" 2>/dev/null || true
+fi
+
+# --- case 9: recorded pid already exited on its own before cleanup --------
+#
+# The ordinary case once ws_test_http_retransmission/ws_test_synack_loss
+# reach their own `wait`: the pid file is left behind (same as tcpdump's
+# after ws_capture_stop) but the process is already gone. Cleanup must
+# treat this as success, not a stale-pid failure.
+selftest_reset
+sleep 0.1 &
+gone_pid=$!
+echo "${gone_pid}" >"${WS_EVIDENCE_DIR}/gone_client.pid"
+ws_record_identity "${gone_pid}" "${WS_EVIDENCE_DIR}/gone_client.pid" sleep
+wait "${gone_pid}" 2>/dev/null
+ws_cleanup >/dev/null 2>&1
+rc=$?
+if [ "${rc}" = "0" ]; then
+    selftest_pass "a recorded process that already exited on its own does not fail cleanup"
+else
+    selftest_fail "a recorded process that already exited on its own does not fail cleanup"
+fi
+
+# --- case 10: pid file's pid identity no longer matches (stale reuse) -----
+#
+# Forcing genuine OS pid reuse deterministically isn't practical, so this
+# directly constructs the situation ws_verify_identity exists to catch: a
+# pid file pointing at a real, currently-running process (other_pid)
+# whose recorded identity actually describes a *different* process
+# (victim_pid). Cleanup must refuse to signal it and report failure,
+# never silently kill an unrelated process that happens to reuse a pid.
+selftest_reset
+sleep 5 &
+victim_pid=$!
+# /proc start-time resolution is one scheduler tick (10ms at the common
+# 100Hz); without separation two processes launched back-to-back can
+# land in the same tick and record identical start times, defeating the
+# mismatch this case exists to prove.
+sleep 0.2
+sleep 5 &
+other_pid=$!
+echo "${other_pid}" >"${WS_EVIDENCE_DIR}/mismatch_client.pid"
+ws_record_identity "${victim_pid}" "${WS_EVIDENCE_DIR}/mismatch_client.pid" sleep
+ws_cleanup >/dev/null 2>&1
+rc=$?
+if [ "${rc}" != "0" ] && kill -0 "${other_pid}" 2>/dev/null; then
+    selftest_pass "a pid file with mismatched recorded identity is refused, not killed"
+else
+    selftest_fail "a pid file with mismatched recorded identity is refused, not killed"
+fi
+kill -9 "${victim_pid}" "${other_pid}" 2>/dev/null || true
+wait "${victim_pid}" "${other_pid}" 2>/dev/null || true
+
 rm -rf "${SELFTEST_ROOT}"
 
 printf '[selftest] failures: %s\n' "${SELFTEST_FAILURES}"
