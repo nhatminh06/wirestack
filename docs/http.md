@@ -132,6 +132,9 @@ last of these required one small additive signal on `TcpReceiveResult`,
 
 ## Manual verification procedure
 
+For a reproducible, automated version of this check with packet-capture
+evidence, see [docs/interoperability.md](interoperability.md).
+
 Opening a TAP device requires `CAP_NET_ADMIN`:
 
 ```bash

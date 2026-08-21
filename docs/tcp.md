@@ -135,10 +135,11 @@ numbers.
 3. A valid final ACK (acknowledgment number = local ISN + 1, sequence
    number = remote ISN + 1) transitions the connection to `Established`.
    No reply is sent for a valid final ACK.
-4. Any other traffic for the listening port -- an ACK with no prior SYN,
-   an ACK with the wrong acknowledgment number, a segment for an unknown
-   connection, or a segment for any port other than 8080 -- is silently
-   dropped. No RST is generated for closed ports; no ICMP is generated.
+4. An ACK with the wrong acknowledgment number against an existing
+   `SynReceived` connection is silently dropped -- no RST, no ICMP. Any
+   other traffic for a port other than 8080, or against no matching
+   connection on 8080, gets a closed-port reset instead -- see "Closed-port
+   RST" below.
 
 ### Initial sequence number
 
@@ -1226,6 +1227,10 @@ to an incoming RST, and never creates connection state or a retransmission
 entry.
 
 ## Manual verification procedure
+
+For a reproducible, automated version of the checks below -- plus
+loss/retransmission, SYN-ACK loss recovery, and reordering with
+packet-capture evidence -- see [docs/interoperability.md](interoperability.md).
 
 Opening a TAP device requires `CAP_NET_ADMIN`:
 

@@ -38,6 +38,12 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming) {
 
     if (incoming.flags.ack) {
         reset.sequence_number = incoming.acknowledgment_number;
+        // ACK is clear on an RST-only reply, so this field is not
+        // meaningful to the receiver, but it is still serialized onto the
+        // wire -- left unset (default-constructed, indeterminate), it
+        // put uninitialized stack memory on the wire, observed live as a
+        // different nonzero value on every run.
+        reset.acknowledgment_number = 0;
     } else {
         reset.sequence_number = 0;
         std::uint32_t consumed = static_cast<std::uint32_t>(incoming.payload.size()) +
