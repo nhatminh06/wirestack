@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 11 (TCP option
-negotiation and adaptive retransmission timing):
+Milestone 0 (project foundation) through Milestone 12 (Reno-style TCP
+congestion control):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,7 +18,7 @@ negotiation and adaptive retransmission timing):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake with SYN-carried MSS/Window Scale option negotiation, MSS-bounded segmentation within the peer's (possibly scaled) send window, bounded out-of-order receive reassembly, RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
+| TCP         | passive handshake with SYN-carried MSS/Window Scale option negotiation, MSS-bounded segmentation within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly, RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit/fast recovery, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
 | HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented and deterministically tested; live curl verification still required |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -41,10 +41,16 @@ negotiation and adaptive retransmission timing):
   (first-arrival-wins overlap trimming, a 262140-byte/128-fragment
   internal bound, out-of-order FIN retention) with a dynamically
   advertised, correctly scaled-when-negotiated receive window, cumulative
-  ACK processing, RTT sampling with Karn's rule feeding an adaptive
+  ACK processing, RTT sampling with Karn's rule (triggered by either a
+  timeout or a duplicate-ACK fast retransmit) feeding an adaptive
   SRTT/RTTVAR/RTO estimator (1s/60s bounds) that drives timeout-based
   retransmission of SYN-ACK/data/FIN with cumulative/partial ACK
-  retirement, passive/active/simultaneous close
+  retirement, a per-connection Reno-style congestion window (initial
+  window sized from the negotiated MSS, Slow Start, Congestion Avoidance,
+  precise duplicate-ACK classification, third-duplicate-ACK fast
+  retransmit, classic fast recovery, and timeout congestion collapse, all
+  gating new application data alongside the peer's advertised window),
+  passive/active/simultaneous close
   (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a deterministic
   60-second TIME_WAIT, acceptable-inbound-RST handling, and closed-port
   RST generation
@@ -70,9 +76,9 @@ echo, a completed TCP handshake, and a `curl --http1.0` request) is
 manually verifiable but has not been exercised in every development
 environment this project has run in — see those docs for exact commands.
 
-Not implemented: TCP active-open/congestion control/slow start/fast
-retransmit/fast recovery/SACK/timestamps/zero-window probes, HTTP/1.1/
-keep-alive/pipelining/request bodies/chunked encoding/TLS, IPv4 options,
+Not implemented: TCP active-open/NewReno partial-ACK recovery/SACK/
+CUBIC/BBR/ECN/timestamps/zero-window probes, HTTP/1.1/keep-alive/
+pipelining/request bodies/chunked encoding/TLS, IPv4 options,
 fragmentation, routing.
 
 ## Structure
