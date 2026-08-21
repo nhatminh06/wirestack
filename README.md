@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 10 (TCP segmentation
-and bounded receive reassembly):
+Milestone 0 (project foundation) through Milestone 11 (TCP option
+negotiation and adaptive retransmission timing):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,7 +18,7 @@ and bounded receive reassembly):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake, MSS-bounded segmentation within the peer's send window, bounded out-of-order receive reassembly, timeout retransmission, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
+| TCP         | passive handshake with SYN-carried MSS/Window Scale option negotiation, MSS-bounded segmentation within the peer's (possibly scaled) send window, bounded out-of-order receive reassembly, RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
 | HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented and deterministically tested; live curl verification still required |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -32,14 +32,20 @@ and bounded receive reassembly):
   minimal `UdpEndpointTable`, and a built-in echo endpoint on port 9000
 - TCP segment parsing/serialization with the IPv4 pseudo-header checksum, a
   4-tuple `TcpConnectionTable`, a passive handshake (LISTEN implicit /
-  SYN_RECEIVED / ESTABLISHED), sequence-space tracking, MSS-bounded
-  (1460-byte) outgoing segmentation with atomic peer-send-window
-  enforcement, bounded out-of-order receive reassembly (first-arrival-wins
-  overlap trimming, 65535-byte/128-fragment bounds, out-of-order FIN
-  retention) with a dynamically advertised receive window, cumulative ACK
-  processing, bounded timeout-based retransmission of SYN-ACK/data/FIN
-  with cumulative/partial ACK retirement, passive/active/simultaneous
-  close (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a deterministic
+  SYN_RECEIVED / ESTABLISHED) that parses and negotiates a SYN's MSS and
+  Window Scale options (RFC-1191-style 536-byte MSS fallback, Window Scale
+  clamped to 14, both fixed for the connection's lifetime), sequence-space
+  tracking, MSS-bounded outgoing segmentation (sized to the negotiated
+  peer MSS, atomically capped at 128 segments per send) with atomic
+  peer-send-window enforcement, bounded out-of-order receive reassembly
+  (first-arrival-wins overlap trimming, a 262140-byte/128-fragment
+  internal bound, out-of-order FIN retention) with a dynamically
+  advertised, correctly scaled-when-negotiated receive window, cumulative
+  ACK processing, RTT sampling with Karn's rule feeding an adaptive
+  SRTT/RTTVAR/RTO estimator (1s/60s bounds) that drives timeout-based
+  retransmission of SYN-ACK/data/FIN with cumulative/partial ACK
+  retirement, passive/active/simultaneous close
+  (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a deterministic
   60-second TIME_WAIT, acceptable-inbound-RST handling, and closed-port
   RST generation
 - A bounded, stateless HTTP/1.0 request parser (`wirestack::http`) layered
@@ -64,10 +70,10 @@ echo, a completed TCP handshake, and a `curl --http1.0` request) is
 manually verifiable but has not been exercised in every development
 environment this project has run in — see those docs for exact commands.
 
-Not implemented: TCP active-open/congestion control/fast retransmit/SACK/
-window scaling/RTT estimation/adaptive RTO/zero-window probes/remote MSS
-negotiation, HTTP/1.1/keep-alive/pipelining/request bodies/chunked
-encoding/TLS, IPv4 options, fragmentation, routing.
+Not implemented: TCP active-open/congestion control/slow start/fast
+retransmit/fast recovery/SACK/timestamps/zero-window probes, HTTP/1.1/
+keep-alive/pipelining/request bodies/chunked encoding/TLS, IPv4 options,
+fragmentation, routing.
 
 ## Structure
 

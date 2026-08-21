@@ -2,26 +2,73 @@
 
 ## Current support
 
-Passive three-way handshake, MSS-bounded outgoing segmentation within the
-peer's advertised send window, bounded out-of-order receive reassembly
-with duplicate/overlap trimming, bounded timeout-based retransmission of
-SYN-ACK/data/FIN, passive/active/simultaneous close with a deterministic
-TIME_WAIT, and acceptable-inbound-RST/closed-port-RST handling, over
-IPv4, on a single fixed listening port (8080). No active open, no
-congestion control, no fast retransmit, no SACK, no window scaling. Port
-8080 hosts the minimal HTTP/1.0 demonstration described in
-[docs/http.md](http.md), not a raw byte echo -- this file covers only
-TCP itself.
+Passive three-way handshake with SYN-carried MSS/Window Scale option
+negotiation, MSS-bounded outgoing segmentation within the peer's
+advertised (and, when negotiated, scaled) send window, bounded
+out-of-order receive reassembly with duplicate/overlap trimming, RTT
+measurement with an adaptive SRTT/RTTVAR/RTO estimator driving
+timeout-based retransmission of SYN-ACK/data/FIN, passive/active/
+simultaneous close with a deterministic TIME_WAIT, and
+acceptable-inbound-RST/closed-port-RST handling, over IPv4, on a single
+fixed listening port (8080). No active open, no congestion control, no
+fast retransmit, no SACK, no timestamps. Port 8080 hosts the minimal
+HTTP/1.0 demonstration described in [docs/http.md](http.md), not a raw
+byte echo -- this file covers only TCP itself.
 
 `TcpSegment` holds source/destination ports, sequence/acknowledgment
 numbers, flags, window size, urgent pointer, and the raw `options` and
 `payload` byte ranges. Data offset and checksum are not stored -- both are
 derived/validated wire values, the same pattern already used for
-`Ipv4Packet` and `UdpDatagram`. Options are preserved verbatim (needed to
-locate the payload correctly) but never interpreted; a normal Linux SYN
-commonly carries options (MSS, window scale, SACK-permitted, timestamps),
-and the parser safely skips over them without understanding their
-semantics.
+`Ipv4Packet` and `UdpDatagram`. Options are preserved verbatim on every
+parsed segment; `parseTcpOptions` (`tcp.hpp`/`tcp.cpp`) is a separate,
+stateless byte-level scan applied only to a bare SYN's options during
+connection creation -- see "TCP options" below.
+
+## TCP options
+
+`parseTcpOptions(options)` returns a `TcpParsedOptions{maximum_segment_size,
+window_scale}` (each `std::optional`) or a `TcpOptionParseError`. A
+single left-to-right cursor scan: kind 0 (End of List) stops parsing
+immediately; kind 1 (No-Operation) advances one byte; every other kind
+requires a length byte (`MissingLength` if absent), `length >= 2`
+(`InvalidLength`), and enough remaining bytes for the declared length
+(`TruncatedOption`) before it is read. Kind 2 (MSS) requires `length ==
+4` and a nonzero 16-bit value (`InvalidMss` otherwise); kind 3 (Window
+Scale) requires `length == 3`; a second occurrence of either is
+`DuplicateMss`/`DuplicateWindowScale`. Any other well-formed kind is
+safely skipped using its own declared length without being interpreted.
+No index ever advances past `options.size()`.
+
+Negotiation happens exactly once, in `handle()`'s bare-SYN branch, from
+that SYN's own `parseTcpOptions` result:
+
+- A parse error produces no connection, no SYN-ACK, and no RST -- the
+  segment is simply dropped.
+- `peer_mss = maximum_segment_size.value_or(536)` -- 536 is the
+  RFC 1191-style IPv4 default MSS assumed when the peer's SYN omits the
+  option entirely. `effective_send_mss = min(1460, peer_mss)`, the MSS
+  actually used to size Wirestack's own outgoing segments to this peer.
+- If `window_scale` is present, `window_scaling_enabled = true`,
+  `peer_window_scale = min(window_scale, 14)` (RFC 1323's own clamp),
+  `local_window_scale = 2` (Wirestack's fixed local shift). Otherwise all
+  three stay at `false`/`0`/`0` and every window on this connection stays
+  a plain unscaled 16-bit value.
+
+A later non-SYN segment's options (if any) are never parsed for
+negotiation purposes -- negotiation is a one-time, SYN-only decision. A
+duplicate SYN for an existing `SynReceived` connection replays the
+already-stored SYN-ACK unchanged regardless of what options the
+duplicate itself carries; negotiated state is never touched twice.
+
+Wirestack's outgoing SYN-ACK always advertises its own path MSS (1460),
+never the peer's offered value: `02 04 05 b4`. When
+`window_scaling_enabled`, it also advertises `01 03 03 02` (NOP + kind=3
+length=3 shift=2) immediately after, giving an 8-byte option block (TCP
+header 28 bytes, Data Offset 7); without negotiation, the option block is
+just the 4 MSS bytes (TCP header 24 bytes, Data Offset 6). Neither the
+SYN-ACK's own window field, nor a retransmission of it, is ever scaled --
+window scaling first applies starting with the handshake's own completing
+ACK.
 
 ## Current state machine
 
@@ -161,32 +208,38 @@ space.
 
 ## MTU and MSS
 
-Wirestack never emits IPv4 or TCP options on anything it constructs, so
-both headers are always exactly 20 bytes; MSS is therefore a fixed local
-constant rather than something computed from serialized header lengths
-or negotiated with the peer:
-
 ```text
-IPv4 MTU:          1500 bytes
-IPv4 header:         20 bytes
-TCP header:           20 bytes
-local fixed MSS:   1460 bytes  (wirestack::kTcpMss)
+IPv4 MTU:                 1500 bytes
+IPv4 header:                20 bytes
+TCP header:            20 or 28 bytes  (28 only when Window Scale is negotiated)
+local path MSS:           1460 bytes  (wirestack::kTcpMss -- always advertised, never negotiated down)
+default peer MSS:          536 bytes  (wirestack::kDefaultPeerMss -- used only when the SYN omits an MSS option)
 ```
 
-Remote MSS negotiation (reading the peer's MSS option from its SYN) is
-not implemented -- Wirestack always assumes and enforces its own 1460
-regardless of what the peer advertises.
+`makeOutgoingData` segments a send into `ceil(N / effective_send_mss)`
+chunks, where `effective_send_mss = min(kTcpMss, peer_mss)` was fixed at
+handshake time (see "TCP options" above) -- so a peer that omits an MSS
+option or advertises less than 1460 gets correspondingly smaller
+outgoing segments, while a peer advertising more than 1460 never causes
+Wirestack to exceed its own path MSS. A single application send whose
+segmentation would need more than `kMaxSegmentsPerSend` (128) segments is
+rejected atomically (`TcpSendError::TooLarge`) rather than partially
+queued.
 
 ## Send window
 
-`Connection` tracks the peer-advertised window (`snd_wnd`, a plain
-16-bit value -- no window scaling) and the sequence/ack numbers of the
-segment that last legitimately updated it (`snd_wl1`/`snd_wl2`,
-RFC 793's SND.WL1/WL2), so a segment that arrives out of order can never
-replace a newer window advertisement with a stale one. `snd_wnd` is
-initialized directly from the handshake-completing ACK, then updated on
-every valid ACK-bearing segment when `seq > snd_wl1`, or `seq == snd_wl1
-and snd_wl2 <= ack`.
+`Connection` tracks the peer-advertised window as a logical 32-bit value
+(`snd_wnd`) and the sequence/ack numbers of the segment that last
+legitimately updated it (`snd_wl1`/`snd_wl2`, RFC 793's SND.WL1/WL2), so
+a segment that arrives out of order can never replace a newer window
+advertisement with a stale one. Every incoming window field is decoded
+through `decodeWindow`: `window_scaling_enabled ? (raw << peer_window_scale)
+: raw`. This applies to the handshake-completing ACK's initial `snd_wnd`
+and to every later `updateSendWindow` call -- but never to the SYN or
+SYN-ACK's own window fields, which are defined to stay raw/unscaled
+regardless of negotiation (RFC 1323). `snd_wnd` is updated on every valid
+ACK-bearing segment when `seq > snd_wl1`, or `seq == snd_wl1 and snd_wl2
+<= ack`.
 
 ```text
 flight_size = snd_nxt - snd_una
@@ -210,18 +263,30 @@ no internal send queue.
 ### Capacity
 
 ```text
-receive capacity:            65535 bytes  (wirestack::kTcpReceiveCapacity)
-maximum reassembly fragments:  128        (wirestack::kMaxReassemblyFragments)
+receive capacity:            262140 bytes  (wirestack::kTcpReceiveCapacity, 65535 << 2)
+local window scale shift:         2        (wirestack::kLocalWindowScaleShift)
+maximum reassembly fragments:   128        (wirestack::kMaxReassemblyFragments)
 ```
 
-The receive window is `[rcv_nxt, rcv_nxt + advertised_window)`, where
-`advertised_window = receive capacity - buffered out-of-order bytes`
-(an accepted out-of-order FIN counts as one unit of that buffered
-space), clamped into the 16-bit window field. Every newly constructed
-outgoing segment (SYN-ACK, pure ACK, data, FIN) uses this current value;
-a retransmitted segment refreshes both its acknowledgment number and its
-window field before checksum serialization, the same as the
-already-existing acknowledgment-number refresh.
+The receive window is `[rcv_nxt, rcv_nxt + advertised_window)`, where the
+*logical* `advertised_window = receive capacity - buffered out-of-order
+bytes` (an accepted out-of-order FIN counts as one unit of that buffered
+space). Wirestack's internal capacity (262140 bytes) is always the same
+regardless of negotiation, but the wire-format 16-bit window field is
+not: `advertisedWindowFor(connection, apply_scale)` produces `available
+>> local_window_scale` when scaling is negotiated and `apply_scale` is
+true, or `min(available, 65535)` otherwise (clamped either way to fit
+16 bits). `apply_scale` is false for the SYN-ACK and its retransmissions
+regardless of negotiation (window scaling never applies to the
+handshake), and `connection.window_scaling_enabled` everywhere else (pure
+ACK, data, FIN, and their retransmissions). The receive-acceptance
+boundary itself always uses the *logical* window
+(`advertisedLogicalWindowFor`, the wire value re-expanded by the scale)
+so Wirestack never accepts bytes beyond what it actually advertised, even
+though its internal buffer is larger than 65535 bytes. A retransmitted
+segment refreshes both its acknowledgment number and its window field
+before checksum serialization, the same as the already-existing
+acknowledgment-number refresh.
 
 ### Trimming and buffering
 
@@ -309,14 +374,72 @@ synthetic instants, advanced by explicit durations) without sleeping or
 depending on machine speed.
 
 ```text
-initial RTO:          1 second
-backoff:               double after each timeout-triggered retransmission
-maximum RTO:           8 seconds
-maximum retransmits:   5 (after the original, non-counted send)
+initial RTO:             1 second   (wirestack::kInitialRto -- before any RTT sample)
+minimum RTO:              1 second  (wirestack::kMinRto)
+maximum RTO:             60 seconds (wirestack::kMaxRto)
+maximum retransmits:      5 (after the original, non-counted send)
 ```
 
-This is an explicit educational policy, not RFC 6298 -- there is no RTT
-sampling, no smoothed RTT/variance, and no Karn's algorithm.
+Each connection carries an adaptive `current_rto`, seeded at
+`kInitialRto` and revised by RTT samples (below); every *new* pending
+transmission (SYN-ACK, a `makeOutgoingData` chunk, a locally-initiated
+FIN) starts its own timeout at the connection's current `current_rto`,
+not a fixed global constant. `PendingTransmission` records both
+`first_sent_at` (set once, never touched by retransmission) and
+`last_sent_at`/`timeout_interval` (updated on each timeout). A timeout
+retransmission doubles that entry's own `timeout_interval` (capped at
+`kMaxRto`) and also writes the backed-off value into the connection's
+`current_rto`, so a later *new* send starts from the more conservative
+estimate rather than resetting to the pre-loss value; an already-armed
+entry's own deadline is not retroactively rewritten by a later RTT
+sample.
+
+### RTT measurement and the adaptive estimator
+
+This is an RFC 6298-style estimator expressed in integer
+`TcpClock::duration` arithmetic (no floating point) -- it is a deliberate
+approximation of RFC 6298 for this educational stack, not a claim of
+full compliance (no ambiguity-tracking beyond Karn's rule, no exponential
+backoff of the *estimator* itself, no minimum-RTO tuning knob).
+
+At most one RTT sample is taken per ACK, from the newest pending entry
+that ACK fully or partially retires, provided that entry was sent exactly
+once (`retransmit_count == 0`) and has a valid `first_sent_at <= now`
+(Karn's rule: once any entry has been retransmitted, an ACK covering it
+can never produce a sample, even the very next ACK). A pure ACK
+(consumes no sequence space, never queued) and an accepted RST never
+produce a sample, since neither retires a pending entry. A clean,
+non-retransmitted SYN-ACK may provide the very first sample, sampled by
+the handshake-completing final ACK.
+
+```text
+R = now - first_sent_at                         (the raw sample)
+G = 1ms                                          (wirestack::kRtoGranularity)
+
+first sample:
+  SRTT   = R
+  RTTVAR = R / 2
+  RTO    = SRTT + max(G, 4 * RTTVAR)
+
+subsequent sample (uses the OLD SRTT for the RTTVAR update, in this order):
+  RTTVAR = (3 * RTTVAR + |SRTT - R|) / 4
+  SRTT   = (7 * SRTT + R) / 8
+  RTO    = SRTT + max(G, 4 * RTTVAR)
+
+current_rto = clamp(RTO, kMinRto, kMaxRto)
+```
+
+Worked example (matches the deterministic tests): a first sample of
+`R=200ms` gives `SRTT=200ms, RTTVAR=100ms`, raw `RTO=600ms`, clamped up
+to the 1-second floor. A following sample of `R=1000ms` (using the old
+200ms/100ms) gives `RTTVAR=275ms, SRTT=300ms, RTO=1400ms` (within
+bounds, unclamped).
+
+Negotiation and RTT/RTO state (`peer_mss`, `effective_send_mss`,
+`peer_window_scale`, `local_window_scale`, `window_scaling_enabled`,
+`has_rtt_sample`, `srtt`, `rttvar`, `current_rto`) are all per-`Connection`
+fields -- two connections through the same `TcpConnectionTable` never
+share or leak negotiated or timing state.
 
 ### Retransmitting
 
@@ -501,31 +624,29 @@ change afterward.
 
 ## Known limitations
 
-- No RTT sampling or smoothing -- the RTO policy is a fixed
-  1s/2s/4s/8s-capped backoff, not RFC 6298.
+- Only MSS and Window Scale options are understood; SACK-permitted and
+  timestamps are safely skipped like any other unknown well-formed
+  option, never interpreted or acted on.
 - No fast retransmit (duplicate-ACK triggered) -- only timeout triggers
   retransmission.
-- No congestion control.
+- No congestion control, no slow start, no fast recovery.
 - No active open (Wirestack never initiates a connection).
 - No challenge ACK; an unacceptable RST is simply dropped.
-- No TCP option negotiation or interpretation (MSS, window scale, SACK,
-  timestamps are all safely skipped, never acted on) -- MSS is a fixed
-  local constant (1460), never negotiated with the peer.
-- No window scaling -- the advertised/peer windows are both plain 16-bit
-  values, capped at 65535.
-- No fast retransmit and no SACK -- loss recovery is timeout-only.
-- No RTT estimation or adaptive RTO -- see the fixed backoff policy above.
+- The RTT/RTO estimator is an integer-arithmetic approximation of
+  RFC 6298 (Karn's rule, SRTT/RTTVAR/RTO, 1s/60s bounds), not a claim of
+  full RFC 6298 compliance.
 - No zero-window persist timer or probe -- Wirestack waits for the peer
   to advertise room; a rejected send must be retried by the caller.
 - No application-level send queue -- an atomic send is either fully
   accepted or fully rejected, never partially buffered internally.
 - Overlap/duplicate handling is a deterministic first-arrival-wins policy
-  bounded to 65535 buffered bytes and 128 fragments, not general
-  attack-resistant TCP normalization.
+  bounded to a 262140-byte internal capacity and 128 fragments, not
+  general attack-resistant TCP normalization; the wire-visible advertised
+  window still never exceeds 65535 unless Window Scale was negotiated.
 - Single application on port 8080 (the HTTP/1.0 demonstration, see
   [docs/http.md](http.md)); no general application registration.
 
 ## Next TCP work
 
-TCP MSS and window-scale option negotiation, RTT measurement, and
-adaptive retransmission timing.
+TCP slow start, congestion avoidance, duplicate-ACK fast retransmit, and
+fast recovery.
