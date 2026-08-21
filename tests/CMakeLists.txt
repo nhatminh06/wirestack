@@ -113,3 +113,11 @@ add_test(NAME test_tcp_send_queue_path COMMAND test_tcp_send_queue_path)
 add_executable(test_tcp_persist_path test_tcp_persist_path.cpp)
 target_link_libraries(test_tcp_persist_path PRIVATE wirestack_core)
 add_test(NAME test_tcp_persist_path COMMAND test_tcp_persist_path)
+
+add_executable(test_tcp_newreno_path test_tcp_newreno_path.cpp)
+target_link_libraries(test_tcp_newreno_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_newreno_path COMMAND test_tcp_newreno_path)
+
+add_executable(test_tcp_sack_path test_tcp_sack_path.cpp)
+target_link_libraries(test_tcp_sack_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_sack_path COMMAND test_tcp_sack_path)
