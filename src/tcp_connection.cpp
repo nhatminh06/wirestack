@@ -652,30 +652,36 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         connection.pending_removal = true;
     }
 
-    // ACK-driven scheduling (see docs/tcp.md): this ACK/window update may
-    // have created new peer-window or congestion-window allowance, so
-    // queued send-buffer bytes (and a deferred FIN, once they drain) are
-    // scheduled immediately -- no second application call or timer tick
-    // is required. Skipped for a connection about to be removed or no
-    // longer in a sendable state (Closing/TimeWait/etc.).
-    std::vector<TcpSegment> scheduled;
-    if (!connection.pending_removal &&
-        (connection.state == TcpState::Established || connection.state == TcpState::CloseWait)) {
-        scheduled = scheduleQueuedData(key, connection, now);
-    } else {
+    // ACK-driven scheduling (see docs/tcp.md) must observe the FINAL
+    // receive-side state for this inbound segment -- in particular the
+    // rcv_nxt this segment's own payload/FIN may advance -- since
+    // scheduleQueuedData() stamps scheduled segments with the current
+    // connection.rcv_nxt as their acknowledgment_number. Scheduling
+    // therefore happens once, after all receive-side processing below,
+    // via this local helper rather than immediately after ACK/window/
+    // congestion processing. Skipped for a connection about to be
+    // removed or no longer in a sendable state (Closing/TimeWait/etc.).
+    auto scheduleIfSendable = [&]() -> std::vector<TcpSegment> {
+        if (!connection.pending_removal &&
+            (connection.state == TcpState::Established ||
+             connection.state == TcpState::CloseWait)) {
+            return scheduleQueuedData(key, connection, now);
+        }
         updatePersistState(connection, now);
-    }
+        return {};
+    };
 
     if (segment.payload.empty() && !segment.flags.fin) {
         // Ack information already processed above; an ordinary ACK-only
         // segment does not itself warrant a reply (that would create an
         // ACK loop). This is also exactly where a LastAck connection's
         // final ACK lands, so pending_removal (just possibly set above)
-        // is surfaced here.
+        // is surfaced here. No payload/FIN means no receive-side state
+        // change, so rcv_nxt is already final here.
         TcpReceiveResult result;
         result.connection_closed = connection.pending_removal;
         result.fast_retransmit = fast_retransmit_segment;
-        result.scheduled = std::move(scheduled);
+        result.scheduled = scheduleIfSendable();
         return result;
     }
 
@@ -709,12 +715,13 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
 
     if (!any_payload_in_window && !fin_in_window) {
         // Nothing of this segment lies in the receive window: store
-        // nothing, deliver nothing, rcv_nxt unchanged, duplicate ACK --
-        // unless scheduled data already carries a valid ACK, making a
-        // separate pure ACK redundant.
+        // nothing, deliver nothing, rcv_nxt unchanged -- already final,
+        // so scheduling now uses the same (unchanged) rcv_nxt as before.
+        // Duplicate ACK unless scheduled data already carries a valid
+        // ACK, making a separate pure ACK redundant.
         TcpReceiveResult result;
         result.fast_retransmit = fast_retransmit_segment;
-        result.scheduled = std::move(scheduled);
+        result.scheduled = scheduleIfSendable();
         if (result.scheduled.empty()) {
             result.reply = makePureAck(key, connection);
         }
@@ -736,7 +743,6 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     TcpReceiveResult result;
     result.accepted_payload = releaseContiguous(connection);
     result.fast_retransmit = fast_retransmit_segment;
-    result.scheduled = std::move(scheduled);
 
     if (connection.pending_fin_seq && *connection.pending_fin_seq == connection.rcv_nxt) {
         connection.rcv_nxt += 1;
@@ -751,6 +757,12 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
             startTimeWait(connection, now);
         }
     }
+
+    // rcv_nxt (and connection state, after any FIN-driven transition) are
+    // now final for this inbound segment -- schedule queued outgoing data
+    // (and a deferred local FIN, once the queue drains) so it acknowledges
+    // the newly consumed peer sequence space.
+    result.scheduled = scheduleIfSendable();
 
     // Only reply directly when nothing was released -- an out-of-order
     // arrival (still gapped) gets a duplicate ACK; a released payload is
