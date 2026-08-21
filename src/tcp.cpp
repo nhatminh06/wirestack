@@ -176,4 +176,69 @@ TcpSerializeResult serializeTcpSegment(const TcpSegment& segment, Ipv4Address so
     return out;
 }
 
+namespace {
+
+constexpr std::uint8_t kOptionKindEndOfList = 0;
+constexpr std::uint8_t kOptionKindNoOperation = 1;
+constexpr std::uint8_t kOptionKindMss = 2;
+constexpr std::uint8_t kOptionKindWindowScale = 3;
+
+} // namespace
+
+TcpOptionParseResult parseTcpOptions(std::span<const std::byte> options) {
+    TcpParsedOptions parsed;
+    std::size_t i = 0;
+
+    while (i < options.size()) {
+        auto kind = static_cast<std::uint8_t>(options[i]);
+
+        if (kind == kOptionKindEndOfList) {
+            break; // remaining bytes are padding, ignored
+        }
+        if (kind == kOptionKindNoOperation) {
+            i += 1;
+            continue;
+        }
+
+        if (i + 1 >= options.size()) {
+            return TcpOptionParseError::MissingLength;
+        }
+        auto length = static_cast<std::uint8_t>(options[i + 1]);
+        if (length < 2) {
+            return TcpOptionParseError::InvalidLength;
+        }
+        if (i + length > options.size()) {
+            return TcpOptionParseError::TruncatedOption;
+        }
+
+        if (kind == kOptionKindMss) {
+            if (length != 4) {
+                return TcpOptionParseError::TruncatedOption;
+            }
+            if (parsed.maximum_segment_size.has_value()) {
+                return TcpOptionParseError::DuplicateMss;
+            }
+            std::uint16_t value = readBigEndian16(options, i + 2);
+            if (value == 0) {
+                return TcpOptionParseError::InvalidMss;
+            }
+            parsed.maximum_segment_size = value;
+        } else if (kind == kOptionKindWindowScale) {
+            if (length != 3) {
+                return TcpOptionParseError::TruncatedOption;
+            }
+            if (parsed.window_scale.has_value()) {
+                return TcpOptionParseError::DuplicateWindowScale;
+            }
+            parsed.window_scale = static_cast<std::uint8_t>(options[i + 2]);
+        }
+        // Any other kind is an unknown well-formed option: safely
+        // skipped below using its own declared length, never interpreted.
+
+        i += length;
+    }
+
+    return parsed;
+}
+
 } // namespace wirestack

@@ -212,7 +212,13 @@ int main() {
     if (echo.segments.empty()) return wirestack::test::failureCount() == 0 ? 0 : 1;
     const auto& echo_segment = echo.segments.front();
 
-    auto data_deadline = data_time + kInitialRto;
+    // The earlier SYN-ACK retransmission already backed the connection's
+    // current_rto off to 2*kInitialRto (task rule 26: a timeout updates
+    // the connection's RTO, not just that one entry's), and the SYN-ACK
+    // was never cleanly ACKed (it was retransmitted first), so no RTT
+    // sample reset it back down -- the echo's own timeout starts from
+    // that already-backed-off 2s value, not kInitialRto.
+    auto data_deadline = data_time + kInitialRto * 2;
     auto data_due = connections.pollRetransmissions(data_deadline);
     CHECK(data_due.retransmissions.size() == 1);
     if (data_due.retransmissions.size() == 1) {

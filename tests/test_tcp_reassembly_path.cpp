@@ -29,21 +29,6 @@ std::vector<std::byte> toBytes(std::string_view text) {
     return out;
 }
 
-std::vector<std::byte> knownSynFrame() {
-    std::vector<std::byte> out;
-    for (std::uint8_t v : {
-             0x02, 0x00, 0x00, 0x00, 0x00, 0x02, // Ethernet destination: Wirestack
-             0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // Ethernet source: host
-             0x08, 0x00,                         // EtherType: IPv4
-             0x45, 0x00, 0x00, 0x28, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x0a, 0x88, 0x0a, 0x00,
-             0x00, 0x01, 0x0a, 0x00, 0x00, 0x02, 0xd4, 0x31, 0x1f, 0x90, 0x00, 0x00, 0x03, 0xe8,
-             0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xff, 0xff, 0xa4, 0x36, 0x00, 0x00,
-         }) {
-        out.push_back(static_cast<std::byte>(v));
-    }
-    return out;
-}
-
 MacAddress clientMac() {
     return *MacAddress::parse("aa:bb:cc:dd:ee:ff");
 }
@@ -70,6 +55,31 @@ std::vector<std::byte> buildFrame(const TcpSegment& segment, Ipv4Address source_
     frame.payload = std::get<std::vector<std::byte>>(ip_bytes);
 
     return serializeEthernetFrame(frame);
+}
+
+// Client 10.0.0.1/aa:bb:cc:dd:ee:ff:54321 -> server 10.0.0.2/
+// 02:00:00:00:00:02:8080, client_isn=1000, offering MSS=1460 and Window
+// Scale=2 -- a modern real client's SYN would carry both, and
+// negotiating scaling here is what makes "window shrinks while
+// buffering / reopens on release" provable at these small HTTP-request
+// buffer sizes (an unscaled window stays pinned at 65535 until tens of
+// thousands of bytes are buffered). Built through the real serializer,
+// not hand-hex, to avoid a manually-computed checksum.
+std::vector<std::byte> knownSynFrame() {
+    TcpSegment syn;
+    syn.source_port = 54321;
+    syn.destination_port = 8080;
+    syn.sequence_number = 1000;
+    syn.acknowledgment_number = 0;
+    syn.flags.syn = true;
+    syn.window_size = 65535;
+    syn.urgent_pointer = 0;
+    syn.options = {std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4},
+                    std::byte{1}, std::byte{3}, std::byte{3}, std::byte{2}};
+
+    return buildFrame(syn, *Ipv4Address::parse("10.0.0.1"), *Ipv4Address::parse("10.0.0.2"),
+                       *MacAddress::parse("aa:bb:cc:dd:ee:ff"),
+                       *MacAddress::parse("02:00:00:00:00:02"));
 }
 
 struct ParsedFrame {
@@ -171,6 +181,14 @@ int main() {
         std::uint32_t seq2 = base + static_cast<std::uint32_t>(range1.size());
         std::uint32_t seq3 = seq2 + static_cast<std::uint32_t>(range2.size());
 
+        // Window before any buffering (Window Scale negotiated, so this
+        // is measurable even for the small buffer sizes used below --
+        // an unscaled window would stay pinned at 65535 until tens of
+        // thousands of bytes were buffered).
+        auto snap_before = connections.snapshotOf(key);
+        CHECK(snap_before.has_value());
+        std::uint16_t full_window = snap_before ? snap_before->advertised_window : 0;
+
         // Deliver the final range first.
         auto r3 = deliverRange(connections, key, *hs, local_ip, local_mac, seq3, range3, t0);
         CHECK(r3.accepted_payload.empty());
@@ -178,10 +196,7 @@ int main() {
         if (r3.reply) CHECK(r3.reply->acknowledgment_number == base); // gap still at the start
         auto snap_after_r3 = connections.snapshotOf(key);
         CHECK(snap_after_r3.has_value());
-        std::uint16_t full_window = 0;
         if (snap_after_r3) {
-            full_window = static_cast<std::uint16_t>(snap_after_r3->advertised_window +
-                                                       range3.size()); // window before buffering
             CHECK(snap_after_r3->advertised_window < full_window); // shrunk while buffering
         }
 

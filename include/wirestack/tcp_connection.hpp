@@ -34,6 +34,11 @@ struct TcpConnectionKey {
     friend auto operator<=>(const TcpConnectionKey&, const TcpConnectionKey&) = default;
 };
 
+// Monotonic clock used for retransmission scheduling and RTT
+// measurement. steady_clock (not system_clock) so timing is unaffected
+// by wall-clock adjustments.
+using TcpClock = std::chrono::steady_clock;
+
 // Read-only snapshot of a connection's sequence-space and retransmission
 // state, exposed for inspection (tests, logging) without exposing
 // mutable internals.
@@ -43,10 +48,21 @@ struct TcpConnectionSnapshot {
     std::uint32_t snd_una;
     std::uint32_t snd_nxt;
     std::size_t pending_count;
-    std::uint16_t snd_wnd;
+    std::uint32_t snd_wnd; // logical (already decoded by peer_window_scale)
     std::size_t reassembly_fragment_count;
     std::size_t reassembly_buffered_bytes;
-    std::uint16_t advertised_window;
+    std::uint16_t advertised_window; // wire value (already encoded for the peer)
+
+    std::uint16_t peer_mss;
+    std::uint16_t effective_send_mss;
+    std::uint8_t peer_window_scale;
+    std::uint8_t local_window_scale;
+    bool window_scaling_enabled;
+
+    bool has_rtt_sample;
+    TcpClock::duration srtt;
+    TcpClock::duration rttvar;
+    TcpClock::duration current_rto;
 };
 
 struct TcpReceiveResult {
@@ -86,45 +102,64 @@ struct TcpReceiveResult {
     bool connection_closed = false;
 };
 
-// Monotonic clock used for retransmission scheduling. steady_clock (not
-// system_clock) so timeouts are unaffected by wall-clock adjustments.
-using TcpClock = std::chrono::steady_clock;
-
-// Educational RTO policy: initial timeout, doubled after each
-// timeout-triggered retransmission up to a cap, abandoned after a fixed
-// number of retransmissions. This is not RFC 6298 (no RTT sampling, no
-// smoothed RTT/variance).
+// Adaptive RTO policy (RFC 6298-style SRTT/RTTVAR estimator, expressed in
+// integer TcpClock::duration arithmetic -- no floating point). A fresh
+// connection starts at kInitialRto; once an eligible RTT sample arrives,
+// the connection's own current_rto tracks the estimator instead. Every
+// per-entry timeout still doubles that entry's own timeout, capped at
+// kMaxRto, independent of the connection-level estimate.
 inline constexpr std::chrono::milliseconds kInitialRto{1000};
-inline constexpr std::chrono::milliseconds kMaxRto{8000};
+inline constexpr std::chrono::milliseconds kMinRto{1000};
+inline constexpr std::chrono::milliseconds kMaxRto{60000};
+inline constexpr std::chrono::milliseconds kRtoGranularity{1};
 inline constexpr int kMaxRetransmits = 5;
 
 // Educational fixed TIME_WAIT duration -- not adaptive, not based on any
 // measured MSL.
 inline constexpr std::chrono::seconds kTimeWaitDuration{60};
 
-// Wirestack never emits IPv4 or TCP options on anything it constructs
-// (confirmed: outgoing segments never set `options`), so both headers
-// are always exactly 20 bytes -- MSS is a fixed local constant, not
-// computed from a negotiated remote value (none is negotiated this
-// milestone; see docs/tcp.md).
+// Wirestack never emits IPv4 options, and only ever emits TCP options on
+// a SYN-ACK (MSS, and Window Scale when negotiated -- see
+// buildSynAckOptions), so path-MTU math still treats both headers as a
+// fixed 20 bytes: MSS is Wirestack's own local constant, independent of
+// whatever the peer negotiates (see docs/tcp.md).
 inline constexpr std::size_t kIpv4HeaderLength = 20;
 inline constexpr std::size_t kTcpHeaderLength = 20;
-inline constexpr std::size_t kTcpMss = 1460; // 1500 - 20 - 20
+inline constexpr std::size_t kTcpMss = 1460; // 1500 - 20 - 20, Wirestack's own path MSS
+
+// IPv4 default peer MSS fallback: 536 bytes when the SYN omits MSS.
+inline constexpr std::uint16_t kDefaultPeerMss = 536;
 
 // Bounds an atomic application send (see makeOutgoingData) -- matches the
 // largest unscaled TCP window and keeps temporary segment construction
 // bounded regardless of caller input.
 inline constexpr std::size_t kMaxApplicationSendSize = 65535;
 
-// Bounds the out-of-order receive buffer. The advertised window is
-// derived from this and can never exceed it (the 16-bit header field
-// couldn't represent more without window scaling, which isn't
-// implemented).
-inline constexpr std::size_t kTcpReceiveCapacity = 65535;
+// Bounds the number of segments one atomic application send may produce
+// (relevant when the peer's negotiated MSS is small); exceeding it
+// rejects the whole send atomically rather than fragmenting into an
+// unbounded number of tiny segments.
+inline constexpr std::size_t kMaxSegmentsPerSend = 128;
+
+// Internal out-of-order receive buffer bound. Always this size
+// regardless of whether Window Scale was negotiated with a given peer --
+// only the *wire encoding* of the advertised window depends on
+// negotiation (see advertisedWindowFor). 65535 << 2, the largest window
+// representable with local_window_scale = 2.
+inline constexpr std::size_t kTcpReceiveCapacity = 65535u << 2;
 
 // Bounds the number of separately-tracked out-of-order fragments per
 // connection, independent of their total byte size.
 inline constexpr std::size_t kMaxReassemblyFragments = 128;
+
+// The shift Wirestack offers when a peer's SYN includes a Window Scale
+// option. 65535 << 2 == kTcpReceiveCapacity.
+inline constexpr std::uint8_t kLocalWindowScaleShift = 2;
+
+// A received Window Scale shift greater than this is clamped -- RFC 1323
+// caps the field at 14 (2^14 * 65535 already exceeds the maximum usable
+// TCP sequence-space window).
+inline constexpr std::uint8_t kMaxWindowScaleShift = 14;
 
 enum class TcpSendError {
     NotSendable,       // connection unknown or not Established/CloseWait
@@ -165,14 +200,16 @@ struct TcpTimeoutPollResult {
 TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 
 // Handles the passive three-way handshake (LISTEN is implicit: any key
-// with no table entry is either unbound or not yet SYN'd), MSS-bounded
-// outgoing segmentation within the peer's advertised send window,
-// bounded out-of-order receive reassembly with duplicate/overlap
-// trimming, cumulative ACK processing, timeout-based retransmission of
-// sequence-consuming segments (SYN-ACK, application data, FIN -- never
-// pure ACKs), passive/active/simultaneous close, deterministic
-// TIME_WAIT, and acceptable inbound RST. No congestion control, no fast
-// retransmit, no SACK, no window scaling, no active open.
+// with no table entry is either unbound or not yet SYN'd) including MSS
+// and Window Scale option negotiation, MSS-bounded outgoing segmentation
+// within the peer's advertised (and, once negotiated, scaled) send
+// window, bounded out-of-order receive reassembly with duplicate/overlap
+// trimming, cumulative ACK processing, RTT-adaptive timeout-based
+// retransmission of sequence-consuming segments (SYN-ACK, application
+// data, FIN -- never pure ACKs), passive/active/simultaneous close,
+// deterministic TIME_WAIT, and acceptable inbound RST. No congestion
+// control, no fast retransmit, no SACK, no TCP timestamps, no active
+// open.
 class TcpConnectionTable {
 public:
     explicit TcpConnectionTable(std::uint16_t listen_port);
@@ -229,9 +266,17 @@ private:
         bool is_fin = false; // true only for a locally-initiated FIN entry
         TcpFlags flags;
         std::vector<std::byte> payload; // owned; empty when is_syn or is_fin
-        TcpClock::time_point last_sent;
-        TcpClock::duration rto = kInitialRto;
-        int retransmit_count = 0;
+        // Set once at construction, never overwritten by a retransmission
+        // -- this is what an RTT sample is measured against.
+        TcpClock::time_point first_sent_at;
+        TcpClock::time_point last_sent_at;
+        TcpClock::duration timeout_interval = kInitialRto; // this entry's own backed-off timeout
+        int retransmit_count = 0; // > 0 also means "not eligible for an RTT sample" (Karn's rule)
+        // Set once an ACK has taken an RTT sample from this entry (full or
+        // partial retirement). Distinct from Karn eligibility: a
+        // never-retransmitted entry may still be ineligible for a *second*
+        // sample after a partial ACK already sampled it once.
+        bool rtt_sample_taken = false;
 
         std::uint32_t sequenceEnd() const {
             return sequence_start + static_cast<std::uint32_t>(payload.size()) +
@@ -267,10 +312,11 @@ private:
         // erases the connection. Never observed outside this class.
         bool pending_removal = false;
 
-        // Peer-advertised send window and the sequence/ack numbers of the
-        // segment that last legitimately updated it (RFC 793 SND.WL1/WL2),
-        // so a stale segment can never replace a newer window advertisement.
-        std::uint16_t snd_wnd = 0;
+        // Peer-advertised send window (logical, already decoded by
+        // peer_window_scale) and the sequence/ack numbers of the segment
+        // that last legitimately updated it (RFC 793 SND.WL1/WL2), so a
+        // stale segment can never replace a newer window advertisement.
+        std::uint32_t snd_wnd = 0;
         std::uint32_t snd_wl1 = 0;
         std::uint32_t snd_wl2 = 0;
 
@@ -279,6 +325,21 @@ private:
         // before all preceding bytes did.
         std::vector<TcpReassemblyFragment> out_of_order;
         std::optional<std::uint32_t> pending_fin_seq;
+
+        // SYN option negotiation, decided once from the peer's SYN and
+        // never touched again (a duplicate SYN or any later segment's
+        // options never renegotiates).
+        std::uint16_t peer_mss = kDefaultPeerMss;
+        std::uint16_t effective_send_mss = kTcpMss;
+        std::uint8_t peer_window_scale = 0;  // clamped to [0, kMaxWindowScaleShift]
+        std::uint8_t local_window_scale = 0; // 0 unless negotiated; kLocalWindowScaleShift if so
+        bool window_scaling_enabled = false;
+
+        // RFC 6298-style adaptive RTO estimator.
+        bool has_rtt_sample = false;
+        TcpClock::duration srtt{};
+        TcpClock::duration rttvar{};
+        TcpClock::duration current_rto = kInitialRto; // starting timeout_interval for new sends
     };
 
     // Not a secure or RFC 6528-style initial sequence number generator --
@@ -290,13 +351,30 @@ private:
     static TcpSegment makePureAck(const TcpConnectionKey& key, const Connection& connection);
     static TcpSegment makeFin(const TcpConnectionKey& key, const Connection& connection);
 
+    // MSS (always kTcpMss, never derived from the peer) and, only when
+    // window_scaling_enabled, NOP + Window Scale -- see docs/tcp.md for
+    // the exact byte layouts. Already word-aligned; no padding needed.
+    static std::vector<std::byte> buildSynAckOptions(const Connection& connection);
+
     // Advances snd_una to `ack` and drains/trims the pending queue to
     // match, if `ack` is ahead of the current snd_una. A no-op for a
     // duplicate or stale ACK. Precondition: `ack` already validated by
     // the caller as not beyond snd_nxt. SYN and FIN both occupy a
     // 1-wide sequence range, so no ack value can land strictly inside
-    // one -- the partial-trim branch below only ever trims data.
-    static void retireAcknowledged(Connection& connection, std::uint32_t ack);
+    // one -- the partial-trim branch below only ever trims data. Also
+    // takes an RTT sample (see recordRttSample) from the newest
+    // fully-or-partially-retired entry that was never retransmitted and
+    // has not already contributed a sample, if any -- Karn's rule falls
+    // out for free, since a retransmitted entry is simply never an
+    // eligible candidate, and rtt_sample_taken prevents a still-partially-
+    // outstanding entry from being sampled a second time by a later ACK.
+    static void retireAcknowledged(Connection& connection, std::uint32_t ack,
+                                    TcpClock::time_point now);
+
+    // Applies the first-sample or subsequent-sample RFC 6298-style
+    // update (SRTT/RTTVAR/RTO) for one measured round-trip time `r`, then
+    // clamps current_rto to [kMinRto, kMaxRto].
+    static void recordRttSample(Connection& connection, TcpClock::duration r);
 
     // Moves `connection` into TimeWait, arming its expiration deadline
     // and dropping any (already-acknowledged) pending entries.
@@ -307,18 +385,48 @@ private:
     // unit of sequence space for capacity purposes).
     static std::size_t bufferedReceiveBytes(const Connection& connection);
 
-    // kTcpReceiveCapacity minus bufferedReceiveBytes, clamped into the
-    // 16-bit header field. Used for every outgoing segment's window_size.
-    static std::uint16_t advertisedWindowFor(const Connection& connection);
+    // The wire-format window_size for an outgoing segment: kTcpReceiveCapacity
+    // minus bufferedReceiveBytes, floor-divided by the local scale and
+    // clamped into the 16-bit header field. `apply_scale` must be false
+    // for a SYN-ACK (and its retransmissions) -- window scaling never
+    // applies to that segment's own window field regardless of what was
+    // negotiated for the rest of the connection.
+    static std::uint16_t advertisedWindowFor(const Connection& connection, bool apply_scale);
+
+    // The LOGICAL receive-window right edge actually promised to the
+    // peer -- the wire value advertisedWindowFor(connection, true) would
+    // produce, re-expanded by Wirestack's OWN local_window_scale (this is
+    // Wirestack's own advertised window, not a peer-received one -- see
+    // expandLocalAdvertisedWindow). Used only for the receive acceptance
+    // test, so Wirestack never accepts bytes beyond what it actually
+    // advertised even though its internal buffer is larger.
+    static std::uint32_t advertisedLogicalWindowFor(const Connection& connection);
 
     // snd_wnd - flight_size (snd_nxt - snd_una), or 0 if the peer's
     // window is already fully consumed by outstanding (unacknowledged)
     // bytes.
     static std::uint32_t availableSendWindow(const Connection& connection);
 
+    // Decodes a window field RECEIVED FROM THE PEER: raw << peer_window_scale
+    // when scaling was negotiated, else raw unchanged. Never applied to a
+    // SYN or SYN-ACK's own window field. Not to be confused with
+    // expandLocalAdvertisedWindow, which uses the other (local) shift.
+    static std::uint32_t decodePeerWindow(const Connection& connection, std::uint16_t raw);
+
+    // Re-expands a WIRE VALUE WIRESTACK ITSELF ADVERTISED (produced by
+    // advertisedWindowFor) back into the logical byte count it promised:
+    // wire << local_window_scale when scaling was negotiated, else wire
+    // unchanged. peer_window_scale plays no part here -- decoding an
+    // incoming peer window and reconstructing Wirestack's own advertised
+    // window are independent negotiated shifts and must never share one
+    // helper implicitly.
+    static std::uint32_t expandLocalAdvertisedWindow(const Connection& connection,
+                                                       std::uint16_t wire);
+
     // Applies the RFC 793 SND.WL1/WL2 acceptance test so a stale segment
     // can never replace a newer window advertisement, then updates
-    // snd_wnd/snd_wl1/snd_wl2 if the new segment is accepted.
+    // snd_wnd/snd_wl1/snd_wl2 (via decodePeerWindow) if the new segment is
+    // accepted.
     static void updateSendWindow(Connection& connection, const TcpSegment& segment);
 
     // Inserts `payload` (already trimmed to lie fully within the receive

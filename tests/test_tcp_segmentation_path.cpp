@@ -19,21 +19,6 @@ namespace {
 constexpr std::size_t kEthernetMtu = 1500;
 constexpr std::size_t kEthernetHeaderLength = 14;
 
-std::vector<std::byte> knownSynFrame() {
-    std::vector<std::byte> out;
-    for (std::uint8_t v : {
-             0x02, 0x00, 0x00, 0x00, 0x00, 0x02, // Ethernet destination: Wirestack
-             0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // Ethernet source: host
-             0x08, 0x00,                         // EtherType: IPv4
-             0x45, 0x00, 0x00, 0x28, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x0a, 0x88, 0x0a, 0x00,
-             0x00, 0x01, 0x0a, 0x00, 0x00, 0x02, 0xd4, 0x31, 0x1f, 0x90, 0x00, 0x00, 0x03, 0xe8,
-             0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xff, 0xff, 0xa4, 0x36, 0x00, 0x00,
-         }) {
-        out.push_back(static_cast<std::byte>(v));
-    }
-    return out;
-}
-
 MacAddress clientMac() {
     return *MacAddress::parse("aa:bb:cc:dd:ee:ff");
 }
@@ -60,6 +45,28 @@ std::vector<std::byte> buildFrame(const TcpSegment& segment, Ipv4Address source_
     frame.payload = std::get<std::vector<std::byte>>(ip_bytes);
 
     return serializeEthernetFrame(frame);
+}
+
+// Client 10.0.0.1/aa:bb:cc:dd:ee:ff:54321 -> server 10.0.0.2/
+// 02:00:00:00:00:02:8080, client_isn=1000, carrying an MSS=1460 option
+// so this connection's effective_send_mss negotiates to Wirestack's own
+// path MSS -- exactly what this test needs to prove >2*MSS segmentation.
+// Built through the real serializer (not hand-hex) to avoid a
+// manually-computed checksum.
+std::vector<std::byte> knownSynFrame() {
+    TcpSegment syn;
+    syn.source_port = 54321;
+    syn.destination_port = 8080;
+    syn.sequence_number = 1000;
+    syn.acknowledgment_number = 0;
+    syn.flags.syn = true;
+    syn.window_size = 65535;
+    syn.urgent_pointer = 0;
+    syn.options = {std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4}};
+
+    return buildFrame(syn, *Ipv4Address::parse("10.0.0.1"), *Ipv4Address::parse("10.0.0.2"),
+                       *MacAddress::parse("aa:bb:cc:dd:ee:ff"),
+                       *MacAddress::parse("02:00:00:00:00:02"));
 }
 
 struct ParsedFrame {
