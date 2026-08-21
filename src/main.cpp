@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <optional>
@@ -332,6 +333,18 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         std::printf("tcp established src=%s:%u\n", ip_packet.source.toString().c_str(),
                     static_cast<unsigned int>(segment.source_port));
     }
+    if (result.connection_established) {
+        std::printf("tcp active connection established dst=%s:%u local_port=%u\n",
+                    ip_packet.source.toString().c_str(),
+                    static_cast<unsigned int>(segment.source_port),
+                    static_cast<unsigned int>(segment.destination_port));
+    }
+    if (result.connection_reset && state_before == wirestack::TcpState::SynSent) {
+        std::printf("tcp active connection refused dst=%s:%u local_port=%u\n",
+                    ip_packet.source.toString().c_str(),
+                    static_cast<unsigned int>(segment.source_port),
+                    static_cast<unsigned int>(segment.destination_port));
+    }
 
     if (result.reply) {
         sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.reply);
@@ -432,7 +445,9 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         }
     }
 
-    if (result.connection_reset) {
+    if (result.connection_reset && state_before != wirestack::TcpState::SynSent) {
+        // The SynSent case already printed "active connection refused"
+        // above -- this is the passive/synchronized-state reset instead.
         std::printf("tcp: connection reset by peer src=%s:%u\n",
                     ip_packet.source.toString().c_str(),
                     static_cast<unsigned int>(segment.source_port));
@@ -491,11 +506,65 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     }
 }
 
+// One opt-in active-open configuration: connect once to remote_ip:remote_port
+// from source_port, as soon as the peer's MAC is known. Parsed from
+// "--active-open <ip>:<port> --source-port <port>", both optional but
+// required together; absent by default (main.cpp owns this runtime
+// policy -- TCP protocol logic knows nothing about command-line syntax).
+struct ActiveOpenConfig {
+    wirestack::Ipv4Address remote_ip;
+    std::uint16_t remote_port;
+    std::uint16_t source_port;
+};
+
+std::optional<ActiveOpenConfig> parseActiveOpenArgs(int argc, char** argv) {
+    std::optional<std::string> active_open_arg;
+    std::optional<std::string> source_port_arg;
+    for (int i = 4; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--active-open" && i + 1 < argc) {
+            active_open_arg = argv[++i];
+        } else if (arg == "--source-port" && i + 1 < argc) {
+            source_port_arg = argv[++i];
+        }
+    }
+    if (!active_open_arg && !source_port_arg) {
+        return std::nullopt;
+    }
+    if (!active_open_arg || !source_port_arg) {
+        std::fprintf(stderr,
+                     "wirestack: --active-open and --source-port must be given together\n");
+        return std::nullopt;
+    }
+
+    auto colon = active_open_arg->rfind(':');
+    if (colon == std::string::npos) {
+        std::fprintf(stderr, "wirestack: --active-open must be <ip>:<port>\n");
+        return std::nullopt;
+    }
+    auto remote_ip = wirestack::Ipv4Address::parse(active_open_arg->substr(0, colon));
+    if (!remote_ip) {
+        std::fprintf(stderr, "wirestack: invalid --active-open IPv4 address\n");
+        return std::nullopt;
+    }
+    int remote_port = std::atoi(active_open_arg->substr(colon + 1).c_str());
+    int source_port = std::atoi(source_port_arg->c_str());
+    if (remote_port <= 0 || remote_port > 0xffff || source_port <= 0 || source_port > 0xffff) {
+        std::fprintf(stderr, "wirestack: --active-open/--source-port ports must be 1-65535\n");
+        return std::nullopt;
+    }
+
+    return ActiveOpenConfig{*remote_ip, static_cast<std::uint16_t>(remote_port),
+                             static_cast<std::uint16_t>(source_port)};
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::fprintf(stderr, "usage: %s <tap-interface-name> <local-ipv4> <local-mac>\n",
+    if (argc < 4) {
+        std::fprintf(stderr,
+                     "usage: %s <tap-interface-name> <local-ipv4> <local-mac> "
+                     "[--active-open <ip>:<port> --source-port <port>]\n",
                      argv[0]);
         return 1;
     }
@@ -536,6 +605,22 @@ int main(int argc, char** argv) {
     // `tcp_connections` but owned separately -- the TCP connection table
     // has no HTTP knowledge.
     std::map<wirestack::TcpConnectionKey, wirestack::HttpConnectionState> http_sessions;
+
+    // Opt-in active open (see parseActiveOpenArgs): at most one configured
+    // connection, started exactly once as soon as the peer's MAC is known
+    // through the existing ARP cache. Absent by default.
+    auto active_open_config = parseActiveOpenArgs(argc, argv);
+    bool active_open_started = false;
+    std::optional<wirestack::TcpConnectionKey> active_open_key;
+    if (active_open_config) {
+        active_open_key = wirestack::TcpConnectionKey{
+            *local_ip, active_open_config->source_port, active_open_config->remote_ip,
+            active_open_config->remote_port};
+        std::printf("tcp: active open pending dst=%s:%u src_port=%u (waiting for peer MAC)\n",
+                    active_open_config->remote_ip.toString().c_str(),
+                    static_cast<unsigned int>(active_open_config->remote_port),
+                    static_cast<unsigned int>(active_open_config->source_port));
+    }
 
     std::array<std::byte, kReceiveBufferSize> buffer{};
     for (;;) {
@@ -591,6 +676,27 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (active_open_config && !active_open_started) {
+            if (auto mac = arp_cache.lookup(active_open_config->remote_ip)) {
+                auto now = wirestack::TcpClock::now();
+                auto connect_result = tcp_connections.beginConnect(*active_open_key, now);
+                active_open_started = true; // one attempt only, regardless of outcome
+                if (connect_result.accepted && connect_result.syn) {
+                    std::printf("tcp: active open started dst=%s:%u src_port=%u\n",
+                                active_open_config->remote_ip.toString().c_str(),
+                                static_cast<unsigned int>(active_open_config->remote_port),
+                                static_cast<unsigned int>(active_open_config->source_port));
+                    sendTcpSegment(tap, *local_ip, *local_mac, active_open_config->remote_ip, *mac,
+                                   *connect_result.syn);
+                } else {
+                    std::printf("tcp: active open rejected dst=%s:%u src_port=%u\n",
+                                active_open_config->remote_ip.toString().c_str(),
+                                static_cast<unsigned int>(active_open_config->remote_port),
+                                static_cast<unsigned int>(active_open_config->source_port));
+                }
+            }
+        }
+
         auto now = wirestack::TcpClock::now();
         auto due = tcp_connections.pollRetransmissions(now);
         for (const auto& retransmission : due.retransmissions) {
@@ -616,9 +722,15 @@ int main(int argc, char** argv) {
             sendTcpSegment(tap, *local_ip, *local_mac, probe.key.remote_ip, *mac, probe.segment);
         }
         for (const auto& key : due.timed_out) {
-            std::printf("tcp: connection to %s:%u timed out after %d retransmissions\n",
-                        key.remote_ip.toString().c_str(), static_cast<unsigned int>(key.remote_port),
-                        wirestack::kMaxRetransmits);
+            if (active_open_key && key == *active_open_key) {
+                std::printf("tcp: active connection to %s:%u timed out after %d retransmissions\n",
+                            key.remote_ip.toString().c_str(),
+                            static_cast<unsigned int>(key.remote_port), wirestack::kMaxRetransmits);
+            } else {
+                std::printf("tcp: connection to %s:%u timed out after %d retransmissions\n",
+                            key.remote_ip.toString().c_str(),
+                            static_cast<unsigned int>(key.remote_port), wirestack::kMaxRetransmits);
+            }
             http_sessions.erase(key);
         }
         for (const auto& key : due.time_wait_expired) {
