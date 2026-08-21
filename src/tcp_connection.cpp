@@ -1240,7 +1240,13 @@ TcpReceiveResult TcpConnectionTable::handleTimeWait(const TcpConnectionKey& key,
 TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
                                              const TcpSegment& segment,
                                              TcpClock::time_point now) {
-    if (key.local_port != listen_port_) {
+    auto it = connections_.find(key);
+
+    // A local port other than the configured listen port is only valid
+    // when it already has active-open connection state (beginConnect
+    // uses an arbitrary caller-supplied source port, not the listen
+    // port) -- otherwise it is genuinely unbound.
+    if (it == connections_.end() && key.local_port != listen_port_) {
         // Unbound port: never respond to an incoming RST; everything
         // else gets a closed-port reset.
         if (segment.flags.rst) {
@@ -1250,8 +1256,6 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
         result.reply = makeClosedPortReset(segment);
         return result;
     }
-
-    auto it = connections_.find(key);
 
     if (it == connections_.end()) {
         if (segment.flags.rst) {
