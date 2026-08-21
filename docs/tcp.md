@@ -3,17 +3,20 @@
 ## Current support
 
 Passive three-way handshake with SYN-carried MSS/Window Scale option
-negotiation, MSS-bounded outgoing segmentation within the peer's
-advertised (and, when negotiated, scaled) send window and a Reno-style
-congestion window, bounded out-of-order receive reassembly with
-duplicate/overlap trimming, RTT measurement with an adaptive
-SRTT/RTTVAR/RTO estimator driving timeout-based retransmission of
-SYN-ACK/data/FIN, duplicate-ACK fast retransmit and classic fast
-recovery, passive/active/simultaneous close with a deterministic
-TIME_WAIT, and acceptable-inbound-RST/closed-port-RST handling, over
-IPv4, on a single fixed listening port (8080). No active open, no SACK,
-no NewReno partial-ACK recovery, no CUBIC/BBR, no ECN, no timestamps.
-Port 8080 hosts the minimal HTTP/1.0 demonstration described in
+negotiation, a bounded per-connection application send buffer with
+ACK/window-update-driven scheduling into MSS-bounded outgoing
+segmentation within the peer's advertised (and, when negotiated, scaled)
+send window and a Reno-style congestion window, bounded out-of-order
+receive reassembly with duplicate/overlap trimming, RTT measurement with
+an adaptive SRTT/RTTVAR/RTO estimator driving timeout-based
+retransmission of SYN-ACK/data/FIN, duplicate-ACK fast retransmit and
+classic fast recovery, a deterministic zero-window persist probe,
+passive/active/simultaneous close (with FIN deferred until all queued
+application bytes enter sequence space) and a deterministic TIME_WAIT,
+and acceptable-inbound-RST/closed-port-RST handling, over IPv4, on a
+single fixed listening port (8080). No active open, no SACK, no NewReno
+partial-ACK recovery, no CUBIC/BBR, no ECN, no timestamps. Port 8080
+hosts the minimal HTTP/1.0 demonstration described in
 [docs/http.md](http.md), not a raw byte echo -- this file covers only
 TCP itself.
 
@@ -218,15 +221,17 @@ local path MSS:           1460 bytes  (wirestack::kTcpMss -- always advertised, 
 default peer MSS:          536 bytes  (wirestack::kDefaultPeerMss -- used only when the SYN omits an MSS option)
 ```
 
-`makeOutgoingData` segments a send into `ceil(N / effective_send_mss)`
-chunks, where `effective_send_mss = min(kTcpMss, peer_mss)` was fixed at
-handshake time (see "TCP options" above) -- so a peer that omits an MSS
-option or advertises less than 1460 gets correspondingly smaller
-outgoing segments, while a peer advertising more than 1460 never causes
-Wirestack to exceed its own path MSS. A single application send whose
-segmentation would need more than `kMaxSegmentsPerSend` (128) segments is
-rejected atomically (`TcpSendError::TooLarge`) rather than partially
-queued.
+The scheduler (see "Send buffering and scheduling" below) segments
+queued bytes into `effective_send_mss`-bounded chunks, where
+`effective_send_mss = min(kTcpMss, peer_mss)` was fixed at handshake
+time (see "TCP options" above) -- so a peer that omits an MSS option or
+advertises less than 1460 gets correspondingly smaller outgoing
+segments, while a peer advertising more than 1460 never causes Wirestack
+to exceed its own path MSS. `kMaxSegmentsPerSend` (128) bounds each
+individual scheduling pass rather than the whole enqueue: with a tiny
+negotiated peer MSS and a large window/congestion allowance, one ACK's
+scheduling pass emits at most 128 segments, and any remainder is simply
+scheduled by a later ACK/window update.
 
 ## Send window
 
@@ -254,23 +259,23 @@ send_available = min(rwnd_available, cwnd_available)
 ```
 
 An application send of `N` bytes (`makeOutgoingData`, capped at
-`kMaxApplicationSendSize` = 65535 bytes regardless of window) is
-permitted only when `N <= send_available`; on rejection the smaller/
-binding limit is reported (`TcpSendError::WindowTooSmall` for the peer
-window, `::CongestionWindowTooSmall` for the congestion window -- a tie
-reports `WindowTooSmall`, an arbitrary but documented choice since either
-is equally true). A local FIN requires `rwnd_available >= 1` only --
-see "Congestion control" below for why FIN is not additionally gated by
-`cwnd`. A zero window (either one) blocks all new payload sends but does
-not block anything else: ACK and RST processing continue normally, and
-already-outstanding (unacknowledged) segments still retransmit --
-whether by timeout or by duplicate-ACK fast retransmit -- regardless of
-either available value, since a retransmission is not new data and
-consumes no additional allowance. There is no persist timer and no
-zero-window probe, so once the peer window is genuinely zero and nothing
-is outstanding, Wirestack simply waits for the peer to advertise room;
-callers must retry a rejected send later themselves, since there is no
-internal send queue.
+`kMaxApplicationSendSize` = 65535 bytes regardless of window, a single
+enqueue call's own bound) is enqueued atomically regardless of
+`send_available` (see "Send buffering and scheduling" below); only
+`send_available` bytes of it are scheduled onto the wire immediately, and
+the rest waits in the send buffer's unsent queue for a later ACK/window
+update. A local FIN requires `rwnd_available >= 1` only -- see
+"Congestion control" below for why FIN is not additionally gated by
+`cwnd`. A zero window (either one) blocks scheduling new payload bytes
+but does not block anything else: ACK and RST processing continue
+normally, and already-outstanding (unacknowledged) segments still
+retransmit -- whether by timeout or by duplicate-ACK fast retransmit --
+regardless of either available value, since a retransmission is not new
+data and consumes no additional allowance. When the peer window is
+genuinely zero, unsent data is queued, and nothing is outstanding, a
+narrow zero-window persist probe eventually fires -- see "Zero-window
+persist" below for the exact scope; outstanding data under a zero window
+still just waits on ordinary retransmission timing, not persist.
 
 ## Receive windows and reassembly
 
@@ -567,14 +572,15 @@ no growth step can overflow `uint32_t`.
 
 ### New-data send limit
 
-`makeOutgoingData` gates every application send by both the peer window
+Scheduling queued bytes onto the wire is gated by both the peer window
 and the congestion window (see "Send window" above for the exact
-`send_available` formula and the `WindowTooSmall`/
-`CongestionWindowTooSmall` error split). A FIN is gated by the peer
-window only, not by `cwnd` -- a narrow, documented choice for this
-milestone rather than a claim that FIN should never interact with
-congestion control. Congestion-window growth counts only application-data
-bytes: acknowledging a SYN, a FIN, or a pure ACK never grows `cwnd`.
+`send_available` formula); enqueue itself is gated only by send-buffer
+capacity, not by either window (see "Send buffering and scheduling"
+below). A FIN is gated by the peer window only, not by `cwnd` -- a
+narrow, documented choice for this milestone rather than a claim that
+FIN should never interact with congestion control. Congestion-window
+growth counts only application-data bytes: acknowledging a SYN, a FIN,
+or a pure ACK never grows `cwnd`.
 
 ### ACK retirement's byte accounting
 
@@ -717,6 +723,91 @@ never regresses, relying on the `uint64_t`-then-clamp arithmetic
 formulas) to rule out overflow rather than literally driving `cwnd` to
 the bound.
 
+## Send buffering and scheduling
+
+A bounded, owned, per-connection application send buffer, replacing the
+previous atomic-only `makeOutgoingData` (which either fully segmented a
+payload immediately or rejected it outright for window/congestion
+reasons). There is exactly one send implementation now: enqueue, then
+schedule -- `makeOutgoingData` is a thin wrapper over it, and it is also
+the entry point ACK-driven scheduling and persist recovery use.
+
+### Capacity
+
+```text
+send-buffer capacity: 262144 bytes  (wirestack::kTcpSendBufferCapacity, 256 * 1024)
+```
+
+Charged bytes = `unsent.size()` (FIFO backlog not yet in sequence space)
+plus the payload size of every non-SYN/FIN pending transmission
+(application bytes already in sequence space but not yet acknowledged).
+Moving bytes from `unsent` into a pending entry during scheduling does
+not change this total -- it is never double-counted, and a retransmission
+(timeout or fast) reuses the same pending entry's payload rather than
+creating a new one, so it never counts twice either. Capacity is
+released only when application bytes are cumulatively or partially
+acknowledged (see "Retransmission" above for the underlying trim logic)
+or the connection is removed.
+
+### Enqueue
+
+`makeOutgoingData` enqueues atomically: the capacity check happens before
+any bytes are copied, and on any rejection (unknown connection; not
+Established/CloseWait; close already requested; empty payload; a single
+call exceeding `kMaxApplicationSendSize`; or exceeding the buffer's
+remaining capacity, `TcpSendError::BufferFull`) no bytes are queued and
+no connection state changes. On acceptance, bytes from separate enqueue
+calls remain strictly FIFO-ordered, and the scheduler may coalesce
+adjacent bytes from different calls into one MSS-sized segment --
+application call boundaries have no wire-format meaning.
+
+### Scheduler
+
+Every enqueue and every valid ACK-bearing segment (see "ACK-driven
+scheduling" below) attempts to convert queued bytes into segments:
+
+```text
+flight          = snd_nxt - snd_una
+rwnd_available  = flight >= snd_wnd ? 0 : snd_wnd - flight
+cwnd_available  = flight >= cwnd    ? 0 : cwnd - flight
+send_available  = min(rwnd_available, cwnd_available)
+to_send         = min(send_available, unsent.size(), kMaxSegmentsPerSend * effective_send_mss)
+```
+
+The `kMaxSegmentsPerSend * effective_send_mss` term bounds one
+scheduling pass to at most `kMaxSegmentsPerSend` (128) segments
+regardless of how large `cwnd`/`snd_wnd` have grown -- relevant only
+with a tiny negotiated peer MSS; any remainder is simply scheduled by a
+later ACK/window update. Each emitted segment gets
+`sequence_number = snd_nxt` for that chunk, `acknowledgment_number =
+rcv_nxt`, `ACK` set, the current advertised receive window, and the next
+FIFO bytes; `PSH` is set only on the segment that drains `unsent`
+completely for this pass -- not merely because this pass's allowance was
+exhausted while more application data remains queued. One pending
+transmission is registered per emitted segment; `snd_nxt` advances by
+exactly the emitted total; nothing is emitted (not an error) when no
+allowance exists. Once `unsent` is empty, the same pass attempts to
+sequence a deferred FIN (see "Connection close" below).
+
+### ACK-driven scheduling
+
+After validating an ACK (existing retirement, RTT, and Reno-growth
+processing -- see "Retransmission" and "Congestion control" above,
+unchanged), the connection is rescheduled immediately if it remains in
+Established/CloseWait and is not about to be removed. The resulting
+segments are returned via `TcpReceiveResult::scheduled`, in ascending
+sequence order, alongside a possible `fast_retransmit`; `main.cpp` sends
+both through the current received frame's immediate-reply path. A
+scheduled segment already carries a valid ACK, so `handle()` clears
+`reply` whenever `scheduled` is non-empty rather than also emitting a
+redundant pure ACK. No application call or timer tick is required for an
+advancing ACK (or a fresh window update with `snd_wnd: 0 -> positive`,
+validated by the existing SND.WL1/WL2 freshness test) to release queued
+bytes -- malformed segments, a bad checksum, a future ACK, a stale ACK,
+an unacceptable window update, an invalid RST, and connection removal
+all continue to schedule nothing, matching their existing rejection
+paths.
+
 ## Connection close
 
 ### FIN sequence accounting
@@ -750,12 +841,27 @@ FIN leaves the connection in `LastAck` unchanged.
 
 ### Application-initiated (active) close
 
-`TcpConnectionTable::beginClose(key, now)` builds a `FIN|ACK` segment
-(`sequence_number = snd_nxt`, `acknowledgment_number = rcv_nxt`, no
-payload), queues it, advances `snd_nxt` by one, and moves `Established ->
-FinWait1`. It rejects (returns `nullopt`, no state change) every other
-state, including a second call in `FinWait1` itself -- calling it twice
-never creates a second FIN. The peer's ACK of the local FIN moves
+`TcpConnectionTable::beginClose(key, now)` returns a `TcpCloseResult`
+(`accepted`, `fin`). It records close intent (`accepted = true`,
+idempotent -- a repeated call while still pending is a harmless no-op)
+only from Established or CloseWait; every other state (already closing,
+reset, unknown) leaves `accepted = false` and changes nothing. Once
+accepted, no further `makeOutgoingData` calls are accepted for this
+connection (`NotSendable`). The FIN itself (`sequence_number = snd_nxt`,
+`acknowledgment_number = rcv_nxt`, no payload, `Established -> FinWait1`
+or `CloseWait -> LastAck`) is sequenced only once the send buffer's
+`unsent` queue is empty and at least one byte of peer send window is
+available -- never gated by `cwnd`, matching every other FIN
+requirement. If bytes are still queued or the window is exhausted,
+`beginClose` returns `fin = nullopt`: the close intent is retained, and
+the same scheduling pass that eventually drains `unsent` (see "Send
+buffering and scheduling" above -- triggered by a later ACK/window
+update, not a second `beginClose` call) sequences the FIN automatically,
+guaranteeing it never precedes unsent application bytes in sequence
+space. Once sequenced, it is queued through the same `PendingTransmission`
+mechanism as before (retransmitted, ACK-retired, backed off) exactly
+once -- repeated scheduling passes never create a second FIN, since
+`local_fin_seq` is checked first. The peer's ACK of the local FIN moves
 `FinWait1 -> FinWait2`; the peer's subsequent FIN in `FinWait2` is
 accepted, ACKed, and enters `TimeWait`.
 
@@ -782,6 +888,101 @@ state, and is not queued -- it gets a freshly built pure ACK and restarts
 the 60-second deadline. Any other traffic in `TimeWait` (a SYN, a
 non-empty payload, an ordinary ACK) is dropped. When the deadline expires,
 the connection is removed with no further traffic.
+
+## Zero-window persist
+
+A narrow, deterministic persist mechanism, deliberately scoped to a
+single case: probing a genuinely zero peer window when nothing is
+already outstanding. It does not probe while data remains outstanding
+under a zero window -- that continues to use the ordinary retransmission
+timer described above, unchanged; the two timers never compete for the
+same connection.
+
+### Eligibility
+
+Persist is armed only when *all* of the following hold, and cancelled
+(deadline cleared) the instant any stops holding:
+
+```text
+connection is Established or CloseWait
+unsent application bytes exist (the send buffer's unsent queue is non-empty)
+peer send window snd_wnd == 0
+snd_nxt == snd_una (no sequence space outstanding)
+no FIN has been sequenced yet
+```
+
+`snd_nxt == snd_una` is what separates this from ordinary retransmission:
+a zero window with outstanding data is not persist-eligible, and stays
+on the existing retransmission timer. Persist does not arm merely
+because `cwnd` is full, a *nonzero* peer window is fully consumed, only
+a deferred FIN remains, there is no unsent data, or the connection is
+outside Established/CloseWait.
+
+`updatePersistState` re-evaluates eligibility after every operation that
+can change it (enqueue, ACK/window-update processing, scheduling): if
+newly eligible it arms at the initial interval; if no longer eligible it
+clears the deadline; if already armed, it leaves the deadline/backoff
+untouched -- a zero-window ACK that changes nothing, or a fresh enqueue
+while already armed, must not reset the backoff back to the 1-second
+floor.
+
+### Backoff
+
+```text
+initial interval: 1 second   (wirestack::kInitialPersistInterval)
+maximum interval: 60 seconds (wirestack::kMaxPersistInterval)
+backoff:          x2, capped, no retry exhaustion
+```
+
+Sequence: 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, ... indefinitely (unlike
+ordinary retransmission, persist never gives up and removes the
+connection on its own).
+
+### Probe
+
+`pollPersistProbes(now)` emits one segment per connection whose deadline
+has passed, deliberately narrow to the no-outstanding-data case this
+milestone covers:
+
+```text
+sequence number       = snd_nxt - 1   (wraps naturally: snd_nxt == 0 -> 0xffffffff)
+acknowledgment number = rcv_nxt
+flags                  = ACK
+window                 = current advertised receive window
+payload                = the first unsent application byte (copied, not moved)
+options                = none
+```
+
+The probe consumes no sequence space and creates no `PendingTransmission`
+-- it does not advance `snd_nxt` or `snd_una`, does not remove the byte
+from `unsent`, does not change buffered-byte accounting, does not touch
+`cwnd`/`ssthresh`/duplicate-ACK state, and is not evidence of loss for
+Karn's rule or the RTO estimator. Repeated probes before a window update
+reuse the same sequence number and the same queued byte. It is never
+marked `PSH`.
+
+### Cancellation and reopening
+
+Cancelled by: an acceptable peer-window update making `snd_wnd > 0`
+(same SND.WL1/WL2 freshness test as ordinary window updates); the unsent
+queue becoming empty; outstanding sequence space appearing; the
+connection leaving Established/CloseWait; or connection removal (RST,
+timeout exhaustion, close completion, TIME_WAIT expiry). When
+`snd_wnd` becomes positive, the very next scheduling pass (see "Send
+buffering and scheduling" above) starts normal data at the *unchanged*
+`snd_nxt` -- the byte the probe used becomes the first byte of that
+normal segment, never lost, skipped, or duplicated. If the same
+connection later becomes zero-window-eligible again, persist restarts at
+the 1-second floor.
+
+### Timer integration
+
+`nextPersistDeadline()` joins `nextRetransmissionDeadline()` in sizing
+the TAP event loop's `poll()` timeout (the smaller of the two). A
+timer-fired probe uses the same timer-originated send path as an
+ordinary retransmission -- `ArpCache` neighbor lookup, never a received
+frame's MAC, since there is no current received frame for a timer event.
+TCP connection state stores no MAC addresses either way.
 
 ## Reset handling
 
@@ -885,6 +1086,22 @@ REQUIRED` when this has not been exercised in the current environment
 (e.g. no `CAP_NET_ADMIN` or usable non-interactive sudo) -- do not
 fabricate tcpdump evidence.
 
+To exercise zero-window persist live, the peer must deliberately
+advertise a zero receive window with an empty socket receive buffer
+(e.g. `nc -l` reading nothing, or a small Python socket with `SO_RCVBUF`
+set to 0 and never calling `recv`) while Wirestack has queued data to
+send it -- only attempt this against the same dedicated, isolated TAP
+setup, never a shared interface. Expect tcpdump to show the peer's
+`Flags [.] win 0`, Wirestack's own one-byte probe roughly one second
+later (`seq` one behind its current send sequence, not advancing it),
+the peer's repeated zero-window ACK, and -- once the peer's window
+genuinely reopens -- Wirestack's normal data resuming at the *same*
+sequence number the probe used. `LIVE PERSIST: MANUAL VERIFICATION
+REQUIRED` when this has not been exercised in the current environment;
+do not fabricate tcpdump evidence, and do not claim persist is
+live-proven without seeing all of: the zero-window advertisement, the
+probe, and the reopening update.
+
 ## Known limitations
 
 - Only MSS and Window Scale options are understood; SACK-permitted and
@@ -901,12 +1118,17 @@ fabricate tcpdump evidence.
 - The RTT/RTO estimator is an integer-arithmetic approximation of
   RFC 6298 (Karn's rule, SRTT/RTTVAR/RTO, 1s/60s bounds), not a claim of
   full RFC 6298 compliance.
-- No zero-window persist timer or probe -- Wirestack waits for the peer
-  to advertise room; a rejected send must be retried by the caller.
-- No application-level send queue -- an atomic send is either fully
-  accepted or fully rejected, never partially buffered internally; an
-  inflated fast-recovery `cwnd` may go unused if the caller has nothing
-  queued to send into it.
+- Persist probes only the single case documented under "Zero-window
+  persist" above: unsent data queued, a genuinely zero peer window, and
+  no sequence space already outstanding. Outstanding data under a zero
+  window continues to use ordinary retransmission timing, not persist.
+- No application-facing asynchronous write API and no partial enqueue --
+  `makeOutgoingData` is synchronous and all-or-nothing at enqueue time;
+  the send buffer itself is a plain owned `std::vector<std::byte>`, not
+  zero-copy.
+- An inflated fast-recovery `cwnd` may go unused if the caller has
+  nothing queued to send into it (there is still no automatic background
+  sender beyond what an ACK/window update schedules).
 - `kMaxCongestionWindow` (`1 << 30` bytes) is not organically reachable
   through a practical deterministic test -- see "Testing limitation"
   under "Congestion control" above.
@@ -914,10 +1136,12 @@ fabricate tcpdump evidence.
   bounded to a 262140-byte internal capacity and 128 fragments, not
   general attack-resistant TCP normalization; the wire-visible advertised
   window still never exceeds 65535 unless Window Scale was negotiated.
+  This is the *receive*-side reassembly buffer and is fully independent
+  of the new *send*-side buffer above -- distinct names, distinct
+  accounting, distinct capacities.
 - Single application on port 8080 (the HTTP/1.0 demonstration, see
   [docs/http.md](http.md)); no general application registration.
 
 ## Next TCP work
 
-Bounded TCP send buffering, ACK-driven transmission scheduling, and
-zero-window persist probes.
+No further milestone is currently scoped.

@@ -248,7 +248,9 @@ int main() {
         CHECK(parsed_resp.has_value());
         if (parsed_resp) CHECK(parsed_resp->tcp.payload == response_bytes);
 
-        auto fin = connections.beginClose(key, t0);
+        auto fin_result = connections.beginClose(key, t0);
+        CHECK(fin_result.accepted);
+        auto fin = fin_result.fin;
         CHECK(fin.has_value());
         CHECK(connections.stateOf(key) == TcpState::FinWait1);
 

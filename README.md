@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 12 (Reno-style TCP
-congestion control):
+Milestone 0 (project foundation) through Milestone 13 (bounded TCP send
+buffering, ACK-driven scheduling, and zero-window persist probes):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,7 +18,7 @@ congestion control):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake with SYN-carried MSS/Window Scale option negotiation, MSS-bounded segmentation within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly, RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit/fast recovery, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
+| TCP         | passive handshake with SYN-carried MSS/Window Scale option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly, RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit/fast recovery, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
 | HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented and deterministically tested; live curl verification still required |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -35,13 +35,17 @@ congestion control):
   SYN_RECEIVED / ESTABLISHED) that parses and negotiates a SYN's MSS and
   Window Scale options (IPv4 default 536-byte MSS fallback, Window Scale
   clamped to 14, both fixed for the connection's lifetime), sequence-space
-  tracking, MSS-bounded outgoing segmentation (sized to the negotiated
-  peer MSS, atomically capped at 128 segments per send) with atomic
-  peer-send-window enforcement, bounded out-of-order receive reassembly
-  (first-arrival-wins overlap trimming, a 262140-byte/128-fragment
-  internal bound, out-of-order FIN retention) with a dynamically
-  advertised, correctly scaled-when-negotiated receive window, cumulative
-  ACK processing, RTT sampling with Karn's rule (triggered by either a
+  tracking, a bounded (262144-byte) per-connection application send
+  buffer with atomic enqueue/backpressure and FIFO ordering across
+  enqueue calls, scheduled by every ACK/window update into
+  effective-MSS-bounded segments (sized to the negotiated peer MSS,
+  capped at 128 segments per scheduling pass) gated by both the peer send
+  window and the congestion window, bounded out-of-order receive
+  reassembly (first-arrival-wins overlap trimming, a
+  262140-byte/128-fragment internal bound, out-of-order FIN retention)
+  with a dynamically advertised, correctly scaled-when-negotiated receive
+  window, cumulative and partial ACK processing with matching send-buffer
+  capacity release, RTT sampling with Karn's rule (triggered by either a
   timeout or a duplicate-ACK fast retransmit) feeding an adaptive
   SRTT/RTTVAR/RTO estimator (1s/60s bounds) that drives timeout-based
   retransmission of SYN-ACK/data/FIN with cumulative/partial ACK
@@ -49,9 +53,12 @@ congestion control):
   window sized from the negotiated MSS, Slow Start, Congestion Avoidance,
   precise duplicate-ACK classification, third-duplicate-ACK fast
   retransmit, classic fast recovery, and timeout congestion collapse, all
-  gating new application data alongside the peer's advertised window),
+  gating new application data alongside the peer's advertised window), a
+  deterministic zero-window persist probe (1s-60s exponential backoff,
+  narrowly scoped to unsent data with no sequence space outstanding),
   passive/active/simultaneous close
-  (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a deterministic
+  (FinWait1/FinWait2/CloseWait/Closing/LastAck, FIN deferred until all
+  queued application bytes enter sequence space) with a deterministic
   60-second TIME_WAIT, acceptable-inbound-RST handling, and closed-port
   RST generation
 - A bounded, stateless HTTP/1.0 request parser (`wirestack::http`) layered
@@ -77,7 +84,8 @@ manually verifiable but has not been exercised in every development
 environment this project has run in — see those docs for exact commands.
 
 Not implemented: TCP active-open/NewReno partial-ACK recovery/SACK/
-CUBIC/BBR/ECN/timestamps/zero-window probes, HTTP/1.1/keep-alive/
+CUBIC/BBR/ECN/timestamps (persist is implemented, but only for the
+narrow no-outstanding-data case -- see docs/tcp.md), HTTP/1.1/keep-alive/
 pipelining/request bodies/chunked encoding/TLS, IPv4 options,
 fragmentation, routing.
 

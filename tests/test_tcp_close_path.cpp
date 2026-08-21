@@ -169,7 +169,9 @@ int main() {
         CHECK(echo_segment.acknowledgment_number ==
               hs->syn.sequence_number + 1 + payload_text.size() + 1); // covers payload + FIN
 
-        auto local_fin = connections.beginClose(key, t0);
+        auto local_fin_result = connections.beginClose(key, t0);
+        CHECK(local_fin_result.accepted);
+        auto local_fin = local_fin_result.fin;
         CHECK(local_fin.has_value());
         CHECK(connections.stateOf(key) == TcpState::LastAck);
         if (!local_fin) return wirestack::test::failureCount() == 0 ? 0 : 1;
@@ -227,7 +229,9 @@ int main() {
         CHECK(hs.has_value());
         if (!hs) return wirestack::test::failureCount() == 0 ? 0 : 1;
 
-        auto local_fin = connections.beginClose(key, t0);
+        auto local_fin_result = connections.beginClose(key, t0);
+        CHECK(local_fin_result.accepted);
+        auto local_fin = local_fin_result.fin;
         CHECK(local_fin.has_value());
         CHECK(connections.stateOf(key) == TcpState::FinWait1);
         if (!local_fin) return wirestack::test::failureCount() == 0 ? 0 : 1;

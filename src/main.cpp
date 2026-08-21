@@ -346,6 +346,14 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *result.fast_retransmit);
     }
 
+    // Application-data segments scheduled by this ACK/window update
+    // because it opened new peer-window or congestion-window allowance
+    // (see docs/tcp.md) -- sent through the same immediate-reply path,
+    // addressed using the current received frame.
+    for (const auto& scheduled_segment : result.scheduled) {
+        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, scheduled_segment);
+    }
+
     if (!result.accepted_payload.empty()) {
         std::printf("tcp data src=%s:%u len=%zu\n", ip_packet.source.toString().c_str(),
                     static_cast<unsigned int>(segment.source_port),
@@ -391,20 +399,32 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
             if (response) {
                 session.responded = true;
                 auto response_bytes = wirestack::serializeHttpResponse(*response);
+                // Enqueues the complete response atomically into TCP's
+                // bounded send buffer; `sent.segments` carries whatever
+                // the current peer-window/congestion-window allowance
+                // lets out immediately -- it may be empty (the response
+                // still fully enqueued) if there is no allowance yet, in
+                // which case a later ACK/window update schedules the
+                // rest (see TcpReceiveResult::scheduled above). HTTP
+                // itself has no notion of TCP windows or sequence
+                // numbers.
                 auto sent = connections.makeOutgoingData(key, response_bytes, now);
-                if (!sent.segments.empty()) {
+                if (!sent.error) {
                     for (const auto& response_segment : sent.segments) {
                         sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame,
                                      response_segment);
                     }
-                    // Never close before the response segment(s) were
-                    // successfully constructed above.
-                    auto fin = connections.beginClose(key, now);
-                    if (fin) {
-                        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame, *fin);
+                    // Close is requested once the response is fully
+                    // accepted into the send buffer, not once it is fully
+                    // on the wire -- TCP itself defers the FIN until every
+                    // response byte has entered sequence space.
+                    auto close_result = connections.beginClose(key, now);
+                    if (close_result.fin) {
+                        sendTcpReply(tap, local_ip, local_mac, ip_packet, eth_frame,
+                                     *close_result.fin);
                     }
                 } else {
-                    std::printf("http: failed to construct response segment for src=%s:%u\n",
+                    std::printf("http: failed to enqueue response for src=%s:%u\n",
                                 ip_packet.source.toString().c_str(),
                                 static_cast<unsigned int>(segment.source_port));
                 }
@@ -520,10 +540,16 @@ int main(int argc, char** argv) {
     std::array<std::byte, kReceiveBufferSize> buffer{};
     for (;;) {
         // Size the poll timeout to the earliest pending TCP retransmission
-        // deadline (if any) so retransmissions fire even when no packet
-        // arrives, without busy-looping.
+        // or zero-window persist deadline (if any) so timers fire even
+        // when no packet arrives, without busy-looping.
         int timeout_ms = -1;
-        if (auto deadline = tcp_connections.nextRetransmissionDeadline()) {
+        auto retransmission_deadline = tcp_connections.nextRetransmissionDeadline();
+        auto persist_deadline = tcp_connections.nextPersistDeadline();
+        std::optional<wirestack::TcpClock::time_point> deadline = retransmission_deadline;
+        if (persist_deadline && (!deadline || *persist_deadline < *deadline)) {
+            deadline = persist_deadline;
+        }
+        if (deadline) {
             auto now = wirestack::TcpClock::now();
             auto remaining = *deadline > now
                                   ? std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -577,6 +603,17 @@ int main(int argc, char** argv) {
             }
             sendTcpSegment(tap, *local_ip, *local_mac, retransmission.key.remote_ip, *mac,
                            retransmission.segment);
+        }
+        auto persist_due = tcp_connections.pollPersistProbes(now);
+        for (const auto& probe : persist_due.probes) {
+            auto mac = arp_cache.lookup(probe.key.remote_ip);
+            if (!mac) {
+                std::printf("tcp: cannot send persist probe to %s:%u: no known MAC address\n",
+                            probe.key.remote_ip.toString().c_str(),
+                            static_cast<unsigned int>(probe.key.remote_port));
+                continue;
+            }
+            sendTcpSegment(tap, *local_ip, *local_mac, probe.key.remote_ip, *mac, probe.segment);
         }
         for (const auto& key : due.timed_out) {
             std::printf("tcp: connection to %s:%u timed out after %d retransmissions\n",
