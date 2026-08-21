@@ -127,6 +127,7 @@ ws_capture_start() {
     tcpdump -i "${iface}" -w "${pcap}" -U -l -s 0 -n >"${WS_EVIDENCE_DIR}/${name}.tcpdump.log" 2>&1 &
     local pid=$!
     echo "${pid}" >"${WS_EVIDENCE_DIR}/${name}.tcpdump.pid"
+    ws_record_identity "${pid}" "${WS_EVIDENCE_DIR}/${name}.tcpdump.pid" tcpdump
     # The pcap file gets its 24-byte global header as soon as tcpdump
     # opens the output, well before its capture socket is actually bound
     # -- wait for tcpdump's own "listening on" message instead, or the
@@ -167,6 +168,111 @@ ws_capture_stop() {
     # arithmetic (closed-port reset fields, retransmission identity).
     tcpdump -r "${WS_EVIDENCE_DIR}/${name}.pcap" -n -tttt -vv -S \
         >"${WS_EVIDENCE_DIR}/${name}.abs.txt" 2>/dev/null || true
+}
+
+# --- resource ownership -----------------------------------------------
+#
+# cleanup.sh must only delete a fixed-name interface (ws-int-tap,
+# ws-host0, ws-int-br) when the current run's own evidence proves it
+# created that exact resource -- a standalone cleanup.sh invocation with
+# no run behind it must refuse, even if a same-named interface exists
+# (it could belong to a different, possibly still-running, invocation).
+
+ws_mark_owned() {
+    [ -n "${WS_EVIDENCE_DIR}" ] || ws_die "cannot record ownership without WS_EVIDENCE_DIR"
+    : >"${WS_EVIDENCE_DIR}/owned.$1"
+}
+
+ws_is_owned() {
+    [ -n "${WS_EVIDENCE_DIR}" ] && [ -f "${WS_EVIDENCE_DIR}/owned.$1" ]
+}
+
+# --- process identity ---------------------------------------------------
+#
+# A pid recorded early in a run can be reused by an unrelated process by
+# the time cleanup runs. Before signaling a recorded pid, cross-check its
+# /proc start time (which cannot be forged by a later process reusing the
+# same pid within the same boot) and its command name.
+
+ws_proc_start_ticks() {
+    local pid="$1"
+    [ -r "/proc/${pid}/stat" ] || return 1
+    # After the last ')', /proc/pid/stat fields are (1-indexed): state(1)
+    # ppid(2) pgrp(3) session(4) tty_nr(5) tpgid(6) flags(7) minflt(8)
+    # cminflt(9) majflt(10) cmajflt(11) utime(12) stime(13) cutime(14)
+    # cstime(15) priority(16) nice(17) num_threads(18) itrealvalue(19)
+    # starttime(20).
+    awk '{ n = split($0, a, ")"); split(a[n], b, " "); print b[20] }' "/proc/${pid}/stat"
+}
+
+ws_proc_comm() {
+    local pid="$1"
+    [ -r "/proc/${pid}/comm" ] || return 1
+    cat "/proc/${pid}/comm"
+}
+
+# Records the identity of `pid` (already known to be the process this run
+# just started) next to `pidfile`, as `<pidfile>.identity`. `expected_comm`
+# is the command name the process is expected to exec into; right after
+# fork the pid still carries its launching shell's comm until execve()
+# completes, so this polls briefly rather than recording a comm that is
+# about to change out from under it.
+ws_record_identity() {
+    local pid="$1" pidfile="$2" expected_comm="$3"
+    local comm="" waited=0
+    while :; do
+        comm="$(ws_proc_comm "${pid}" 2>/dev/null)" || ws_die "process ${pid} exited before becoming '${expected_comm}'"
+        [ "${comm}" = "${expected_comm}" ] && break
+        waited=$((waited + 1))
+        [ "${waited}" -gt 150 ] && ws_die "process ${pid} never became '${expected_comm}' (still '${comm}')"
+        sleep 0.02
+    done
+    local start
+    start="$(ws_proc_start_ticks "${pid}")" || ws_die "cannot read /proc/${pid}/stat to record identity"
+    printf '%s %s\n' "${start}" "${comm}" >"${pidfile}.identity"
+}
+
+# Returns success only if `pid` is still running and its start time and
+# command name match what was recorded for it. Used to refuse killing a
+# pid that has since been reused by an unrelated process.
+ws_verify_identity() {
+    local pid="$1" pidfile="$2"
+    local identity="${pidfile}.identity"
+    [ -f "${identity}" ] || return 1
+    local recorded_start recorded_comm
+    read -r recorded_start recorded_comm <"${identity}"
+    local cur_start cur_comm
+    cur_start="$(ws_proc_start_ticks "${pid}" 2>/dev/null)" || return 1
+    cur_comm="$(ws_proc_comm "${pid}" 2>/dev/null)" || return 1
+    [ "${cur_start}" = "${recorded_start}" ] && [ "${cur_comm}" = "${recorded_comm}" ]
+}
+
+# --- offload verification -----------------------------------------------
+#
+# GRO/TSO/GSO/checksum offload/scatter-gather on an interface in the
+# capture path can aggregate or split segments in ways that hide real
+# segment boundaries -- ws_setup_topology asks the kernel to disable them
+# with `ethtool -K`, but that request can be silently ignored by a driver.
+# Verify the *effective* state afterward instead of trusting the request.
+
+WS_OFFLOAD_FEATURES="tcp-segmentation-offload generic-segmentation-offload generic-receive-offload tx-checksumming rx-checksumming scatter-gather"
+
+# Runs `ethtool -k <iface>` via "$@" (so callers can prefix with
+# ws_in_client to check an interface inside the client namespace) and
+# dies if any offload relevant to packet-boundary correctness is still
+# effectively on.
+ws_verify_offloads_off() {
+    local iface="$1"
+    shift
+    local out
+    out="$("$@" ethtool -k "${iface}" 2>/dev/null)" || ws_die "ethtool -k ${iface} failed"
+    local feature line
+    for feature in ${WS_OFFLOAD_FEATURES}; do
+        line="$(printf '%s\n' "${out}" | grep -E "^[[:space:]]*${feature}:" | head -1)"
+        [ -n "${line}" ] || continue
+        printf '%s\n' "${line}" | grep -qE ': off' \
+            || ws_die "offload ${feature} remains enabled on ${iface} (needed off for packet-boundary correctness): ${line}"
+    done
 }
 
 # --- test result tracking ---------------------------------------------

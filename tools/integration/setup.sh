@@ -34,14 +34,17 @@ ws_setup_topology() {
         sleep 0.05
     done
     [ -e "/proc/${client_pid}/ns/net" ] || ws_die "client namespace did not appear (pid ${client_pid})"
+    ws_record_identity "${client_pid}" "$(ws_client_pidfile)" sleep
     ws_log "created client namespace (placeholder pid ${client_pid})"
 
     ws_log "creating bridge ${WS_BRIDGE}"
     ip link add "${WS_BRIDGE}" type bridge
+    ws_mark_owned bridge
     ip link set "${WS_BRIDGE}" up
 
     ws_log "creating veth pair ${WS_HOST_VETH} <-> ${WS_CLIENT_VETH}"
     ip link add "${WS_HOST_VETH}" type veth peer name "${WS_CLIENT_VETH}"
+    ws_mark_owned host_veth
     ip link set "${WS_HOST_VETH}" master "${WS_BRIDGE}"
     ip link set "${WS_HOST_VETH}" up
 
@@ -56,6 +59,8 @@ ws_setup_topology() {
     # payloads larger than any single Ethernet frame it will accept.
     ethtool -K "${WS_HOST_VETH}" tso off gso off gro off tx off rx off sg off >/dev/null 2>&1 || true
     ws_in_client ethtool -K "${WS_CLIENT_VETH}" tso off gso off gro off tx off rx off sg off >/dev/null 2>&1 || true
+    ws_verify_offloads_off "${WS_HOST_VETH}"
+    ws_verify_offloads_off "${WS_CLIENT_VETH}" ws_in_client
 
     ip link set "${WS_HOST_VETH}" mtu "${WS_MTU}"
     ws_in_client ip link set "${WS_CLIENT_VETH}" mtu "${WS_MTU}"
@@ -71,6 +76,9 @@ ws_start_wirestack() {
     "${WS_BINARY}" "${WS_TAP}" "${WS_SERVER_IP}" "${WS_SERVER_MAC}" >"${out}" 2>&1 &
     local ws_pid=$!
     echo "${ws_pid}" >"${WS_EVIDENCE_DIR}/${WS_WIRESTACK_PIDFILE_NAME}"
+    # /proc/<pid>/comm is truncated to 15 bytes by the kernel.
+    ws_record_identity "${ws_pid}" "${WS_EVIDENCE_DIR}/${WS_WIRESTACK_PIDFILE_NAME}" \
+        "$(basename "${WS_BINARY}" | cut -c1-15)"
 
     # Wait for wirestack to create and report the TAP interface rather
     # than sleeping a fixed, racy amount of time.
@@ -83,10 +91,12 @@ ws_start_wirestack() {
         [ "${waited}" -gt 100 ] && ws_die "timed out waiting for ${WS_TAP} to appear"
         sleep 0.05
     done
+    ws_mark_owned tap
 
     ip link set "${WS_TAP}" master "${WS_BRIDGE}"
     ip link set "${WS_TAP}" up
     ethtool -K "${WS_TAP}" tso off gso off gro off tx off rx off sg off >/dev/null 2>&1 || true
+    ws_verify_offloads_off "${WS_TAP}"
     ip link set "${WS_TAP}" mtu "${WS_MTU}"
 
     ws_log "wirestack running (pid ${ws_pid}), tap ${WS_TAP} attached to ${WS_BRIDGE}"
