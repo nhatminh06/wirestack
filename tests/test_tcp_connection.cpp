@@ -235,6 +235,54 @@ std::uint32_t establishWithPeerMss(TcpConnectionTable& table, const TcpConnectio
     return server_isn;
 }
 
+// SYN carrying MSS + SACK-Permitted (in that order, matching
+// buildSynAckOptions' fixed layout), and completes the handshake.
+std::uint32_t establishWithSack(TcpConnectionTable& table, const TcpConnectionKey& key,
+                                 std::uint32_t client_isn, TcpClock::time_point now = t0) {
+    std::vector<std::byte> options = {std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4},
+                                       std::byte{4}, std::byte{2}};
+    auto syn_ack = table
+                       .handle(key,
+                               makeSynWithOptions(key.local_port, key.remote_port, client_isn,
+                                                   options),
+                               now)
+                       .reply;
+    std::uint32_t server_isn = syn_ack ? syn_ack->sequence_number : 0;
+    table.handle(key, makeAck(key.local_port, key.remote_port, client_isn + 1, server_isn + 1),
+                 now);
+    return server_isn;
+}
+
+void appendUint32(std::vector<std::byte>& out, std::uint32_t value) {
+    out.push_back(static_cast<std::byte>((value >> 24) & 0xff));
+    out.push_back(static_cast<std::byte>((value >> 16) & 0xff));
+    out.push_back(static_cast<std::byte>((value >> 8) & 0xff));
+    out.push_back(static_cast<std::byte>(value & 0xff));
+}
+
+// An ACK carrying a SACK option built from `blocks` (left/right sequence
+// number pairs), zero-padded to a 4-byte boundary like the real encoder.
+TcpSegment makeAckWithSack(std::uint16_t local_port, std::uint16_t remote_port, std::uint32_t seq,
+                            std::uint32_t ack,
+                            const std::vector<std::pair<std::uint32_t, std::uint32_t>>& blocks) {
+    TcpSegment segment = makeAck(local_port, remote_port, seq, ack);
+    if (blocks.empty()) {
+        return segment;
+    }
+    std::vector<std::byte> options;
+    options.push_back(std::byte{5});
+    options.push_back(static_cast<std::byte>(2 + 8 * blocks.size()));
+    for (auto [left, right] : blocks) {
+        appendUint32(options, left);
+        appendUint32(options, right);
+    }
+    while (options.size() % 4 != 0) {
+        options.push_back(std::byte{0});
+    }
+    segment.options = std::move(options);
+    return segment;
+}
+
 } // namespace
 
 int main() {
@@ -5031,6 +5079,716 @@ int main() {
         CHECK(!result.scheduled.empty()); // window update still scheduled queued data
         for (const auto& seg : result.scheduled) {
             CHECK(seg.acknowledgment_number == 8001); // the unchanged rcv_nxt, not an advanced one
+        }
+    }
+
+    // ================= Milestone: SACK negotiation =================
+
+    // peer omits SACK-Permitted: sack_permitted stays false, SYN-ACK has
+    // only MSS
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto syn_ack = table.handle(key, makeSyn(8080, 54321, 1000), t0).reply;
+        CHECK(syn_ack.has_value());
+        if (syn_ack) CHECK(syn_ack->options == toBytes({0x02, 0x04, 0x05, 0xb4}));
+        table.handle(key, makeAck(8080, 54321, 1001, syn_ack ? syn_ack->sequence_number + 1 : 0),
+                     t0);
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(!snap->sack_permitted);
+    }
+
+    // peer offers SACK-Permitted: negotiated, SYN-ACK advertises it after
+    // MSS, exactly "02 04 05 b4 04 02 00 00"
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(snap->sack_permitted);
+    }
+
+    // exact SYN-ACK option bytes for all four negotiated combinations
+    {
+        // MSS only
+        TcpConnectionTable t1(8080);
+        TcpConnectionKey k1{localIp(), 8080, remoteIp(), 1};
+        auto r1 = t1.handle(k1, makeSyn(8080, 1, 1000), t0).reply;
+        CHECK(r1.has_value());
+        if (r1) CHECK(r1->options == toBytes({0x02, 0x04, 0x05, 0xb4}));
+
+        // MSS + Window Scale
+        TcpConnectionTable t2(8080);
+        TcpConnectionKey k2{localIp(), 8080, remoteIp(), 2};
+        std::vector<std::byte> ws_opts = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                           std::byte{0xb4}, std::byte{1}, std::byte{3},
+                                           std::byte{3},   std::byte{2}};
+        auto r2 = t2.handle(k2, makeSynWithOptions(8080, 2, 1000, ws_opts), t0).reply;
+        CHECK(r2.has_value());
+        if (r2)
+            CHECK(r2->options ==
+                  toBytes({0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x02}));
+
+        // MSS + SACK-Permitted
+        TcpConnectionTable t3(8080);
+        TcpConnectionKey k3{localIp(), 8080, remoteIp(), 3};
+        std::vector<std::byte> sack_opts = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                             std::byte{0xb4}, std::byte{4}, std::byte{2}};
+        auto r3 = t3.handle(k3, makeSynWithOptions(8080, 3, 1000, sack_opts), t0).reply;
+        CHECK(r3.has_value());
+        if (r3)
+            CHECK(r3->options ==
+                  toBytes({0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x00, 0x00}));
+
+        // MSS + SACK-Permitted + Window Scale
+        TcpConnectionTable t4(8080);
+        TcpConnectionKey k4{localIp(), 8080, remoteIp(), 4};
+        std::vector<std::byte> both_opts = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                             std::byte{0xb4}, std::byte{4}, std::byte{2},
+                                             std::byte{1},    std::byte{3}, std::byte{3},
+                                             std::byte{2}};
+        auto r4 = t4.handle(k4, makeSynWithOptions(8080, 4, 1000, both_opts), t0).reply;
+        CHECK(r4.has_value());
+        if (r4)
+            CHECK(r4->options == toBytes({0x02, 0x04, 0x05, 0xb4, 0x04, 0x02, 0x01, 0x03,
+                                            0x03, 0x02, 0x00, 0x00}));
+    }
+
+    // duplicate SACK-Permitted on the SYN: malformed, no connection created
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> bad = {std::byte{4}, std::byte{2}, std::byte{4}, std::byte{2}};
+        auto result = table.handle(key, makeSynWithOptions(8080, 54321, 1000, bad), t0);
+        CHECK(!result.reply.has_value());
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // malformed SACK-Permitted length on the SYN: no connection created
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> bad = {std::byte{4}, std::byte{3}, std::byte{0}};
+        auto result = table.handle(key, makeSynWithOptions(8080, 54321, 1000, bad), t0);
+        CHECK(!result.reply.has_value());
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // a SACK block on the SYN is invalid: no connection created
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> bad = {
+            std::byte{5}, std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0},
+            std::byte{1}, std::byte{0},  std::byte{0}, std::byte{0}, std::byte{5},
+        };
+        auto result = table.handle(key, makeSynWithOptions(8080, 54321, 1000, bad), t0);
+        CHECK(!result.reply.has_value());
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // duplicate SYN with changed options (dropping SACK-Permitted) never
+    // renegotiates -- the retransmitted SYN-ACK still advertises SACK
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> sack_opts = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                             std::byte{0xb4}, std::byte{4}, std::byte{2}};
+        auto first = table.handle(key, makeSynWithOptions(8080, 54321, 1000, sack_opts), t0).reply;
+        CHECK(first.has_value());
+        auto second = table.handle(key, makeSyn(8080, 54321, 1000), t0).reply; // no SACK this time
+        CHECK(second.has_value());
+        if (first && second) CHECK(first->options == second->options); // unchanged
+    }
+
+    // two connections negotiate SACK independently
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key_a{localIp(), 8080, remoteIp(), 1};
+        TcpConnectionKey key_b{localIp(), 8080, remoteIp(), 2};
+        establishWithSack(table, key_a, 1000, t0);
+        auto server_isn_b = establish(table, key_b, 2000, t0); // no SACK
+        (void)server_isn_b;
+        auto snap_a = table.snapshotOf(key_a);
+        auto snap_b = table.snapshotOf(key_b);
+        CHECK(snap_a.has_value() && snap_b.has_value());
+        if (snap_a && snap_b) {
+            CHECK(snap_a->sack_permitted);
+            CHECK(!snap_b->sack_permitted);
+        }
+    }
+
+    // SYN-ACK timeout retransmission preserves SACK-Permitted
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        std::vector<std::byte> sack_opts = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                             std::byte{0xb4}, std::byte{4}, std::byte{2}};
+        auto first = table.handle(key, makeSynWithOptions(8080, 54321, 1000, sack_opts), t0).reply;
+        CHECK(first.has_value());
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1);
+        if (due.retransmissions.size() == 1 && first) {
+            CHECK(due.retransmissions[0].segment.options == first->options);
+        }
+    }
+
+    // an established-state SACK-Permitted option is safely parsed but
+    // ignored (never enables SACK after the handshake)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0); // no SACK on the SYN
+        std::vector<std::byte> late_sack = {std::byte{4}, std::byte{2}};
+        auto ack = makeAck(8080, 54321, 1001, 0);
+        ack.options = late_sack;
+        table.handle(key, ack, t0);
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(!snap->sack_permitted);
+    }
+
+    // ================= Milestone: sender SACK scoreboard =================
+
+    // one block covering one pending segment marks it sacked; SACK never
+    // advances snd_una, frees capacity, grows cwnd, or takes an RTT sample
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 3; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 3);
+        if (sent_segments.size() != 3) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t seq3 = sent_segments[2].sequence_number;
+
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        std::uint32_t cwnd_before = before ? before->cwnd : 0;
+        std::size_t owned_before = before ? before->owned_bytes : 0;
+
+        // Reports segment 2 received (segment 1 missing at the cumulative
+        // ACK, which stays pinned at seq1).
+        auto result = table.handle(
+            key, makeAckWithSack(8080, 54321, 1001, seq1, {{seq2, seq3}}), t0);
+
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after && before) {
+            CHECK(after->snd_una == seq1);        // unchanged: SACK never advances snd_una
+            CHECK(after->pending_count == 3);      // no entry removed
+            CHECK(after->sacked_pending_count == 1); // exactly segment 2
+            CHECK(after->cwnd == cwnd_before);      // no growth from a SACK-only ACK
+            CHECK(after->owned_bytes == owned_before); // no capacity freed
+        }
+    }
+
+    // one block covering several pending segments marks all of them
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 4; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 4);
+        if (sent_segments.size() != 4) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t seq4_end = sent_segments[3].sequence_number + 100;
+
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq1, {{seq2, seq4_end}}), t0);
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(snap->sacked_pending_count == 3); // segments 2,3,4
+    }
+
+    // multiple disjoint blocks, duplicate blocks, and overlapping/touching
+    // blocks (merged) all behave idempotently
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 4; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 4);
+        if (sent_segments.size() != 4) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t seq2_end = seq2 + 100;
+        std::uint32_t seq4 = sent_segments[3].sequence_number;
+        std::uint32_t seq4_end = seq4 + 100;
+
+        // disjoint blocks for segments 2 and 4
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq1,
+                                           {{seq2, seq2_end}, {seq4, seq4_end}}),
+                     t0);
+        auto snap1 = table.snapshotOf(key);
+        CHECK(snap1.has_value());
+        if (snap1) CHECK(snap1->sacked_pending_count == 2);
+
+        // duplicate report: idempotent
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq1,
+                                           {{seq2, seq2_end}, {seq4, seq4_end}}),
+                     t0);
+        auto snap2 = table.snapshotOf(key);
+        CHECK(snap2.has_value());
+        if (snap2) CHECK(snap2->sacked_pending_count == 2);
+
+        // touching/overlapping block covering segment 3 too, merged with
+        // the segment-2 report
+        std::uint32_t seq3 = sent_segments[2].sequence_number;
+        table.handle(key,
+                     makeAckWithSack(8080, 54321, 1001, seq1, {{seq2, seq3 + 100}}), t0);
+        auto snap3 = table.snapshotOf(key);
+        CHECK(snap3.has_value());
+        if (snap3) CHECK(snap3->sacked_pending_count == 3); // 2, 3, and still 4
+    }
+
+    // a block only partially covering a segment does not mark it sacked
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(sent.segments.size() == 1);
+        if (sent.segments.size() != 1) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq = sent.segments.front().sequence_number;
+
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq, {{seq + 10, seq + 100}}), t0);
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(snap->sacked_pending_count == 0);
+    }
+
+    // structurally valid but semantically unusable blocks are ignored
+    // individually: at/below cumulative ACK, beyond snd_nxt, reversed,
+    // empty -- none corrupt an otherwise-valid cumulative ACK
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 2; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 2);
+        if (sent_segments.size() != 2) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t snd_nxt = seq2 + 100;
+
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> bad_blocks = {
+            {seq1 - 50, seq1},        // entirely at/below cumulative ACK
+            {seq1, seq1},              // empty (left == right)
+            {seq1 + 20, seq1 + 10},    // reversed
+            {snd_nxt, snd_nxt + 100},  // beyond snd_nxt (unsent space)
+        };
+        for (auto [left, right] : bad_blocks) {
+            auto result = table.handle(
+                key, makeAckWithSack(8080, 54321, 1001, seq1, {{left, right}}), t0);
+            // The cumulative ACK itself (== snd_una, a duplicate) is still
+            // processed normally -- not rejected because of the bad block.
+            CHECK(!result.connection_reset);
+        }
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(snap->sacked_pending_count == 0);
+    }
+
+    // unnegotiated connection: SACK blocks are parsed safely but ignored
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0); // no SACK
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(sent.segments.size() == 1);
+        if (sent.segments.size() != 1) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq = sent.segments.front().sequence_number;
+        auto result = table.handle(
+            key, makeAckWithSack(8080, 54321, 1001, seq, {{seq, seq + 100}}), t0);
+        CHECK(!result.connection_reset);
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(snap->sacked_pending_count == 0);
+    }
+
+    // cumulative ACK later retires a previously-SACKed entry exactly once,
+    // and freed capacity/RTT accounting follow normal cumulative-ACK rules
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 2; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 2);
+        if (sent_segments.size() != 2) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t seq2_end = seq2 + 100;
+
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq1, {{seq2, seq2_end}}), t0);
+        auto mid = table.snapshotOf(key);
+        CHECK(mid.has_value());
+        if (mid) CHECK(mid->sacked_pending_count == 1);
+
+        table.handle(key, makeAck(8080, 54321, 1001, seq2_end), t0); // cumulative ACK of both
+        auto final_snap = table.snapshotOf(key);
+        CHECK(final_snap.has_value());
+        if (final_snap) {
+            CHECK(final_snap->snd_una == seq2_end);
+            CHECK(final_snap->pending_count == 0);
+            CHECK(final_snap->sacked_pending_count == 0); // retired, not double-counted
+        }
+    }
+
+    // RST clears connection state entirely (scoreboard gone with it)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(sent.segments.size() == 1);
+        auto snap_before = table.snapshotOf(key);
+        CHECK(snap_before.has_value());
+        auto rst = makeRst(8080, 54321, snap_before ? snap_before->rcv_nxt : 0);
+        table.handle(key, rst, t0);
+        CHECK(!table.stateOf(key).has_value());
+    }
+
+    // two connections' scoreboards are independent
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key_a{localIp(), 8080, remoteIp(), 1};
+        TcpConnectionKey key_b{localIp(), 8080, remoteIp(), 2};
+        establishWithSack(table, key_a, 1000, t0);
+        establishWithSack(table, key_b, 2000, t0);
+        std::vector<TcpSegment> sent_a_segments;
+        for (int i = 0; i < 2; ++i) {
+            auto sent = table.makeOutgoingData(key_a, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_a_segments.push_back(sent.segments.front());
+        }
+        auto sent_b = table.makeOutgoingData(key_b, makeFilledPayload(100), t0);
+        CHECK(sent_a_segments.size() == 2 && sent_b.segments.size() == 1);
+        if (sent_a_segments.size() != 2 || sent_b.segments.size() != 1) {
+            return wirestack::test::failureCount() == 0 ? 0 : 1;
+        }
+        std::uint32_t seq_a1 = sent_a_segments[0].sequence_number;
+        std::uint32_t seq_a2 = sent_a_segments[1].sequence_number;
+        table.handle(key_a,
+                     makeAckWithSack(8080, 1, 1001, seq_a1, {{seq_a2, seq_a2 + 100}}), t0);
+        auto snap_a = table.snapshotOf(key_a);
+        auto snap_b = table.snapshotOf(key_b);
+        CHECK(snap_a.has_value() && snap_b.has_value());
+        if (snap_a && snap_b) {
+            CHECK(snap_a->sacked_pending_count == 1);
+            CHECK(snap_b->sacked_pending_count == 0); // untouched
+        }
+    }
+
+    // ================= Milestone: NewReno recovery timeout/RST clearing =================
+
+    // RTO clears SACK marks and recovery-transmitted markers
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 2; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 2);
+        if (sent_segments.size() != 2) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq1, {{seq2, seq2 + 100}}), t0);
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        if (before) CHECK(before->sacked_pending_count == 1);
+
+        auto due = table.pollRetransmissions(t0 + kInitialRto);
+        CHECK(due.retransmissions.size() == 1); // segment 1 (oldest) times out
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) {
+            CHECK(after->sacked_pending_count == 0);
+            CHECK(after->recovery_retransmitted_count == 0);
+            CHECK(!after->in_fast_recovery);
+        }
+    }
+
+    // ================= Milestone: selective retransmission with SACK =================
+
+    // segments 1..7; 3,5,6,7 fully SACKed; 2 and 4 missing. Duplicate ACK
+    // 3 retransmits segment 2; a further SACK-bearing duplicate ACK skips
+    // segment 3 (already SACKed) and retransmits segment 4; neither is
+    // selected twice; cumulative ACK later retires everything.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 7; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 7);
+        if (sent_segments.size() != 7) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t seq3 = sent_segments[2].sequence_number;
+        std::uint32_t seq4 = sent_segments[3].sequence_number;
+        std::uint32_t seq5 = sent_segments[4].sequence_number;
+        std::uint32_t seq7_end = sent_segments[6].sequence_number + 100;
+
+        // ACK pinned at seq2 (segment 1 received, segment 2 missing),
+        // reporting segments 3 and 5-7 received via SACK. The first such
+        // ACK genuinely advances snd_una (retiring segment 1) and is not
+        // itself a duplicate ACK; three further identical ACKs are.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> blocks = {
+            {seq3, seq3 + 100}, {seq5, seq7_end}};
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq2, blocks), t0);
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq2, blocks), t0);
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq2, blocks), t0);
+        auto dup3 = table.handle(key, makeAckWithSack(8080, 54321, 1001, seq2, blocks), t0);
+        CHECK(dup3.fast_retransmit.has_value());
+        if (dup3.fast_retransmit) CHECK(dup3.fast_retransmit->sequence_number == seq2);
+
+        auto after_dup3 = table.snapshotOf(key);
+        CHECK(after_dup3.has_value());
+        if (after_dup3) {
+            CHECK(after_dup3->in_fast_recovery);
+            CHECK(after_dup3->snd_una == seq2); // segment 1 retired by the cumulative ACK
+            CHECK(after_dup3->sacked_pending_count == 4); // 3,5,6,7
+            CHECK(after_dup3->recovery_retransmitted_count == 1); // segment 2
+        }
+
+        // A further SACK-bearing duplicate ACK (still pinned at seq2):
+        // segment 3 is skipped (already SACKed), segment 4 is selected.
+        auto dup4 = table.handle(key, makeAckWithSack(8080, 54321, 1001, seq2, blocks), t0);
+        CHECK(dup4.fast_retransmit.has_value());
+        if (dup4.fast_retransmit) CHECK(dup4.fast_retransmit->sequence_number == seq4);
+
+        auto after_dup4 = table.snapshotOf(key);
+        CHECK(after_dup4.has_value());
+        if (after_dup4) {
+            CHECK(after_dup4->recovery_retransmitted_count == 2); // segments 2 and 4
+            CHECK(after_dup4->pending_count == 6); // segment 1 already retired; SACK removes none
+        }
+
+        // Cumulative ACK retires everything and exits recovery normally.
+        table.handle(key, makeAck(8080, 54321, 1001, seq7_end), t0);
+        auto final_snap = table.snapshotOf(key);
+        CHECK(final_snap.has_value());
+        if (final_snap) {
+            CHECK(final_snap->snd_una == seq7_end);
+            CHECK(final_snap->pending_count == 0);
+            CHECK(!final_snap->in_fast_recovery);
+        }
+    }
+
+    // ================= Milestone: receiver SACK block generation =================
+
+    // one out-of-order fragment produces one SACK block with exact edges
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithSack(table, key, 8000, t0);
+
+        TcpSegment gapped;
+        gapped.source_port = 54321;
+        gapped.destination_port = 8080;
+        gapped.sequence_number = 8001 + 10; // 10-byte gap
+        gapped.acknowledgment_number = server_isn + 1;
+        gapped.flags.ack = true;
+        gapped.window_size = 65535;
+        gapped.payload = makeFilledPayload(15, std::byte{'g'});
+
+        auto result = table.handle(key, gapped, t0);
+        CHECK(result.reply.has_value());
+        if (result.reply) {
+            CHECK(result.reply->acknowledgment_number == 8001); // pinned at the gap
+            auto parsed = wirestack::parseTcpOptions(result.reply->options);
+            CHECK(std::holds_alternative<wirestack::TcpParsedOptions>(parsed));
+            if (auto* opts = std::get_if<wirestack::TcpParsedOptions>(&parsed)) {
+                CHECK(opts->sack_blocks.size() == 1);
+                if (opts->sack_blocks.size() == 1) {
+                    CHECK(opts->sack_blocks[0].left_edge == 8011);
+                    CHECK(opts->sack_blocks[0].right_edge == 8026);
+                }
+            }
+        }
+    }
+
+    // two disjoint fragments, most-recent-first ordering; gap fill and
+    // cumulative release removes the released fragment from later reports
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithSack(table, key, 8000, t0);
+
+        auto sendGapped = [&](std::uint32_t seq, std::size_t len) {
+            TcpSegment seg;
+            seg.source_port = 54321;
+            seg.destination_port = 8080;
+            seg.sequence_number = seq;
+            seg.acknowledgment_number = server_isn + 1;
+            seg.flags.ack = true;
+            seg.window_size = 65535;
+            seg.payload = makeFilledPayload(len, std::byte{'g'});
+            return table.handle(key, seg, t0);
+        };
+
+        // First fragment: [8011, 8021)
+        sendGapped(8001 + 10, 10);
+        // Second, most-recent fragment: [8031, 8041)
+        auto second = sendGapped(8001 + 30, 10);
+        CHECK(second.reply.has_value());
+        if (second.reply) {
+            auto parsed = wirestack::parseTcpOptions(second.reply->options);
+            if (auto* opts = std::get_if<wirestack::TcpParsedOptions>(&parsed)) {
+                CHECK(opts->sack_blocks.size() == 2);
+                if (opts->sack_blocks.size() == 2) {
+                    CHECK(opts->sack_blocks[0].left_edge == 8031); // most recent first
+                    CHECK(opts->sack_blocks[1].left_edge == 8011);
+                }
+            }
+        }
+
+        // Fill the first gap: [8001, 8011) -- releases the first fragment,
+        // rcv_nxt advances to 8021; only the second fragment remains.
+        auto filled = sendGapped(8001, 10);
+        CHECK(!filled.accepted_payload.empty());
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after) CHECK(after->rcv_nxt == 8021);
+        if (filled.reply) {
+            auto parsed = wirestack::parseTcpOptions(filled.reply->options);
+            if (auto* opts = std::get_if<wirestack::TcpParsedOptions>(&parsed)) {
+                CHECK(opts->sack_blocks.size() == 1);
+                if (opts->sack_blocks.size() == 1) CHECK(opts->sack_blocks[0].left_edge == 8031);
+            }
+        }
+    }
+
+    // duplicate/overlapping arrivals do not create duplicate blocks
+    // (first-arrival-wins trimming keeps the fragment set canonical)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithSack(table, key, 8000, t0);
+
+        auto sendGapped = [&](std::uint32_t seq, std::size_t len) {
+            TcpSegment seg;
+            seg.source_port = 54321;
+            seg.destination_port = 8080;
+            seg.sequence_number = seq;
+            seg.acknowledgment_number = server_isn + 1;
+            seg.flags.ack = true;
+            seg.window_size = 65535;
+            seg.payload = makeFilledPayload(len, std::byte{'g'});
+            return table.handle(key, seg, t0);
+        };
+
+        sendGapped(8001 + 10, 10);       // [8011, 8021)
+        auto dup = sendGapped(8001 + 10, 10); // exact duplicate
+        CHECK(dup.reply.has_value());
+        if (dup.reply) {
+            auto parsed = wirestack::parseTcpOptions(dup.reply->options);
+            if (auto* opts = std::get_if<wirestack::TcpParsedOptions>(&parsed)) {
+                CHECK(opts->sack_blocks.size() == 1); // still exactly one fragment
+            }
+        }
+        auto snap = table.snapshotOf(key);
+        CHECK(snap.has_value());
+        if (snap) CHECK(snap->reassembly_fragment_count == 1);
+    }
+
+    // unnegotiated connection emits no SACK option on a gapped arrival
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establish(table, key, 8000, t0); // no SACK
+
+        TcpSegment gapped;
+        gapped.source_port = 54321;
+        gapped.destination_port = 8080;
+        gapped.sequence_number = 8001 + 10;
+        gapped.acknowledgment_number = server_isn + 1;
+        gapped.flags.ack = true;
+        gapped.window_size = 65535;
+        gapped.payload = makeFilledPayload(15, std::byte{'g'});
+
+        auto result = table.handle(key, gapped, t0);
+        CHECK(result.reply.has_value());
+        if (result.reply) CHECK(result.reply->options.empty());
+    }
+
+    // a SACK-bearing ACK that also carries acceptable payload and opens
+    // send allowance -- every scheduled segment must still acknowledge
+    // the FINAL post-payload rcv_nxt, not a stale one (regression for the
+    // ordering fix in commits 8032653/08e00aa; see docs/tcp.md)
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 8000, 0, t0);
+        (void)server_isn;
+
+        // Renegotiate SACK via a fresh table since establishWithWindow
+        // doesn't negotiate it -- build one directly instead.
+        TcpConnectionTable table2(8080);
+        TcpConnectionKey key2{localIp(), 8080, remoteIp(), 54322};
+        std::vector<std::byte> sack_opts = {std::byte{2}, std::byte{4}, std::byte{0x05},
+                                             std::byte{0xb4}, std::byte{4}, std::byte{2}};
+        auto syn_ack =
+            table2.handle(key2, makeSynWithOptions(8080, 54322, 8000, sack_opts), t0).reply;
+        std::uint32_t server_isn2 = syn_ack ? syn_ack->sequence_number : 0;
+        table2.handle(key2,
+                       makeWindowUpdate(8080, 54322, 8001, server_isn2 + 1, 0), t0);
+
+        auto queued = makeFilledPayload(40, std::byte{'q'});
+        auto sent = table2.makeOutgoingData(key2, queued, t0);
+        CHECK(sent.segments.empty()); // zero window: nothing sent yet
+
+        // Segment carries payload (accepted, advances rcv_nxt) and opens
+        // the send window at once.
+        TcpSegment client_segment;
+        client_segment.source_port = 54322;
+        client_segment.destination_port = 8080;
+        client_segment.sequence_number = 8001;
+        client_segment.acknowledgment_number = server_isn2 + 1;
+        client_segment.flags.ack = true;
+        client_segment.window_size = 500;
+        client_segment.payload = makeFilledPayload(15, std::byte{'d'});
+
+        auto result = table2.handle(key2, client_segment, t0);
+        CHECK(!result.accepted_payload.empty());
+        CHECK(!result.scheduled.empty());
+        auto snap = table2.snapshotOf(key2);
+        CHECK(snap.has_value());
+        if (snap) {
+            for (const auto& seg : result.scheduled) {
+                CHECK(seg.acknowledgment_number == snap->rcv_nxt); // final, post-payload rcv_nxt
+            }
         }
     }
 

@@ -505,7 +505,7 @@ void TcpConnectionTable::applySackBlocks(Connection& connection, std::uint32_t c
             continue;
         }
         for (const auto& [left, right] : merged) {
-            if (!sequenceGreater(entry.sequence_start, left) &&
+            if (sequenceLessOrEqual(left, entry.sequence_start) &&
                 sequenceLessOrEqual(entry.sequenceEnd(), right)) {
                 entry.sacked = true;
                 break;
