@@ -203,16 +203,21 @@ void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_
 
     // Newest (last-processed, since entries are in send order) entry
     // covered -- fully or partially -- by this ack that was never
-    // retransmitted. Karn's rule falls out for free: a retransmitted
-    // entry is simply never a candidate.
+    // retransmitted AND has not already contributed a sample. Karn's rule
+    // falls out for free: a retransmitted entry is simply never a
+    // candidate. rtt_sample_taken separately prevents one transmission
+    // from producing more than one sample across successive partial ACKs
+    // of its still-outstanding remainder.
     std::optional<TcpClock::time_point> sample_first_sent;
+    PendingTransmission* sample_entry = nullptr; // set only if it survives (partial trim)
 
     auto& pending = connection.pending;
     while (!pending.empty()) {
         auto& entry = pending.front();
         if (sequenceLessOrEqual(entry.sequenceEnd(), ack)) {
-            if (entry.retransmit_count == 0) {
+            if (entry.retransmit_count == 0 && !entry.rtt_sample_taken) {
                 sample_first_sent = entry.first_sent_at;
+                sample_entry = nullptr; // this entry is about to be erased
             }
             pending.erase(pending.begin());
             continue;
@@ -222,8 +227,9 @@ void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_
             // can never satisfy this (no integer lies strictly between
             // sequence_start and sequence_start + 1), so this only ever
             // trims a data entry's payload.
-            if (entry.retransmit_count == 0) {
+            if (entry.retransmit_count == 0 && !entry.rtt_sample_taken) {
                 sample_first_sent = entry.first_sent_at;
+                sample_entry = &entry; // survives, trimmed -- mark below
             }
             std::uint32_t trimmed = ack - entry.sequence_start;
             entry.payload.erase(entry.payload.begin(),
@@ -235,6 +241,9 @@ void TcpConnectionTable::retireAcknowledged(Connection& connection, std::uint32_
 
     if (sample_first_sent && *sample_first_sent <= now) {
         recordRttSample(connection, now - *sample_first_sent);
+        if (sample_entry) {
+            sample_entry->rtt_sample_taken = true;
+        }
     }
 }
 
@@ -823,10 +832,15 @@ TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_poin
         oldest.retransmit_count += 1;
         oldest.last_sent_at = now;
         oldest.timeout_interval = std::min<TcpClock::duration>(oldest.timeout_interval * 2, kMaxRto);
-        // The connection's own RTO reflects this backed-off value too,
-        // so a later new send starts from the more conservative point
-        // rather than resetting to the pre-loss estimate.
-        connection.current_rto = oldest.timeout_interval;
+        // The connection's own RTO reflects this backed-off value too, so
+        // a later new send starts from the more conservative point rather
+        // than resetting to the pre-loss estimate -- but a timeout must
+        // never make the connection-level estimate LESS conservative than
+        // it already was (a different, still-outstanding entry may have a
+        // smaller per-entry interval than the connection has already
+        // backed off to).
+        connection.current_rto =
+            std::max<TcpClock::duration>(connection.current_rto, oldest.timeout_interval);
 
         result.retransmissions.push_back({it->first, std::move(segment)});
         ++it;

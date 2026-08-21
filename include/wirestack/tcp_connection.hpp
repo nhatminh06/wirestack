@@ -272,6 +272,11 @@ private:
         TcpClock::time_point last_sent_at;
         TcpClock::duration timeout_interval = kInitialRto; // this entry's own backed-off timeout
         int retransmit_count = 0; // > 0 also means "not eligible for an RTT sample" (Karn's rule)
+        // Set once an ACK has taken an RTT sample from this entry (full or
+        // partial retirement). Distinct from Karn eligibility: a
+        // never-retransmitted entry may still be ineligible for a *second*
+        // sample after a partial ACK already sampled it once.
+        bool rtt_sample_taken = false;
 
         std::uint32_t sequenceEnd() const {
             return sequence_start + static_cast<std::uint32_t>(payload.size()) +
@@ -358,9 +363,11 @@ private:
     // 1-wide sequence range, so no ack value can land strictly inside
     // one -- the partial-trim branch below only ever trims data. Also
     // takes an RTT sample (see recordRttSample) from the newest
-    // fully-or-partially-retired entry that was never retransmitted, if
-    // any -- Karn's rule falls out for free, since a retransmitted entry
-    // is simply never an eligible candidate.
+    // fully-or-partially-retired entry that was never retransmitted and
+    // has not already contributed a sample, if any -- Karn's rule falls
+    // out for free, since a retransmitted entry is simply never an
+    // eligible candidate, and rtt_sample_taken prevents a still-partially-
+    // outstanding entry from being sampled a second time by a later ACK.
     static void retireAcknowledged(Connection& connection, std::uint32_t ack,
                                     TcpClock::time_point now);
 

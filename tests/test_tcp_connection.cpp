@@ -3043,5 +3043,159 @@ int main() {
         if (after) CHECK(!after->has_rtt_sample);
     }
 
+    // ================= PR #5 fix 3: backoff must never reduce current_rto =================
+
+    // Two outstanding transmissions A (older, front of queue) and B
+    // (younger): A times out twice, backing the connection off to 4s. A is
+    // then acknowledged (Karn's rule: no sample). B, still carrying its
+    // original 1s per-entry interval, then times out once (interval
+    // becomes 2s) -- this must NOT reduce the connection's current_rto
+    // below the 4s A already established.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0); // handshake sample clamps current_rto to kMinRto (1s)
+
+        auto sent_a = table.makeOutgoingData(key, toBytes("AAAA"), t0);
+        auto sent_b = table.makeOutgoingData(key, toBytes("BBBB"), t0);
+        CHECK(sent_a.segments.size() == 1 && sent_b.segments.size() == 1);
+        if (sent_a.segments.size() != 1 || sent_b.segments.size() != 1) {
+            return wirestack::test::failureCount() == 0 ? 0 : 1;
+        }
+        std::uint32_t a_end = sent_a.segments.front().sequence_number +
+                               static_cast<std::uint32_t>(sent_a.segments.front().payload.size());
+
+        auto t1 = t0 + kInitialRto; // 1s: A's first timeout
+        auto due1 = table.pollRetransmissions(t1);
+        CHECK(due1.retransmissions.size() == 1);
+        if (due1.retransmissions.size() == 1) {
+            CHECK(due1.retransmissions[0].segment.payload == toBytes("AAAA"));
+        }
+        auto after_first_timeout = table.snapshotOf(key);
+        CHECK(after_first_timeout.has_value());
+        if (after_first_timeout) CHECK(after_first_timeout->current_rto == std::chrono::milliseconds(2000));
+
+        auto t2 = t1 + std::chrono::milliseconds(2000); // A's second timeout
+        auto due2 = table.pollRetransmissions(t2);
+        CHECK(due2.retransmissions.size() == 1);
+        if (due2.retransmissions.size() == 1) {
+            CHECK(due2.retransmissions[0].segment.payload == toBytes("AAAA"));
+        }
+        auto after_second_timeout = table.snapshotOf(key);
+        CHECK(after_second_timeout.has_value());
+        if (after_second_timeout) {
+            CHECK(after_second_timeout->current_rto == std::chrono::milliseconds(4000));
+        }
+
+        // ACK A fully (it was retransmitted twice -- no RTT sample).
+        table.handle(key, makeAck(8080, 54321, 1001, a_end), t2);
+        auto after_ack_a = table.snapshotOf(key);
+        CHECK(after_ack_a.has_value());
+        if (after_ack_a) {
+            CHECK(after_ack_a->current_rto == std::chrono::milliseconds(4000)); // unchanged
+            CHECK(after_ack_a->pending_count == 1); // only B remains
+        }
+
+        // B is now the front of the queue; its own timeout_interval is
+        // still 1s (never touched by A's backoff) and its deadline
+        // (t0 + 1s) has long since passed.
+        auto due3 = table.pollRetransmissions(t2);
+        CHECK(due3.retransmissions.size() == 1);
+        if (due3.retransmissions.size() == 1) {
+            CHECK(due3.retransmissions[0].segment.payload == toBytes("BBBB"));
+        }
+        auto after_b_timeout = table.snapshotOf(key);
+        CHECK(after_b_timeout.has_value());
+        if (after_b_timeout) {
+            // B's own interval only reached 2s, but the connection-level
+            // RTO must not regress below A's already-established 4s.
+            CHECK(after_b_timeout->current_rto == std::chrono::milliseconds(4000));
+        }
+
+        // A later clean RTT sample may still legitimately recalculate and
+        // reduce the RTO -- this is not a floor, only a "never regress on
+        // timeout" rule.
+        std::uint32_t b_end = sent_b.segments.front().sequence_number +
+                               static_cast<std::uint32_t>(sent_b.segments.front().payload.size());
+        table.handle(key, makeAck(8080, 54321, 1001, b_end), t2); // Karn's rule: B was retransmitted
+        auto sent_c = table.makeOutgoingData(key, toBytes("CCCC"), t2);
+        CHECK(sent_c.segments.size() == 1);
+        if (sent_c.segments.size() == 1) {
+            std::uint32_t c_end = sent_c.segments.front().sequence_number +
+                                   static_cast<std::uint32_t>(sent_c.segments.front().payload.size());
+            auto t3 = t2 + std::chrono::milliseconds(50); // clean, fast RTT sample
+            table.handle(key, makeAck(8080, 54321, 1001, c_end), t3);
+            auto after_clean_sample = table.snapshotOf(key);
+            CHECK(after_clean_sample.has_value());
+            if (after_clean_sample) {
+                CHECK(after_clean_sample->current_rto < std::chrono::milliseconds(4000));
+                CHECK(after_clean_sample->current_rto == kMinRto); // clamped down to the 1s floor
+            }
+        }
+    }
+
+    // ================= PR #5 fix 4: one transmission samples at most once =================
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establish(table, key, 1000, t0);
+
+        auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+        CHECK(sent.segments.size() == 1);
+        if (sent.segments.size() != 1) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq_start = sent.segments.front().sequence_number;
+
+        // Partial ACK of the first 40 bytes at T0+200ms: takes the first
+        // real sample for this transmission.
+        auto t200 = t0 + std::chrono::milliseconds(200);
+        table.handle(key, makeAck(8080, 54321, 1001, seq_start + 40), t200);
+        auto after_first_sample = table.snapshotOf(key);
+        CHECK(after_first_sample.has_value());
+        if (after_first_sample) CHECK(after_first_sample->pending_count == 1); // trimmed, not retired
+
+        // Partial ACK of another 30 bytes at T0+500ms: same original
+        // transmission, already sampled once -- must not sample again.
+        auto t500 = t0 + std::chrono::milliseconds(500);
+        table.handle(key, makeAck(8080, 54321, 1001, seq_start + 70), t500);
+        auto after_second_partial = table.snapshotOf(key);
+        CHECK(after_second_partial.has_value());
+        if (after_first_sample && after_second_partial) {
+            CHECK(after_second_partial->srtt == after_first_sample->srtt);
+            CHECK(after_second_partial->rttvar == after_first_sample->rttvar);
+            CHECK(after_second_partial->current_rto == after_first_sample->current_rto);
+        }
+
+        // Final ACK of the remaining 30 bytes at T0+800ms fully retires
+        // the entry -- still no second sample.
+        auto t800 = t0 + std::chrono::milliseconds(800);
+        table.handle(key, makeAck(8080, 54321, 1001, seq_start + 100), t800);
+        auto after_full_retirement = table.snapshotOf(key);
+        CHECK(after_full_retirement.has_value());
+        if (after_first_sample && after_full_retirement) {
+            CHECK(after_full_retirement->srtt == after_first_sample->srtt);
+            CHECK(after_full_retirement->rttvar == after_first_sample->rttvar);
+            CHECK(after_full_retirement->current_rto == after_first_sample->current_rto);
+            CHECK(after_full_retirement->pending_count == 0);
+        }
+
+        // A new, distinct clean transmission may produce the next sample.
+        auto clean_sent = table.makeOutgoingData(key, toBytes("fresh"), t800);
+        CHECK(clean_sent.segments.size() == 1);
+        if (clean_sent.segments.size() == 1) {
+            std::uint32_t clean_end =
+                clean_sent.segments.front().sequence_number +
+                static_cast<std::uint32_t>(clean_sent.segments.front().payload.size());
+            auto t850 = t800 + std::chrono::milliseconds(50);
+            table.handle(key, makeAck(8080, 54321, 1001, clean_end), t850);
+            auto after_new_sample = table.snapshotOf(key);
+            CHECK(after_new_sample.has_value());
+            if (after_first_sample && after_new_sample) {
+                CHECK((after_new_sample->srtt != after_first_sample->srtt) ||
+                      (after_new_sample->current_rto != after_first_sample->current_rto));
+            }
+        }
+    }
+
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }

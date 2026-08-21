@@ -399,11 +399,15 @@ not a fixed global constant. `PendingTransmission` records both
 `first_sent_at` (set once, never touched by retransmission) and
 `last_sent_at`/`timeout_interval` (updated on each timeout). A timeout
 retransmission doubles that entry's own `timeout_interval` (capped at
-`kMaxRto`) and also writes the backed-off value into the connection's
-`current_rto`, so a later *new* send starts from the more conservative
-estimate rather than resetting to the pre-loss value; an already-armed
-entry's own deadline is not retroactively rewritten by a later RTT
-sample.
+`kMaxRto`) and folds the backed-off value into the connection's
+`current_rto` via `current_rto = max(current_rto, timeout_interval)` --
+never a direct assignment -- so a later *new* send starts from the more
+conservative estimate rather than resetting to the pre-loss value, and a
+second, younger, still-outstanding entry timing out on its own smaller
+per-entry interval can never pull the connection-level estimate back
+down below what an earlier entry's timeout had already established. An
+already-armed entry's own deadline is not retroactively rewritten by a
+later RTT sample.
 
 ### RTT measurement and the adaptive estimator
 
@@ -415,8 +419,12 @@ backoff of the *estimator* itself, no minimum-RTO tuning knob).
 
 At most one RTT sample is taken per ACK, from the newest pending entry
 that ACK fully or partially retires, provided that entry was sent exactly
-once (`retransmit_count == 0`) and has a valid `first_sent_at <= now`
-(Karn's rule: once any entry has been retransmitted, an ACK covering it
+once (`retransmit_count == 0`), has a valid `first_sent_at <= now`, and
+has not already contributed a sample (`PendingTransmission::
+rtt_sample_taken`) -- distinct from Karn eligibility: a partial ACK can
+sample a still-outstanding entry once, after which a later ACK of that
+same entry's remaining bytes is not eligible again, even though it was
+never retransmitted (Karn's rule: once any entry has been retransmitted, an ACK covering it
 can never produce a sample, even the very next ACK). A pure ACK
 (consumes no sequence space, never queued) and an accepted RST never
 produce a sample, since neither retires a pending entry. A clean,
