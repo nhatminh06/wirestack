@@ -737,6 +737,16 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
         return {};
     }
 
+    // Malformed options drop the whole segment before any state mutation --
+    // including an otherwise-acceptable RST: no reset, no ACK processing,
+    // no window update, no congestion-state change, no SACK marking, no
+    // payload acceptance, no FIN consumption (see docs/tcp.md).
+    auto parsed_options_result = parseTcpOptions(segment.options);
+    if (std::holds_alternative<TcpOptionParseError>(parsed_options_result)) {
+        return {};
+    }
+    const TcpParsedOptions& parsed_options = std::get<TcpParsedOptions>(parsed_options_result);
+
     if (segment.flags.rst) {
         // Acceptable only if it lands exactly at the next expected byte.
         if (segment.sequence_number == connection.rcv_nxt) {
@@ -751,15 +761,6 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     if (!segment.flags.ack) {
         return {};
     }
-
-    // Malformed options drop the whole segment: no ACK processing, no
-    // window update, no congestion-state change, no SACK marking, no
-    // payload acceptance, no FIN consumption, no reset (see docs/tcp.md).
-    auto parsed_options_result = parseTcpOptions(segment.options);
-    if (std::holds_alternative<TcpOptionParseError>(parsed_options_result)) {
-        return {};
-    }
-    const TcpParsedOptions& parsed_options = std::get<TcpParsedOptions>(parsed_options_result);
 
     // An ACK acknowledging sequence space beyond what has been sent is
     // invalid: no state change, no payload delivery, no FIN consumption.

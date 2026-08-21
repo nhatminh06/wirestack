@@ -5791,5 +5791,82 @@ int main() {
         }
     }
 
+    // ================= PR #8 review fix: malformed options on an
+    // otherwise-acceptable RST must drop the whole segment before any
+    // state mutation, not reset the connection (see docs/tcp.md).
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 2; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 2);
+        if (sent_segments.size() != 2) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t seq2_end = seq2 + 100;
+
+        // Marks segment 2 SACKed, giving the connection observable pending
+        // and scoreboard state to check for corruption below.
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq1, {{seq2, seq2_end}}), t0);
+
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+
+        // Otherwise-acceptable RST (lands exactly at rcv_nxt) carrying a
+        // malformed SACK-Permitted option (kind=4, declared length=3 --
+        // must be exactly 2; same malformed bytes as the SYN option test).
+        TcpSegment bad_rst = makeRst(8080, 54321, before ? before->rcv_nxt : 0);
+        bad_rst.options = {std::byte{4}, std::byte{3}, std::byte{0}};
+
+        auto result = table.handle(key, bad_rst, t0);
+        CHECK(!result.connection_reset);
+        CHECK(!result.reply.has_value());
+        CHECK(table.stateOf(key).has_value()); // connection still exists
+
+        auto after = table.snapshotOf(key);
+        CHECK(after.has_value());
+        if (after && before) {
+            CHECK(after->state == before->state);
+            CHECK(after->snd_una == before->snd_una);
+            CHECK(after->snd_nxt == before->snd_nxt);
+            CHECK(after->pending_count == before->pending_count);
+            CHECK(after->cwnd == before->cwnd);
+            CHECK(after->in_fast_recovery == before->in_fast_recovery);
+            CHECK(after->sacked_pending_count == before->sacked_pending_count);
+        }
+    }
+
+    // Positive control: identical setup, but a structurally valid
+    // acceptable RST still resets and removes the connection.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithSack(table, key, 1000, t0);
+
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 2; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(100), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 2);
+        if (sent_segments.size() != 2) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seq1 = sent_segments[0].sequence_number;
+        std::uint32_t seq2 = sent_segments[1].sequence_number;
+        std::uint32_t seq2_end = seq2 + 100;
+        table.handle(key, makeAckWithSack(8080, 54321, 1001, seq1, {{seq2, seq2_end}}), t0);
+
+        auto before = table.snapshotOf(key);
+        CHECK(before.has_value());
+        auto rst = makeRst(8080, 54321, before ? before->rcv_nxt : 0);
+        auto result = table.handle(key, rst, t0);
+        CHECK(result.connection_reset);
+        CHECK(!table.stateOf(key).has_value());
+    }
+
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }
