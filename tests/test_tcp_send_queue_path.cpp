@@ -242,5 +242,106 @@ int main() {
         CHECK(final_snapshot->pending_count == 0);
     }
 
+    // --- Receive/scheduling ordering: one real segment that both opens
+    //     the send window AND carries new in-order input payload must
+    //     produce scheduled output that acknowledges that newly accepted
+    //     payload -- not a stale, pre-payload ACK number. Proven through
+    //     real Ethernet/IPv4/TCP serialization, parsing, and checksum
+    //     validation on both directions. ---
+    {
+        TcpConnectionTable connections2(8080);
+        TcpConnectionKey key2{local_ip, 8080, clientIp(), 54321};
+
+        TcpSegment syn2;
+        syn2.source_port = 54321;
+        syn2.destination_port = 8080;
+        syn2.sequence_number = 9000;
+        syn2.acknowledgment_number = 0;
+        syn2.flags.syn = true;
+        syn2.window_size = 65535;
+        syn2.urgent_pointer = 0;
+        syn2.options = {std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4}};
+
+        auto syn2_frame = buildFrame(syn2, clientIp(), local_ip, clientMac(), local_mac);
+        auto parsed_syn2 = parseFrame(syn2_frame);
+        CHECK(parsed_syn2.has_value());
+        if (!parsed_syn2) return wirestack::test::failureCount() == 0 ? 0 : 1;
+
+        auto syn2_ack = connections2.handle(key2, parsed_syn2->tcp, t0).reply;
+        CHECK(syn2_ack.has_value());
+        if (!syn2_ack) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t server_isn2 = syn2_ack->sequence_number;
+
+        // Handshake-completing ACK advertising a zero window: nothing can
+        // be sent yet, so the application queue below stays fully queued.
+        TcpSegment final_ack2;
+        final_ack2.source_port = 54321;
+        final_ack2.destination_port = 8080;
+        final_ack2.sequence_number = 9001;
+        final_ack2.acknowledgment_number = server_isn2 + 1;
+        final_ack2.flags.ack = true;
+        final_ack2.window_size = 0;
+
+        auto final_ack2_frame = buildFrame(final_ack2, clientIp(), local_ip, clientMac(), local_mac);
+        auto parsed_final_ack2 = parseFrame(final_ack2_frame);
+        CHECK(parsed_final_ack2.has_value());
+        if (parsed_final_ack2) connections2.handle(key2, parsed_final_ack2->tcp, t0);
+        CHECK(connections2.stateOf(key2) == TcpState::Established);
+
+        auto queued2 = makeFilledPayload(80);
+        auto sent2 = connections2.makeOutgoingData(key2, queued2, t0);
+        CHECK(!sent2.error);
+        CHECK(sent2.segments.empty()); // zero window: still fully queued
+
+        // One real segment that opens the window (0 -> 200) AND carries
+        // new in-order input payload.
+        auto input_payload = makeFilledPayload(25);
+        TcpSegment combined;
+        combined.source_port = 54321;
+        combined.destination_port = 8080;
+        combined.sequence_number = 9001;
+        combined.acknowledgment_number = server_isn2 + 1;
+        combined.flags.ack = true;
+        combined.flags.psh = true;
+        combined.window_size = 200;
+        combined.payload = input_payload;
+
+        auto combined_frame = buildFrame(combined, clientIp(), local_ip, clientMac(), local_mac);
+        auto parsed_combined = parseFrame(combined_frame);
+        CHECK(parsed_combined.has_value());
+        if (!parsed_combined) return wirestack::test::failureCount() == 0 ? 0 : 1;
+
+        auto combined_result = connections2.handle(key2, parsed_combined->tcp, t0);
+        CHECK(combined_result.accepted_payload == input_payload);
+        CHECK(!combined_result.scheduled.empty());
+
+        std::uint32_t expected_ack = 9001 + static_cast<std::uint32_t>(input_payload.size());
+
+        auto snapshot2 = connections2.snapshotOf(key2);
+        CHECK(snapshot2.has_value());
+        if (snapshot2) CHECK(snapshot2->rcv_nxt == expected_ack);
+
+        for (const auto& seg : combined_result.scheduled) {
+            // Real serialize -> parse round trip: validates both the
+            // IPv4 and TCP checksums, and every field the task requires.
+            auto frame_bytes = buildFrame(seg, local_ip, clientIp(), local_mac, clientMac());
+            auto parsed_out = parseFrame(frame_bytes);
+            CHECK(parsed_out.has_value());
+            if (!parsed_out) continue;
+
+            CHECK(parsed_out->eth.source == local_mac);
+            CHECK(parsed_out->eth.destination == clientMac());
+            CHECK(parsed_out->ip.source == local_ip);
+            CHECK(parsed_out->ip.destination == clientIp());
+            CHECK(parsed_out->tcp.source_port == 8080);
+            CHECK(parsed_out->tcp.destination_port == 54321);
+            CHECK(parsed_out->tcp.sequence_number == seg.sequence_number);
+            CHECK(parsed_out->tcp.acknowledgment_number == expected_ack); // not a stale ACK
+            CHECK(parsed_out->tcp.flags.ack);
+            CHECK(parsed_out->tcp.window_size == seg.window_size);
+            CHECK(parsed_out->tcp.payload == seg.payload);
+        }
+    }
+
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }

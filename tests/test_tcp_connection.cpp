@@ -4847,5 +4847,170 @@ int main() {
         }
     }
 
+    // ========= receive/scheduling ordering: ACK + in-order payload =========
+    //
+    // scheduleQueuedData() stamps scheduled segments with the CURRENT
+    // connection.rcv_nxt. If scheduling ran before this segment's own
+    // in-order payload advanced rcv_nxt, the scheduled segments would
+    // acknowledge the old (pre-payload) rcv_nxt -- a stale ACK. This test
+    // fails against commit a918b0e for exactly that reason.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 6000, 0, t0); // zero window: nothing can send yet
+
+        auto queued = makeFilledPayload(250);
+        auto sent = table.makeOutgoingData(key, queued, t0);
+        CHECK(!sent.error);
+        CHECK(sent.segments.empty()); // zero window prevented all transmission
+
+        // One segment that both opens the send window AND carries
+        // in-order application payload.
+        TcpSegment client_segment;
+        client_segment.source_port = 54321;
+        client_segment.destination_port = 8080;
+        client_segment.sequence_number = 6001;
+        client_segment.acknowledgment_number = server_isn + 1; // no outstanding data to ack
+        client_segment.flags.ack = true;
+        client_segment.flags.psh = true;
+        client_segment.window_size = 100;
+        client_segment.payload = makeFilledPayload(30, std::byte{'y'});
+
+        auto result = table.handle(key, client_segment, t0);
+
+        CHECK(result.accepted_payload == client_segment.payload); // delivered exactly once
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        std::uint32_t expected_rcv_nxt = 6001 + 30;
+        if (snapshot) {
+            CHECK(snapshot->rcv_nxt == expected_rcv_nxt); // rcv_nxt advanced by payload length
+        }
+
+        CHECK(!result.scheduled.empty()); // queued data scheduled immediately
+        std::size_t scheduled_bytes = 0;
+        for (const auto& seg : result.scheduled) {
+            CHECK(seg.acknowledgment_number == expected_rcv_nxt); // not the stale pre-payload rcv_nxt
+            scheduled_bytes += seg.payload.size();
+        }
+        CHECK(scheduled_bytes == 100); // bound by the newly opened 100-byte window
+
+        CHECK(!result.reply.has_value()); // no redundant pure ACK
+
+        if (snapshot) {
+            CHECK(snapshot->unsent_bytes == queued.size() - 100);
+            CHECK(snapshot->owned_bytes == queued.size()); // all still owned (queued + pending)
+        }
+    }
+
+    // ============= receive/scheduling ordering: ACK + payload + FIN =============
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 7000, 0, t0);
+
+        auto queued = makeFilledPayload(50, std::byte{'q'});
+        auto sent = table.makeOutgoingData(key, queued, t0);
+        CHECK(sent.segments.empty());
+
+        auto close_result = table.beginClose(key, t0);
+        CHECK(close_result.accepted);
+        CHECK(!close_result.fin.has_value()); // deferred: unsent is still non-empty
+
+        auto client_payload = makeFilledPayload(20, std::byte{'z'});
+        TcpSegment client_segment;
+        client_segment.source_port = 54321;
+        client_segment.destination_port = 8080;
+        client_segment.sequence_number = 7001;
+        client_segment.acknowledgment_number = server_isn + 1;
+        client_segment.flags.ack = true;
+        client_segment.flags.fin = true;
+        client_segment.window_size = 1000; // plenty: drains the whole queue plus the FIN
+        client_segment.payload = client_payload;
+
+        auto result = table.handle(key, client_segment, t0);
+
+        CHECK(result.accepted_payload == client_payload); // delivered exactly once
+        CHECK(result.peer_closed); // EOF signaled exactly once
+
+        std::uint32_t expected_rcv_nxt = 7001 + 20 + 1; // payload.size() + FIN
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->rcv_nxt == expected_rcv_nxt);
+            CHECK(snapshot->state == TcpState::LastAck); // post-FIN state: CloseWait -> LastAck
+        }
+
+        CHECK(!result.scheduled.empty());
+        bool saw_fin = false;
+        std::uint32_t max_data_seq_end = 0;
+        std::optional<std::uint32_t> fin_seq;
+        for (const auto& seg : result.scheduled) {
+            CHECK(seg.acknowledgment_number == expected_rcv_nxt); // every scheduled segment
+            if (seg.flags.fin) {
+                CHECK(!saw_fin); // exactly one FIN
+                saw_fin = true;
+                fin_seq = seg.sequence_number;
+            } else {
+                max_data_seq_end =
+                    seg.sequence_number + static_cast<std::uint32_t>(seg.payload.size());
+            }
+        }
+        CHECK(saw_fin); // deferred local FIN followed the queued application data
+        CHECK(fin_seq.has_value());
+        if (fin_seq) CHECK(*fin_seq == max_data_seq_end); // FIN sequenced after all queued bytes
+
+        CHECK(!result.reply.has_value()); // no redundant pure ACK
+
+        // A duplicate copy of the peer's FIN (same seq/payload) must not
+        // re-deliver payload or re-signal EOF.
+        auto duplicate_result = table.handle(key, client_segment, t0);
+        CHECK(duplicate_result.accepted_payload.empty());
+        CHECK(!duplicate_result.peer_closed);
+    }
+
+    // ============= receive/scheduling ordering: out-of-order payload =============
+    //
+    // Proves scheduling observes the FINAL receive state in the
+    // non-advancing case too: a gap leaves rcv_nxt unchanged, so scheduled
+    // segments must still ack the unchanged rcv_nxt, not a value computed
+    // as if the gap had been filled.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        auto server_isn = establishWithWindow(table, key, 8000, 0, t0);
+
+        auto queued = makeFilledPayload(40, std::byte{'q'});
+        auto sent = table.makeOutgoingData(key, queued, t0);
+        CHECK(sent.segments.empty());
+
+        // Out-of-order: leaves a 10-byte gap before this segment's start.
+        TcpSegment client_segment;
+        client_segment.source_port = 54321;
+        client_segment.destination_port = 8080;
+        client_segment.sequence_number = 8001 + 10;
+        client_segment.acknowledgment_number = server_isn + 1;
+        client_segment.flags.ack = true;
+        client_segment.window_size = 500; // opens the send window
+        client_segment.payload = makeFilledPayload(15, std::byte{'g'});
+
+        auto result = table.handle(key, client_segment, t0);
+
+        CHECK(result.accepted_payload.empty()); // gap: nothing released early
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->rcv_nxt == 8001); // unchanged: still awaiting the missing 10 bytes
+            CHECK(snapshot->reassembly_buffered_bytes == 15); // buffered, not delivered
+            CHECK(snapshot->reassembly_fragment_count == 1);
+        }
+
+        CHECK(!result.scheduled.empty()); // window update still scheduled queued data
+        for (const auto& seg : result.scheduled) {
+            CHECK(seg.acknowledgment_number == 8001); // the unchanged rcv_nxt, not an advanced one
+        }
+    }
+
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }
