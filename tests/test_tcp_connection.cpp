@@ -21,6 +21,7 @@ using wirestack::kTimeWaitDuration;
 using wirestack::parseTcpSegment;
 using wirestack::serializeTcpSegment;
 using wirestack::TcpClock;
+using wirestack::TcpConnectError;
 using wirestack::TcpConnectionKey;
 using wirestack::TcpConnectionTable;
 using wirestack::TcpSegment;
@@ -136,6 +137,28 @@ TcpSegment makeWindowUpdate(std::uint16_t local_port, std::uint16_t remote_port,
     segment.flags.ack = true;
     segment.window_size = window;
     segment.urgent_pointer = 0;
+    return segment;
+}
+
+// A peer SYN-ACK for active-open tests. `local_port`/`remote_port` name
+// Wirestack's own (ephemeral) port and the peer's port, same convention
+// as makeSyn/makeAck above. `options` defaults to MSS(1460) + SACK-
+// Permitted + Window Scale(2), matching a well-behaved peer.
+TcpSegment makeSynAck(std::uint16_t local_port, std::uint16_t remote_port, std::uint32_t seq,
+                       std::uint32_t ack, std::vector<std::byte> options = {
+                           std::byte{2}, std::byte{4}, std::byte{0x05}, std::byte{0xb4},
+                           std::byte{4}, std::byte{2}, std::byte{1}, std::byte{3}, std::byte{3},
+                           std::byte{2}, std::byte{0}, std::byte{0}}) {
+    TcpSegment segment;
+    segment.source_port = remote_port;
+    segment.destination_port = local_port;
+    segment.sequence_number = seq;
+    segment.acknowledgment_number = ack;
+    segment.flags.syn = true;
+    segment.flags.ack = true;
+    segment.window_size = 65535;
+    segment.urgent_pointer = 0;
+    segment.options = std::move(options);
     return segment;
 }
 
@@ -5938,6 +5961,433 @@ int main() {
             CHECK(!after_exit->in_fast_recovery);
             CHECK(after_exit->pending_count == 0);
         }
+    }
+
+    // --- Active open: API and initialization ---------------------------
+
+    // beginConnect creates SynSent with the exact four-tuple, correct
+    // initial sequence state, and a SYN advertising the fixed local
+    // capability policy.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49152, remoteIp(), 9090};
+
+        auto result = table.beginConnect(key, t0);
+        CHECK(result.accepted);
+        CHECK(!result.error.has_value());
+        CHECK(result.syn.has_value());
+        if (result.syn) {
+            CHECK(result.syn->source_port == 49152);
+            CHECK(result.syn->destination_port == 9090);
+            CHECK(result.syn->flags.syn);
+            CHECK(!result.syn->flags.ack);
+            CHECK(!result.syn->flags.rst);
+            CHECK(!result.syn->flags.fin);
+            CHECK(result.syn->acknowledgment_number == 0);
+            CHECK(result.syn->payload.empty());
+        }
+        CHECK(table.stateOf(key) == TcpState::SynSent);
+
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot && result.syn) {
+            std::uint32_t isn = result.syn->sequence_number;
+            CHECK(snapshot->snd_una == isn);
+            CHECK(snapshot->snd_nxt == isn + 1); // the SYN consumed one sequence number
+            CHECK(snapshot->pending_count == 1);
+        }
+    }
+
+    // Rejections: invalid ports and duplicate four-tuple, none of which
+    // mutate any state.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey zero_local{localIp(), 0, remoteIp(), 9090};
+        auto reject_local = table.beginConnect(zero_local, t0);
+        CHECK(!reject_local.accepted);
+        CHECK(reject_local.error == TcpConnectError::InvalidPort);
+        CHECK(!reject_local.syn.has_value());
+        CHECK(!table.stateOf(zero_local).has_value());
+
+        TcpConnectionKey zero_remote{localIp(), 49152, remoteIp(), 0};
+        auto reject_remote = table.beginConnect(zero_remote, t0);
+        CHECK(!reject_remote.accepted);
+        CHECK(reject_remote.error == TcpConnectError::InvalidPort);
+        CHECK(!table.stateOf(zero_remote).has_value());
+
+        TcpConnectionKey key{localIp(), 49153, remoteIp(), 9090};
+        auto first = table.beginConnect(key, t0);
+        CHECK(first.accepted);
+        auto duplicate = table.beginConnect(key, t0);
+        CHECK(!duplicate.accepted);
+        CHECK(duplicate.error == TcpConnectError::DuplicateConnection);
+        CHECK(!duplicate.syn.has_value());
+        // The original connection is untouched by the rejected duplicate.
+        CHECK(table.stateOf(key) == TcpState::SynSent);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->pending_count == 1);
+    }
+
+    // Two simultaneous active connections, distinct four-tuples, do not
+    // interfere with each other.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key_a{localIp(), 49154, remoteIp(), 9090};
+        TcpConnectionKey key_b{localIp(), 49155, remoteIp(), 9091};
+        auto a = table.beginConnect(key_a, t0);
+        auto b = table.beginConnect(key_b, t0);
+        CHECK(a.accepted && b.accepted);
+        CHECK(a.syn->sequence_number != b.syn->sequence_number);
+        CHECK(table.stateOf(key_a) == TcpState::SynSent);
+        CHECK(table.stateOf(key_b) == TcpState::SynSent);
+    }
+
+    // --- Invalid SYN-ACK / unsupported SynSent traffic ------------------
+
+    // Wrong ACK (too low, too high, equal to local ISN rather than +1)
+    // never establishes and never mutates state.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49156, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        for (std::uint32_t bad_ack : {isn, isn - 1, isn + 2}) {
+            auto result = table.handle(key, makeSynAck(49156, 9090, 7000000, bad_ack), t0);
+            CHECK(!result.connection_established);
+            CHECK(table.stateOf(key) == TcpState::SynSent);
+        }
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->pending_count == 1); // SYN never retired
+    }
+
+    // ACK-only, bare SYN (simultaneous open), FIN, FIN|ACK, payload-only,
+    // and a payload-bearing or FIN-bearing SYN-ACK are all unsupported
+    // before establishment: no state change, no payload/FIN processing.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49157, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        auto ack_only = table.handle(key, makeAck(49157, 9090, 7000000, isn + 1), t0);
+        CHECK(!ack_only.connection_established && table.stateOf(key) == TcpState::SynSent);
+
+        auto bare_syn = table.handle(key, makeSyn(49157, 9090, 7000000), t0);
+        CHECK(!bare_syn.connection_established && table.stateOf(key) == TcpState::SynSent);
+
+        auto fin = table.handle(key, makeFin(49157, 9090, 7000000, isn + 1), t0);
+        CHECK(!fin.peer_closed && table.stateOf(key) == TcpState::SynSent);
+
+        auto data = table.handle(key, makeData(49157, 9090, 7000000, isn + 1, makeFilledPayload(4)),
+                                  t0);
+        CHECK(data.accepted_payload.empty() && table.stateOf(key) == TcpState::SynSent);
+
+        auto payload_syn_ack = makeSynAck(49157, 9090, 7000000, isn + 1);
+        payload_syn_ack.payload = makeFilledPayload(4);
+        auto r1 = table.handle(key, payload_syn_ack, t0);
+        CHECK(!r1.connection_established && table.stateOf(key) == TcpState::SynSent);
+
+        auto fin_syn_ack = makeSynAck(49157, 9090, 7000000, isn + 1);
+        fin_syn_ack.flags.fin = true;
+        auto r2 = table.handle(key, fin_syn_ack, t0);
+        CHECK(!r2.connection_established && table.stateOf(key) == TcpState::SynSent);
+
+        // Still establishable afterward -- none of the above corrupted
+        // sequence/pending state.
+        auto ok = table.handle(key, makeSynAck(49157, 9090, 7000000, isn + 1), t0);
+        CHECK(ok.connection_established);
+        CHECK(table.stateOf(key) == TcpState::Established);
+    }
+
+    // Malformed SYN-ACK options never mutate state (truncated MSS,
+    // zero-length option, and a garbage trailing byte past what a known
+    // option kind declares).
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49158, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        std::vector<std::vector<std::byte>> malformed_options_cases = {
+            {std::byte{2}, std::byte{4}, std::byte{0x05}}, // truncated MSS (declares 4, has 3)
+            {std::byte{2}, std::byte{1}, std::byte{0}},    // invalid length (<2 data... length 1 total)
+            {std::byte{3}, std::byte{3}},                  // truncated Window Scale
+            {std::byte{4}, std::byte{3}, std::byte{0}},    // invalid SACK-Permitted length
+        };
+        for (const auto& options : malformed_options_cases) {
+            auto result =
+                table.handle(key, makeSynAck(49158, 9090, 7000000, isn + 1, options), t0);
+            CHECK(!result.connection_established);
+            CHECK(table.stateOf(key) == TcpState::SynSent);
+        }
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) CHECK(snapshot->pending_count == 1);
+    }
+
+    // --- Valid establishment: option variants ---------------------------
+
+    // No options at all: falls back to kDefaultPeerMss, no window
+    // scaling, no SACK.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49159, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        auto result = table.handle(key, makeSynAck(49159, 9090, 7000000, isn + 1, {}), t0);
+        CHECK(result.connection_established);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->peer_mss == wirestack::kDefaultPeerMss);
+            CHECK(!snapshot->window_scaling_enabled);
+            CHECK(!snapshot->sack_permitted);
+        }
+    }
+
+    // A peer Window Scale above 14 is clamped, not rejected.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49160, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        std::vector<std::byte> options = {std::byte{1}, std::byte{3}, std::byte{3}, std::byte{20}};
+        auto result = table.handle(key, makeSynAck(49160, 9090, 7000000, isn + 1, options), t0);
+        CHECK(result.connection_established);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->window_scaling_enabled);
+            CHECK(snapshot->peer_window_scale == 14);
+        }
+    }
+
+    // Peer MSS values, including the smallest legal value and a value
+    // above Wirestack's own path MSS (which must not raise the
+    // effective MSS beyond kTcpMss).
+    {
+        for (std::uint16_t peer_mss : {static_cast<std::uint16_t>(1460),
+                                        static_cast<std::uint16_t>(1200),
+                                        static_cast<std::uint16_t>(536),
+                                        static_cast<std::uint16_t>(1)}) {
+            TcpConnectionTable table(8080);
+            TcpConnectionKey key{localIp(), 49161, remoteIp(), 9090};
+            auto connect = table.beginConnect(key, t0);
+            std::uint32_t isn = connect.syn->sequence_number;
+
+            std::vector<std::byte> options = {std::byte{2}, std::byte{4},
+                                               static_cast<std::byte>((peer_mss >> 8) & 0xff),
+                                               static_cast<std::byte>(peer_mss & 0xff)};
+            auto result = table.handle(key, makeSynAck(49161, 9090, 7000000, isn + 1, options), t0);
+            CHECK(result.connection_established);
+            auto snapshot = table.snapshotOf(key);
+            CHECK(snapshot.has_value());
+            if (snapshot) {
+                CHECK(snapshot->peer_mss == peer_mss);
+                CHECK(snapshot->effective_send_mss ==
+                      std::min<std::uint16_t>(peer_mss, static_cast<std::uint16_t>(kTcpMss)));
+            }
+        }
+    }
+
+    // --- Send-window initialization (section 12) -------------------------
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49162, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        std::vector<std::byte> options = {std::byte{1}, std::byte{3}, std::byte{3}, std::byte{4}};
+        TcpSegment syn_ack = makeSynAck(49162, 9090, 7000000, isn + 1, options);
+        syn_ack.window_size = 4096;
+        auto result = table.handle(key, syn_ack, t0);
+        CHECK(result.connection_established);
+        auto after_syn_ack = table.snapshotOf(key);
+        CHECK(after_syn_ack.has_value());
+        if (after_syn_ack) {
+            CHECK(after_syn_ack->window_scaling_enabled);
+            CHECK(after_syn_ack->peer_window_scale == 4);
+            // SYN-ACK window is never scaled -- raw value used directly.
+            CHECK(after_syn_ack->snd_wnd == 4096);
+        }
+
+        // An ordinary (non-SYN) ACK with the same raw window now applies
+        // the negotiated peer scale. ack=isn+1 (not +1+1): the final ACK
+        // consumed no sequence space, so snd_nxt is still isn+1.
+        table.handle(key, makeWindowUpdate(49162, 9090, 7000001, isn + 1, 4096), t0);
+        auto after_ordinary_ack = table.snapshotOf(key);
+        CHECK(after_ordinary_ack.has_value());
+        if (after_ordinary_ack) {
+            CHECK(after_ordinary_ack->snd_wnd == 4096u << 4); // 65536
+        }
+    }
+
+    // --- Duplicate SYN-ACK after establishment (section 15) -------------
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49163, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        auto establish = table.handle(key, makeSynAck(49163, 9090, 7000000, isn + 1), t0);
+        CHECK(establish.connection_established);
+        auto snapshot_before = table.snapshotOf(key);
+
+        // The peer retransmits the same SYN-ACK (final ACK presumed lost).
+        auto duplicate = table.handle(key, makeSynAck(49163, 9090, 7000000, isn + 1), t0);
+        CHECK(!duplicate.connection_established); // not a second establishment
+        CHECK(duplicate.reply.has_value());
+        if (duplicate.reply) {
+            CHECK(duplicate.reply->flags.ack);
+            CHECK(!duplicate.reply->flags.syn);
+            CHECK(duplicate.reply->sequence_number == isn + 1); // no sequence space consumed
+            CHECK(duplicate.reply->acknowledgment_number == 7000001);
+        }
+        auto snapshot_after = table.snapshotOf(key);
+        CHECK(table.stateOf(key) == TcpState::Established);
+        CHECK(snapshot_before.has_value() && snapshot_after.has_value());
+        if (snapshot_before && snapshot_after) {
+            CHECK(snapshot_before->snd_nxt == snapshot_after->snd_nxt);
+            CHECK(snapshot_before->snd_una == snapshot_after->snd_una);
+            CHECK(snapshot_before->peer_mss == snapshot_after->peer_mss); // not renegotiated
+        }
+
+        // An unrelated SYN-bearing segment (wrong peer sequence) is still
+        // just dropped, not treated as a duplicate handshake.
+        auto unrelated = table.handle(key, makeSynAck(49163, 9090, 1234567, isn + 1), t0);
+        CHECK(!unrelated.reply.has_value());
+        CHECK(!unrelated.connection_established);
+    }
+
+    // --- Active-open sequence wraparound (section 5/29) ------------------
+    //
+    // Wirestack's own active-open ISN (nextIsn()) is a small incrementing
+    // counter with no caller-supplied seed, the same generator the
+    // passive path already uses for its local ISN -- consistent with
+    // that existing code, its own wraparound is not independently
+    // exercised here (there is no practical way to drive it to
+    // 0xffffffff from the public API; see docs/tcp.md). What IS fully
+    // caller-controlled, exactly like the existing passive-path
+    // "remote_isn = 0xffffffff" case above, is the PEER's ISN -- so this
+    // proves rcv_nxt wraps correctly, and that a valid/invalid ACK is
+    // still judged correctly when the local ISN (and therefore snd_nxt)
+    // is itself an ordinary small value while the peer's sequence space
+    // has wrapped.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49166, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        auto established =
+            table.handle(key, makeSynAck(49166, 9090, 0xffffffff, isn + 1), t0);
+        CHECK(established.connection_established);
+        auto snapshot = table.snapshotOf(key);
+        CHECK(snapshot.has_value());
+        if (snapshot) {
+            CHECK(snapshot->rcv_nxt == 0); // 0xffffffff + 1 wraps to 0
+        }
+        if (established.reply) {
+            CHECK(established.reply->acknowledgment_number == 0);
+        }
+
+        // A later peer segment whose sequence number is right at the
+        // wrapped rcv_nxt is accepted; validated via the same handle()
+        // path any receive uses (not active-open-specific).
+        auto data = table.handle(key, makeData(49166, 9090, 0, isn + 1, makeFilledPayload(3)), t0);
+        CHECK(data.accepted_payload.size() == 3);
+    }
+
+    // --- Post-establishment reuse of existing data/close machinery ------
+    // (section 18/22) -- no active-open-specific send/receive/close code
+    // exists; this exercises the same makeOutgoingData/handle/beginClose
+    // API passive connections use.
+
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 49164, remoteIp(), 9090};
+        auto connect = table.beginConnect(key, t0);
+        std::uint32_t isn = connect.syn->sequence_number;
+
+        std::vector<std::byte> options = {std::byte{2}, std::byte{4}, std::byte{0x02},
+                                           std::byte{0x00}}; // peer MSS = 512
+        auto establish = table.handle(key, makeSynAck(49164, 9090, 7000000, isn + 1, options), t0);
+        CHECK(establish.connection_established);
+
+        // Enqueue more than one MSS worth of application data -- must
+        // segment by the negotiated MSS just like a passive connection.
+        std::vector<std::byte> payload = makeFilledPayload(600);
+        auto sent = table.makeOutgoingData(key, payload, t0);
+        CHECK(!sent.error.has_value());
+        CHECK(sent.bytes_accepted == 600);
+        CHECK(sent.segments.size() == 2); // 512 + 88
+        if (sent.segments.size() == 2) {
+            CHECK(sent.segments[0].payload.size() == 512);
+            CHECK(sent.segments[1].payload.size() == 88);
+        }
+
+        // Cumulative ACK retires the data.
+        std::uint32_t data_end = isn + 1 + 600;
+        auto ack_result = table.handle(key, makeAck(49164, 9090, 7000001, data_end), t0);
+        auto after_ack = table.snapshotOf(key);
+        CHECK(after_ack.has_value());
+        if (after_ack) CHECK(after_ack->pending_count == 0);
+
+        // Receive an in-order binary payload, including non-printable
+        // bytes, and confirm rcv_nxt advances.
+        std::vector<std::byte> binary = {std::byte{0x00}, std::byte{0x01}, std::byte{0x7f},
+                                          std::byte{0x80}, std::byte{0xff}, std::byte{0x0a}};
+        auto recv = table.handle(key, makeData(49164, 9090, 7000001, data_end, binary), t0);
+        CHECK(recv.accepted_payload == binary);
+        auto after_recv = table.snapshotOf(key);
+        CHECK(after_recv.has_value());
+        if (after_recv) CHECK(after_recv->rcv_nxt == 7000001 + binary.size());
+
+        // Active close reuses beginClose/FIN sequencing.
+        auto close_result = table.beginClose(key, t0);
+        CHECK(close_result.accepted);
+        CHECK(table.stateOf(key) == TcpState::FinWait1);
+    }
+
+    // --- Active and passive open coexist on the same table (section 17) -
+
+    {
+        TcpConnectionTable table(8080);
+
+        // Passive connection on the listen port.
+        TcpConnectionKey passive_key{localIp(), 8080, remoteIp(), 60000};
+        auto passive_syn_ack = table.handle(passive_key, makeSyn(8080, 60000, 500), t0).reply;
+        CHECK(passive_syn_ack.has_value());
+        CHECK(table.stateOf(passive_key) == TcpState::SynReceived);
+
+        // Active connection on a different (ephemeral) local port.
+        TcpConnectionKey active_key{localIp(), 49165, remoteIp(), 9090};
+        auto connect = table.beginConnect(active_key, t0);
+        CHECK(connect.accepted);
+        CHECK(table.stateOf(active_key) == TcpState::SynSent);
+
+        // Completing the active handshake does not disturb the passive
+        // connection still mid-handshake.
+        std::uint32_t isn = connect.syn->sequence_number;
+        auto active_established =
+            table.handle(active_key, makeSynAck(49165, 9090, 7000000, isn + 1), t0);
+        CHECK(active_established.connection_established);
+        CHECK(table.stateOf(active_key) == TcpState::Established);
+        CHECK(table.stateOf(passive_key) == TcpState::SynReceived);
+
+        // Completing the passive connection likewise leaves the active
+        // one untouched.
+        auto passive_established = table.handle(
+            passive_key, makeAck(8080, 60000, 501, passive_syn_ack->sequence_number + 1), t0);
+        CHECK(table.stateOf(passive_key) == TcpState::Established);
+        CHECK(table.stateOf(active_key) == TcpState::Established);
     }
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;

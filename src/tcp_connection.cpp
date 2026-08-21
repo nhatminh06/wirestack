@@ -409,6 +409,76 @@ TcpSegment TcpConnectionTable::makeSynAck(const TcpConnectionKey& key,
     return reply;
 }
 
+std::vector<std::byte> TcpConnectionTable::buildActiveSynOptions() {
+    std::vector<std::byte> out;
+    out.push_back(std::byte{2}); // kind: MSS
+    out.push_back(std::byte{4}); // length
+    out.push_back(static_cast<std::byte>((kTcpMss >> 8) & 0xff));
+    out.push_back(static_cast<std::byte>(kTcpMss & 0xff));
+    out.push_back(std::byte{4}); // kind: SACK-Permitted -- always offered
+    out.push_back(std::byte{2}); // length
+    out.push_back(std::byte{1}); // NOP (pads to a 4-byte boundary)
+    out.push_back(std::byte{3}); // kind: Window Scale -- always offered
+    out.push_back(std::byte{3}); // length
+    out.push_back(static_cast<std::byte>(kLocalWindowScaleShift));
+    while (out.size() % 4 != 0) {
+        out.push_back(std::byte{0});
+    }
+    return out;
+}
+
+TcpSegment TcpConnectionTable::makeActiveSyn(const TcpConnectionKey& key,
+                                              const Connection& connection) {
+    TcpSegment syn;
+    syn.source_port = key.local_port;
+    syn.destination_port = key.remote_port;
+    syn.sequence_number = connection.local_isn;
+    syn.acknowledgment_number = 0;
+    syn.flags.syn = true;
+    syn.window_size = advertisedWindowFor(connection, /*apply_scale=*/false);
+    syn.urgent_pointer = 0;
+    syn.options = buildActiveSynOptions();
+    return syn;
+}
+
+TcpConnectResult TcpConnectionTable::beginConnect(const TcpConnectionKey& key,
+                                                   TcpClock::time_point now) {
+    TcpConnectResult result;
+    if (key.local_port == 0 || key.remote_port == 0) {
+        result.error = TcpConnectError::InvalidPort;
+        return result;
+    }
+    if (connections_.contains(key)) {
+        result.error = TcpConnectError::DuplicateConnection;
+        return result;
+    }
+
+    Connection connection;
+    connection.state = TcpState::SynSent;
+    connection.remote_isn_known = false;
+    connection.local_isn = nextIsn();
+    connection.snd_una = connection.local_isn;
+    connection.snd_nxt = connection.local_isn + 1;
+
+    auto [inserted_it, _] = connections_.emplace(key, connection);
+
+    TcpSegment syn = makeActiveSyn(key, inserted_it->second);
+
+    PendingTransmission pending;
+    pending.sequence_start = inserted_it->second.local_isn;
+    pending.is_syn = true;
+    pending.is_active_syn = true;
+    pending.flags = syn.flags;
+    pending.first_sent_at = now;
+    pending.last_sent_at = now;
+    pending.timeout_interval = inserted_it->second.current_rto;
+    inserted_it->second.pending.push_back(std::move(pending));
+
+    result.accepted = true;
+    result.syn = std::move(syn);
+    return result;
+}
+
 TcpSegment TcpConnectionTable::makePureAck(const TcpConnectionKey& key, const Connection& connection,
                                             std::optional<std::uint32_t> most_recent_fragment_start) {
     TcpSegment reply;
@@ -743,10 +813,26 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
                                                           Connection& connection,
                                                           const TcpSegment& segment,
                                                           TcpClock::time_point now) {
-    // A SYN is invalid in every synchronized state; the whole segment is
-    // dropped, not partially processed.
+    // A SYN is invalid in every synchronized state, EXCEPT a duplicate of
+    // the exact SYN-ACK that completed this connection's own active-open
+    // handshake (see docs/tcp.md section on duplicate SYN-ACK): the final
+    // ACK was lost, so the peer retransmitted its SYN-ACK. That gets a
+    // fresh pure ACK for the already-established connection -- no
+    // renegotiation, no sequence-space movement, no second establishment.
+    // Any other SYN-bearing segment here is dropped whole, not partially
+    // processed.
     if (segment.flags.syn) {
-        return {};
+        bool duplicate_handshake_syn_ack =
+            segment.flags.ack && !segment.flags.rst && !segment.flags.fin &&
+            segment.payload.empty() && connection.remote_isn_known &&
+            segment.sequence_number == connection.remote_isn &&
+            segment.acknowledgment_number == connection.local_isn + 1;
+        if (!duplicate_handshake_syn_ack) {
+            return {};
+        }
+        TcpReceiveResult result;
+        result.reply = makePureAck(key, connection);
+        return result;
     }
 
     // Malformed options drop the whole segment before any state mutation --
@@ -1022,6 +1108,109 @@ TcpReceiveResult TcpConnectionTable::handleSynchronized(const TcpConnectionKey& 
     return result;
 }
 
+TcpReceiveResult TcpConnectionTable::handleSynSent(const TcpConnectionKey& key,
+                                                    Connection& connection,
+                                                    const TcpSegment& segment,
+                                                    TcpClock::time_point now) {
+    // Malformed options are rejected before any state mutation --
+    // including an otherwise-acceptable RST (same rule preserved from
+    // handleSynchronized: no reset, no ACK processing, no option-state
+    // mutation, no sequence-state mutation).
+    auto parsed_options_result = parseTcpOptions(segment.options);
+    if (std::holds_alternative<TcpOptionParseError>(parsed_options_result)) {
+        return {};
+    }
+    const TcpParsedOptions& parsed_options = std::get<TcpParsedOptions>(parsed_options_result);
+
+    if (segment.flags.rst) {
+        // Accepted only if it acknowledges the outstanding SYN -- a valid
+        // Linux-style closed-port refusal (RST|ACK, ack=local ISN+1).
+        // Anything else (bare RST, wrong ACK) is ignored: it must not
+        // remove the connection.
+        if (segment.flags.ack && segment.acknowledgment_number == connection.snd_nxt) {
+            TcpReceiveResult result;
+            result.connection_reset = true;
+            connection.pending_removal = true;
+            return result;
+        }
+        return {};
+    }
+
+    if (!segment.flags.syn) {
+        // ACK-only, FIN, FIN|ACK, payload-only, PSH|ACK -- all unsupported
+        // before establishment (see docs/tcp.md): no payload delivery, no
+        // partial FIN processing, no state change. Silent drop.
+        return {};
+    }
+
+    if (!segment.flags.ack) {
+        // A bare SYN from the peer here would be simultaneous open, out of
+        // scope for this milestone.
+        return {};
+    }
+
+    if (segment.flags.fin || !segment.payload.empty()) {
+        // A FIN-bearing or payload-bearing SYN-ACK never establishes.
+        return {};
+    }
+
+    if (segment.acknowledgment_number != connection.snd_nxt) {
+        // Does not acknowledge Wirestack's outstanding SYN (too low, too
+        // high, or equal to local ISN rather than local ISN+1).
+        return {};
+    }
+
+    connection.remote_isn = segment.sequence_number;
+    connection.remote_isn_known = true;
+    connection.rcv_nxt = segment.sequence_number + 1;
+
+    // Option negotiation directionality mirrors the passive path exactly,
+    // with the two sides' SYN/SYN-ACK swapped (see docs/tcp.md): the
+    // peer's MSS limits Wirestack's outgoing segments, the peer's Window
+    // Scale decodes future peer windows, and Wirestack's own local scale
+    // (always offered in the active SYN) applies once the peer's SYN-ACK
+    // also carried the option.
+    connection.peer_mss = parsed_options.maximum_segment_size.value_or(kDefaultPeerMss);
+    connection.effective_send_mss =
+        std::min<std::uint16_t>(static_cast<std::uint16_t>(kTcpMss), connection.peer_mss);
+    connection.cwnd = initialCongestionWindow(connection.effective_send_mss);
+    if (parsed_options.window_scale) {
+        connection.window_scaling_enabled = true;
+        connection.peer_window_scale =
+            std::min<std::uint8_t>(*parsed_options.window_scale, kMaxWindowScaleShift);
+        connection.local_window_scale = kLocalWindowScaleShift;
+    }
+    connection.sack_permitted = parsed_options.sack_permitted;
+
+    connection.state = TcpState::Established;
+    // Drains the pending active SYN; also this connection's first RTT
+    // sample, unless the SYN was retransmitted (Karn's rule falls out of
+    // the same was_retransmitted/rtt_sample_taken machinery used
+    // everywhere else -- see retireAcknowledged).
+    retireAcknowledged(connection, segment.acknowledgment_number, now);
+
+    // The SYN-ACK's raw window field initializes the peer send window
+    // directly -- window scaling never applies to a SYN or SYN-ACK's own
+    // window field, even once negotiated (see docs/tcp.md).
+    connection.snd_wnd = segment.window_size;
+    connection.snd_wl1 = segment.sequence_number;
+    connection.snd_wl2 = segment.acknowledgment_number;
+
+    TcpSegment final_ack;
+    final_ack.source_port = key.local_port;
+    final_ack.destination_port = key.remote_port;
+    final_ack.sequence_number = connection.snd_nxt; // consumes no sequence space
+    final_ack.acknowledgment_number = connection.rcv_nxt;
+    final_ack.flags.ack = true;
+    final_ack.window_size = advertisedWindowFor(connection, connection.window_scaling_enabled);
+    final_ack.urgent_pointer = 0;
+
+    TcpReceiveResult result;
+    result.reply = std::move(final_ack); // not added to the retransmission queue
+    result.connection_established = true;
+    return result;
+}
+
 TcpReceiveResult TcpConnectionTable::handleTimeWait(const TcpConnectionKey& key,
                                                       Connection& connection,
                                                       const TcpSegment& segment,
@@ -1053,7 +1242,13 @@ TcpReceiveResult TcpConnectionTable::handleTimeWait(const TcpConnectionKey& key,
 TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
                                              const TcpSegment& segment,
                                              TcpClock::time_point now) {
-    if (key.local_port != listen_port_) {
+    auto it = connections_.find(key);
+
+    // A local port other than the configured listen port is only valid
+    // when it already has active-open connection state (beginConnect
+    // uses an arbitrary caller-supplied source port, not the listen
+    // port) -- otherwise it is genuinely unbound.
+    if (it == connections_.end() && key.local_port != listen_port_) {
         // Unbound port: never respond to an incoming RST; everything
         // else gets a closed-port reset.
         if (segment.flags.rst) {
@@ -1063,8 +1258,6 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
         result.reply = makeClosedPortReset(segment);
         return result;
     }
-
-    auto it = connections_.find(key);
 
     if (it == connections_.end()) {
         if (segment.flags.rst) {
@@ -1137,6 +1330,14 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
 
     if (connection.state == TcpState::TimeWait) {
         auto result = handleTimeWait(key, connection, segment, now);
+        if (connection.pending_removal) {
+            connections_.erase(it);
+        }
+        return result;
+    }
+
+    if (connection.state == TcpState::SynSent) {
+        auto result = handleSynSent(key, connection, segment, now);
         if (connection.pending_removal) {
             connections_.erase(it);
         }
@@ -1425,17 +1626,30 @@ TcpTimeoutPollResult TcpConnectionTable::pollRetransmissions(TcpClock::time_poin
         segment.source_port = it->first.local_port;
         segment.destination_port = it->first.remote_port;
         segment.sequence_number = oldest.sequence_start;
-        segment.acknowledgment_number =
-            oldest.is_syn ? connection.remote_isn + 1 : connection.rcv_nxt;
+        // An active SYN's ack number is always 0 (no ACK flag is set on
+        // it -- see makeActiveSyn); a passive SYN-ACK's ack number is
+        // fixed at remote_isn+1; anything else is an ordinary data/FIN
+        // segment, acked with the current rcv_nxt.
+        segment.acknowledgment_number = oldest.is_active_syn ? 0
+                                         : oldest.is_syn      ? connection.remote_isn + 1
+                                                               : connection.rcv_nxt;
         segment.flags = oldest.flags;
         // Refreshed to the current advertised window, same as the
         // acknowledgment number just above, before checksum serialization.
-        // A retransmitted SYN-ACK stays unscaled, same as the original.
+        // A retransmitted SYN or SYN-ACK stays unscaled, same as the
+        // original (window scaling never applies to either's own window
+        // field -- see docs/tcp.md).
         segment.window_size =
             advertisedWindowFor(connection, !oldest.is_syn && connection.window_scaling_enabled);
         segment.urgent_pointer = 0;
         segment.payload = oldest.payload;
-        if (oldest.is_syn) {
+        if (oldest.is_active_syn) {
+            // A timeout-retransmitted active SYN must carry the exact same
+            // option bytes as the original (see docs/tcp.md) -- these are
+            // Wirestack's own fixed offer, not negotiated state, so they
+            // are simply rebuilt identically rather than stored per-entry.
+            segment.options = buildActiveSynOptions();
+        } else if (oldest.is_syn) {
             // A timeout-retransmitted SYN-ACK must carry the same
             // negotiated options (MSS, Window Scale) as the original --
             // otherwise a retransmission silently drops Data Offset bytes

@@ -1226,6 +1226,170 @@ wraparound `uint32_t` addition), and RST|ACK. Never generated in response
 to an incoming RST, and never creates connection state or a retransmission
 entry.
 
+## TCP active open
+
+Wirestack can initiate a connection to a listening peer (client-side
+three-way handshake), in addition to the passive open covered above.
+TCP simultaneous open is not implemented -- a bare SYN received while
+Wirestack is in SynSent is dropped, not treated as a second handshake
+path.
+
+### API
+
+```cpp
+TcpConnectResult beginConnect(const TcpConnectionKey& key, TcpClock::time_point now);
+```
+
+The caller supplies the exact four-tuple (local IP, local port, remote
+IP, remote port) -- there is no ephemeral-port allocator; the runtime
+demonstration below uses one explicitly configured source port.
+Rejected (`accepted=false`, `TcpConnectError`) for a zero local or
+remote port (`InvalidPort`) or a four-tuple that already has connection
+state, active or passive (`DuplicateConnection`). A rejected call
+creates no state, consumes no ISN, and queues no transmission.
+
+### SynSent
+
+A new `TcpState::SynSent` value. A successful `beginConnect` inserts a
+`Connection` in this state with `local_isn` freshly drawn, `snd_una =
+local_isn`, `snd_nxt = local_isn + 1` (the SYN consumes one sequence
+number), and no valid peer sequence state yet -- tracked with a
+`remote_isn_known` flag rather than treating an arbitrary zero as valid
+(a passively-created connection always has this true from construction,
+since its `remote_isn` comes from the peer's initial SYN, known
+immediately). Every existing state switch in the connection table was
+audited: SynSent is dispatched to its own `handleSynSent` before the
+shared `handleSynchronized` path, so it can never be silently treated as
+Established, SynReceived, or a synchronized close state.
+
+### Active SYN
+
+Built by `makeActiveSyn`: source/destination ports from the key,
+sequence number `local_isn`, acknowledgment number 0, `SYN=1` only
+(`ACK=0`, `RST=0`, `FIN=0`), empty payload, unscaled window (window
+scaling never applies to a SYN's own window field). Its options
+(`buildActiveSynOptions`) advertise MSS (`kTcpMss`), SACK-Permitted
+(always offered), and Window Scale (always offered,
+`kLocalWindowScaleShift`) -- the same local capability constants the
+passive SYN-ACK path uses, offered unconditionally here since no peer
+options have been seen yet.
+
+### Retransmission
+
+The active SYN uses the existing `PendingTransmission`/timer machinery,
+not a second queue. A new `is_active_syn` flag on that entry (alongside
+the existing `is_syn`, which a passive SYN-ACK entry also sets)
+distinguishes the two roles for `pollRetransmissions`: an active SYN
+retransmission always carries `ack=0` and no ACK flag, rebuilds the
+exact same option bytes via `buildActiveSynOptions`, and stays unscaled,
+while a SYN-ACK retransmission keeps its existing `remote_isn+1`/
+`buildSynAckOptions` behavior. Adaptive RTO/backoff, retry-count
+exhaustion (removing only the affected connection, freeing the
+four-tuple for reuse), and the "never gated by cwnd/rwnd" rule are all
+the same generic machinery every other pending entry already uses --
+nothing SYN-specific was added there.
+
+### SYN-ACK validation
+
+`handleSynSent` accepts a candidate SYN-ACK only if: the segment carries
+`SYN=1, ACK=1`; `RST=0`; `FIN=0`; payload empty;
+`acknowledgment_number == snd_nxt` (i.e. exactly `local_isn + 1` --
+too low, too high, or equal to `local_isn` itself all fail); and its TCP
+options parse structurally (malformed options are rejected before any
+state, sequence, or RST mutation, matching the existing rule in
+`handleSynchronized`, including for an RST that happens to arrive with
+malformed option bytes attached -- see "Reset handling" below). Anything
+else in SynSent (an ACK-only segment, a bare SYN from the peer, a FIN or
+FIN|ACK, a payload-bearing SYN-ACK, a PSH|ACK) is silently dropped: no
+payload delivery, no partial FIN processing, no simultaneous-open state,
+no reply. This is a deliberately narrow, documented behavior, not RFC
+5961-style challenge-ACK handling.
+
+### Option negotiation
+
+Directionality mirrors the passive path exactly, with the two SYN sides
+swapped: the peer's MSS (from its SYN-ACK) limits Wirestack's outgoing
+segment size (`effective_send_mss = min(kTcpMss, peer_mss)`, defaulting
+to `kDefaultPeerMss` if the peer omitted MSS); the peer's Window Scale
+(if present) decodes future peer-advertised windows and simultaneously
+enables Wirestack's own already-offered local scale for its own
+advertised window; the peer's SACK-Permitted (if present) determines
+whether Wirestack may send SACK blocks, the same combined `sack_permitted`
+flag the passive path already uses for both directions. None of this
+touches connection state until options have already parsed structurally.
+
+### Window initialization
+
+The SYN-ACK's raw `window_size` field initializes `snd_wnd` directly --
+window scaling is never applied to a SYN or SYN-ACK's own window field,
+even once negotiated, exactly as the passive path already treats its own
+SYN-ACK. The next ordinary (non-SYN) ACK is the first segment where the
+negotiated peer scale actually applies.
+
+### RTT sampling and Karn's rule
+
+The active SYN's pending entry uses the same `retireAcknowledged` path
+every other entry does: a clean (never-retransmitted) SYN takes one RTT
+sample on establishment; a SYN retransmitted by timeout is marked
+`was_retransmitted` and is therefore never a sampling candidate (Karn's
+rule) even though it still establishes normally once the (now
+ambiguous) SYN-ACK arrives. No separate RTT estimator was added.
+
+### Final ACK
+
+On a valid SYN-ACK: `remote_isn = segment.sequence_number`, `rcv_nxt =
+remote_isn + 1`, `snd_una = snd_nxt = local_isn + 1`, state becomes
+Established, and a final ACK is built (source/destination from the key,
+`sequence_number = snd_nxt` -- unchanged, consumes no sequence space --
+`acknowledgment_number = rcv_nxt`, `ACK` only, post-negotiation
+advertised window). It is returned as an ordinary immediate reply and is
+**not** added to the retransmission queue, the same way every other pure
+ACK in this codebase is never queued.
+
+### Reset/refusal
+
+A Linux closed port answers an active SYN with `RST|ACK`,
+`ack=local_isn+1`. `handleSynSent` accepts a reset only when
+`flags.rst && flags.ack && acknowledgment_number == snd_nxt`; any other
+reset shape (bare RST, wrong ACK) is ignored without mutating the
+connection, and -- like every other malformed-options-before-RST path in
+this codebase (see the existing `handleSynchronized` fix this preserves)
+-- a reset whose accompanying option bytes fail to parse is also ignored
+before any mutation. A valid refusal removes the connection (no pending
+SYN, no reply is ever sent for an RST) and immediately frees the
+four-tuple for a later `beginConnect`; unrelated connections are
+untouched.
+
+### Duplicate SYN-ACK after establishment
+
+If the final ACK is lost and the peer retransmits its SYN-ACK, that
+retransmission still carries `SYN=1`, which `handleSynchronized` would
+otherwise drop unconditionally for every synchronized state. A narrow
+exception checks whether the SYN-bearing segment matches this
+connection's own completed handshake identity exactly
+(`ACK` set, `RST`/`FIN` clear, empty payload, `sequence_number ==
+remote_isn`, `acknowledgment_number == local_isn + 1`) and, if so,
+replies with a fresh pure ACK for the already-established connection --
+no renegotiation, no sequence-space movement, no second establishment.
+Any other SYN-bearing segment in a synchronized state is still dropped
+exactly as before.
+
+### Runtime demonstration and neighbor-resolution limitation
+
+`wirestack <tap> <ip> <mac> --active-open <ip>:<port> --source-port
+<port>` (both flags required together; absent by default, leaving the
+passive HTTP listener as the only runtime behavior). main.cpp owns this
+policy entirely -- it waits for the peer's MAC to already be present in
+the existing ARP cache, calls `beginConnect` exactly once, and sends the
+resulting SYN through the existing `sendTcpSegment` path; the SYN-ACK,
+RST, and timeout outcomes are then handled by the ordinary receive loop.
+**Limitation**: active TCP open is implemented, but the current runtime
+demonstration requires the peer MAC to already be present in the ARP
+cache (learned opportunistically from any prior ARP or IPv4 traffic from
+that peer -- see `handleIpv4`'s `arp_cache.insert` call). Wirestack does
+not send an ARP request of its own to actively resolve an unknown
+neighbor; there is no autonomous neighbor discovery or routing table.
+
 ## Manual verification procedure
 
 For a reproducible, automated version of the checks below -- plus
@@ -1348,7 +1512,10 @@ probe, and the reopening update.
   DSACK; no RFC 6675 pipe-estimation algorithm; no PRR; no Limited
   Transmit; no CUBIC; no BBR; no ECN; no congestion-window validation
   after idle; no ACK pacing.
-- No active open (Wirestack never initiates a connection).
+- Active open (see "TCP active open" above) has no TCP simultaneous
+  open, no general ephemeral-port allocator, and the current runtime
+  demonstration requires the peer MAC to already be present in the ARP
+  cache (no active neighbor resolution).
 - No challenge ACK; an unacceptable RST is simply dropped.
 - The RTT/RTO estimator is an integer-arithmetic approximation of
   RFC 6298 (Karn's rule, SRTT/RTTVAR/RTO, 1s/60s bounds), not a claim of
@@ -1377,7 +1544,28 @@ probe, and the reopening update.
 - Single application on port 8080 (the HTTP/1.0 demonstration, see
   [docs/http.md](http.md)); no general application registration.
 
+To exercise active open live, start a plain listener on the peer and
+point Wirestack at it (see [docs/interoperability.md](interoperability.md)
+for the isolated-namespace version this project's live suite actually
+runs):
+
+```bash
+# terminal 2 (the peer)
+nc -l 10.0.0.1 9090
+
+# terminal 1
+sudo ./build/wirestack wire0 10.0.0.2 02:00:00:00:00:02 \
+    --active-open 10.0.0.1:9090 --source-port 49152
+```
+
+Expect tcpdump on `wire0` to show Wirestack's `Flags [S]` from
+10.0.0.2:49152, the peer's `Flags [S.]`, and Wirestack's `Flags [.]`
+completing the handshake; `nc` reports the connection accepted. Pointing
+`--active-open` at a closed port instead (no listener) is expected to
+show the peer's `Flags [R.]` and Wirestack's own printed "active
+connection refused" line, with no further SYN retransmission afterward.
+
 ## Next TCP work
 
-Reproducible Linux TAP interoperability, loss/reordering qualification,
-and packet-capture evidence.
+Minimal outbound HTTP/1.0 client over TCP active open using a literal
+IPv4 address.

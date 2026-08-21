@@ -18,7 +18,7 @@ partial-ACK recovery and a bounded segment-granular SACK scoreboard):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented, deterministically tested, and live-qualified against a real Linux client (see docs/interoperability.md) for the handshake, timeout retransmission, SYN-ACK loss recovery, and receiver-side SACK -- sender-side multi-segment SACK recovery remains deterministic-test-only |
+| TCP         | passive handshake, and active open (`beginConnect`/SynSent, an opt-in `--active-open` runtime path, RST refusal, timeout retransmission -- see docs/tcp.md) with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented, deterministically tested, and live-qualified against a real Linux client (see docs/interoperability.md) for the passive handshake, timeout retransmission, SYN-ACK loss recovery, and receiver-side SACK -- sender-side multi-segment SACK recovery remains deterministic-test-only; active open's handshake (established and refused) is also live-qualified against a real Linux listener (see `tools/integration/active_open.sh`), while data transfer over an actively-opened connection remains deterministic-test-only (see `tests/test_tcp_active_open_path.cpp`) |
 | HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented, deterministically tested, and live-qualified with a real `curl --http1.0` request (see docs/interoperability.md) |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -94,7 +94,8 @@ SACK recovery is not exercised by that harness (the current HTTP
 response is under one MSS) and remains covered only by the deterministic
 tests in `tests/test_tcp_sack_path.cpp`.
 
-Not implemented: TCP active-open/DSACK/RFC 6675 pipe-based recovery/PRR/
+Not implemented: TCP simultaneous open, a general ephemeral-port
+allocator, DSACK, RFC 6675 pipe-based recovery, PRR,
 Limited Transmit/CUBIC/BBR/ECN/timestamps (persist is implemented, but
 only for the narrow no-outstanding-data case; SACK coverage is
 segment-granular, not sub-range, and reneging recovery beyond clearing
