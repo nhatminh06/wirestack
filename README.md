@@ -7,8 +7,8 @@ implementing them, not feature completeness or performance.
 
 ## Status
 
-Milestone 0 (project foundation) through Milestone 9 (minimal HTTP/1.0
-GET handling):
+Milestone 0 (project foundation) through Milestone 10 (TCP segmentation
+and bounded receive reassembly):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
@@ -18,7 +18,7 @@ GET handling):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake, single-segment in-order data transfer, bounded timeout retransmission, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
+| TCP         | passive handshake, MSS-bounded segmentation within the peer's send window, bounded out-of-order receive reassembly, timeout retransmission, and passive/active/simultaneous close with TIME_WAIT and reset handling implemented and deterministically tested; live TAP verification still required |
 | HTTP        | minimal HTTP/1.0 GET (`/` -> 200, other paths -> 404, one request per connection) implemented and deterministically tested; live curl verification still required |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -32,13 +32,16 @@ GET handling):
   minimal `UdpEndpointTable`, and a built-in echo endpoint on port 9000
 - TCP segment parsing/serialization with the IPv4 pseudo-header checksum, a
   4-tuple `TcpConnectionTable`, a passive handshake (LISTEN implicit /
-  SYN_RECEIVED / ESTABLISHED), sequence-space tracking, single in-order
-  data segment receive with duplicate/out-of-order/overlap rejection,
-  cumulative ACK processing, bounded timeout-based retransmission of
-  SYN-ACK/data/FIN with cumulative/partial ACK retirement, passive/active/
-  simultaneous close (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a
-  deterministic 60-second TIME_WAIT, acceptable-inbound-RST handling, and
-  closed-port RST generation
+  SYN_RECEIVED / ESTABLISHED), sequence-space tracking, MSS-bounded
+  (1460-byte) outgoing segmentation with atomic peer-send-window
+  enforcement, bounded out-of-order receive reassembly (first-arrival-wins
+  overlap trimming, 65535-byte/128-fragment bounds, out-of-order FIN
+  retention) with a dynamically advertised receive window, cumulative ACK
+  processing, bounded timeout-based retransmission of SYN-ACK/data/FIN
+  with cumulative/partial ACK retirement, passive/active/simultaneous
+  close (FinWait1/FinWait2/CloseWait/Closing/LastAck) with a deterministic
+  60-second TIME_WAIT, acceptable-inbound-RST handling, and closed-port
+  RST generation
 - A bounded, stateless HTTP/1.0 request parser (`wirestack::http`) layered
   above TCP: GET-only, `/` -> 200 with a fixed body, any other valid path
   -> 404, unsupported method -> 405, unsupported version -> 505,
@@ -61,9 +64,10 @@ echo, a completed TCP handshake, and a `curl --http1.0` request) is
 manually verifiable but has not been exercised in every development
 environment this project has run in — see those docs for exact commands.
 
-Not implemented: TCP segmentation/reassembly/active-open/congestion
-control/RTT estimation/fast retransmit, HTTP/1.1/keep-alive/pipelining/
-request bodies/chunked encoding/TLS, IPv4 options, fragmentation, routing.
+Not implemented: TCP active-open/congestion control/fast retransmit/SACK/
+window scaling/RTT estimation/adaptive RTO/zero-window probes/remote MSS
+negotiation, HTTP/1.1/keep-alive/pipelining/request bodies/chunked
+encoding/TLS, IPv4 options, fragmentation, routing.
 
 ## Structure
 

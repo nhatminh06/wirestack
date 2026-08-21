@@ -2,14 +2,16 @@
 
 ## Current support
 
-Passive three-way handshake, single-segment in-order application data
-transfer, bounded timeout-based retransmission of SYN-ACK/data/FIN,
-passive/active/simultaneous close with a deterministic TIME_WAIT, and
-acceptable-inbound-RST/closed-port-RST handling, over IPv4, on a single
-fixed listening port (8080). No active open, no segmentation, no
-reassembly, no congestion control. Port 8080 now hosts the minimal
-HTTP/1.0 demonstration described in [docs/http.md](http.md), not a raw
-byte echo -- this file covers only TCP itself.
+Passive three-way handshake, MSS-bounded outgoing segmentation within the
+peer's advertised send window, bounded out-of-order receive reassembly
+with duplicate/overlap trimming, bounded timeout-based retransmission of
+SYN-ACK/data/FIN, passive/active/simultaneous close with a deterministic
+TIME_WAIT, and acceptable-inbound-RST/closed-port-RST handling, over
+IPv4, on a single fixed listening port (8080). No active open, no
+congestion control, no fast retransmit, no SACK, no window scaling. Port
+8080 hosts the minimal HTTP/1.0 demonstration described in
+[docs/http.md](http.md), not a raw byte echo -- this file covers only
+TCP itself.
 
 `TcpSegment` holds source/destination ports, sequence/acknowledgment
 numbers, flags, window size, urgent pointer, and the raw `options` and
@@ -87,9 +89,10 @@ later without touching handshake logic.
 
 ### Window field
 
-The outgoing SYN-ACK always advertises a fixed window (65535). There is no
-receive-window accounting or flow control; the field is transmitted but
-not backed by real buffer-space tracking.
+The outgoing SYN-ACK advertises the current advertised receive window
+(see "Receive windows and reassembly" below) -- 65535 for a fresh
+connection with nothing buffered, shrinking as out-of-order bytes
+accumulate.
 
 ## Established-state data transfer
 
@@ -108,47 +111,157 @@ snd_nxt = S + 1   -- next sequence number Wirestack will send
 ### Receiving application data
 
 A segment is only considered for payload delivery when the connection is
-Established, ACK is set, and SYN/FIN/RST are all clear (any of those three
-flags on an Established segment drops it entirely, payload included --
-none of them are implemented). PSH is optional; delivery does not depend
-on it. An ACK number beyond `snd_nxt` invalidates the whole segment (no
-state change, no delivery). A valid ACK number advances `snd_una` when
-it's ahead of the current value; a duplicate or stale ACK leaves it
-unchanged.
+synchronized (`Established` or `CloseWait`, plus `FinWait1`/`FinWait2`
+for a peer FIN still to arrive), ACK is set, and SYN is clear (a SYN on
+an already-synchronized segment drops it entirely; RST is handled
+separately -- see "Reset handling"). PSH is optional; delivery does not
+depend on it. An ACK number beyond `snd_nxt` invalidates the whole
+segment (no state change, no delivery, no reassembly buffering, no FIN
+retention). A valid ACK number advances `snd_una` when it's ahead of the
+current value and updates the peer send window (see below); a duplicate
+or stale ACK leaves both unchanged.
 
-For a non-empty payload:
+For a non-empty payload or a FIN, the segment is trimmed to the current
+receive window and handed to the reassembly buffer -- see "Receive
+windows and reassembly" for the full left-trim/right-trim/buffer/release
+algorithm. `accepted_payload` is non-empty only when this call made new
+bytes contiguous with `rcv_nxt`, whether because the segment itself
+arrived in order or because it closed the last gap needed to release
+previously buffered out-of-order bytes (possibly several fragments'
+worth, concatenated).
 
-- `segment.sequence_number == rcv_nxt` (in-order, new data): the payload
-  is exposed to the caller exactly once, and `rcv_nxt` advances by the
-  payload length.
-- any other sequence number -- duplicate, out-of-order, or overlapping --
-  is treated identically: nothing is delivered, `rcv_nxt` is unchanged,
-  and a duplicate ACK for the current `rcv_nxt` is generated. There is no
-  out-of-order buffering and no overlap classification; this is
-  intentionally the smallest correct behavior, not reassembly.
-
-An ordinary ACK-only Established segment (empty payload, valid ACK
-number) updates ack-processing state and produces no reply -- replying to
-every ACK would create an ACK loop.
+An ordinary ACK-only Established/CloseWait segment (empty payload, no
+FIN, valid ACK number) updates ack-processing state and produces no
+reply -- replying to every ACK would create an ACK loop. A segment that
+releases no new contiguous bytes (duplicate, still-gapped, or entirely
+outside the window) gets a duplicate ACK reflecting the current
+`rcv_nxt` and advertised window instead.
 
 ### Sending application data and generating ACKs
 
 A pure ACK (`sequence_number = snd_nxt`, `acknowledgment_number =
 rcv_nxt`, flags ACK only, empty payload) consumes no sequence space and
-is used only for the duplicate/out-of-order/overlapping-data case above.
+is used only for the no-new-contiguous-bytes case above.
 
-An outgoing data segment (`sequence_number = snd_nxt`,
-`acknowledgment_number = rcv_nxt`, flags PSH|ACK, payload as given)
-advances `snd_nxt` by the payload length once the segment is
-successfully constructed; it is rejected (state unchanged) for an unknown
-or not-yet-Established connection, an empty payload, or a payload that
-would push the segment past the 65535-byte pseudo-header length limit.
-One call produces at most one segment -- no segmentation.
+`makeOutgoingData` segments `payload` into `ceil(N / kTcpMss)` PSH|ACK
+segments (`kTcpMss` = 1460 bytes -- see "MTU and MSS" below), each with
+`acknowledgment_number = rcv_nxt` and the current advertised window, PSH
+set only on the final segment, contiguous sequence numbers starting at
+`snd_nxt`. The send is atomic (see "Send window" below): either every
+byte is accepted and segmented, registering one retransmission-queue
+entry per segment and advancing `snd_nxt` once by the total length, or
+nothing is queued and `snd_nxt` is unchanged. `beginClose`'s FIN segment
+also uses the current advertised window and requires one byte of
+available send window, same as any other send.
 
 Sequence comparisons use 32-bit unsigned arithmetic with a
 wraparound-safe signed-difference check, under the assumption that the
 tracked send/receive window stays under half of the 32-bit sequence
 space.
+
+## MTU and MSS
+
+Wirestack never emits IPv4 or TCP options on anything it constructs, so
+both headers are always exactly 20 bytes; MSS is therefore a fixed local
+constant rather than something computed from serialized header lengths
+or negotiated with the peer:
+
+```text
+IPv4 MTU:          1500 bytes
+IPv4 header:         20 bytes
+TCP header:           20 bytes
+local fixed MSS:   1460 bytes  (wirestack::kTcpMss)
+```
+
+Remote MSS negotiation (reading the peer's MSS option from its SYN) is
+not implemented -- Wirestack always assumes and enforces its own 1460
+regardless of what the peer advertises.
+
+## Send window
+
+`Connection` tracks the peer-advertised window (`snd_wnd`, a plain
+16-bit value -- no window scaling) and the sequence/ack numbers of the
+segment that last legitimately updated it (`snd_wl1`/`snd_wl2`,
+RFC 793's SND.WL1/WL2), so a segment that arrives out of order can never
+replace a newer window advertisement with a stale one. `snd_wnd` is
+initialized directly from the handshake-completing ACK, then updated on
+every valid ACK-bearing segment when `seq > snd_wl1`, or `seq == snd_wl1
+and snd_wl2 <= ack`.
+
+```text
+flight_size = snd_nxt - snd_una
+available    = flight_size >= snd_wnd ? 0 : snd_wnd - flight_size
+```
+
+An application send of `N` bytes (`makeOutgoingData`, capped at
+`kMaxApplicationSendSize` = 65535 bytes regardless of window) is
+permitted only when `N <= available`; a local FIN requires `available
+>= 1`. A zero window blocks all new payload and FIN sends but does not
+block anything else: ACK and RST processing continue normally, and
+already-outstanding (unacknowledged) segments still retransmit on
+schedule through the existing timeout machinery -- there is no persist
+timer and no zero-window probe, so once the window is genuinely zero and
+nothing is outstanding, Wirestack simply waits for the peer to advertise
+room; callers must retry a rejected send later themselves, since there is
+no internal send queue.
+
+## Receive windows and reassembly
+
+### Capacity
+
+```text
+receive capacity:            65535 bytes  (wirestack::kTcpReceiveCapacity)
+maximum reassembly fragments:  128        (wirestack::kMaxReassemblyFragments)
+```
+
+The receive window is `[rcv_nxt, rcv_nxt + advertised_window)`, where
+`advertised_window = receive capacity - buffered out-of-order bytes`
+(an accepted out-of-order FIN counts as one unit of that buffered
+space), clamped into the 16-bit window field. Every newly constructed
+outgoing segment (SYN-ACK, pure ACK, data, FIN) uses this current value;
+a retransmitted segment refreshes both its acknowledgment number and its
+window field before checksum serialization, the same as the
+already-existing acknowledgment-number refresh.
+
+### Trimming and buffering
+
+An incoming segment is left-trimmed to `max(rcv_nxt, segment.sequence_number)`
+(already-delivered prefix discarded) and right-trimmed to the window's
+right edge (bytes beyond it ignored); if nothing of the payload survives
+and no FIN lies in the window, the segment is a pure duplicate/out-of-window
+arrival -- nothing stored, nothing delivered, a duplicate ACK sent. The
+surviving bytes are inserted into a bounded fragment list using
+**first-arrival-wins**: bytes already buffered keep their original value,
+and new input only fills previously-missing sequence positions -- this is
+a deterministic, limited overlap policy for this milestone, not general
+attack-resistant TCP normalization. Fragments are kept sorted and
+coalesced whenever they become byte-adjacent, which keeps the steady-state
+fragment count low; insertion is bounded by `kMaxReassemblyFragments`
+independent of total buffered size (excess new fragments are simply
+dropped, which can only shrink what's buffered, never overflow it).
+
+### Release
+
+After insertion, every fragment now contiguous with `rcv_nxt` is released
+in order (this can span several previously-buffered fragments already
+merged into one by coalescing), advancing `rcv_nxt` and handed to the
+caller as one concatenated `accepted_payload` -- out-of-order bytes are
+never exposed early. If a retained peer FIN's position has now been
+reached, it is consumed (`rcv_nxt += 1`, `peer_closed` set exactly once,
+the existing close-state transition applied) in the same call.
+
+### Out-of-order FIN
+
+A FIN is retained (not yet consumed) when it arrives before all
+preceding bytes have -- but only in a state where the peer's FIN hasn't
+already been consumed (`Established`, `FinWait1`, `FinWait2`); in every
+other synchronized state a further FIN flag is necessarily a
+retransmission of one already consumed, handled by the ordinary
+duplicate-ACK path. The FIN's own sequence position must itself lie
+within the receive window to be retained -- a FIN whose preceding
+payload was right-edge-trimmed away is never retained, since its
+position is already past the window's right edge. A duplicate retained
+FIN does not re-signal EOF and does not change sequence state.
 
 ### Application layering
 
@@ -165,11 +278,14 @@ connection should close.
 ### What is queued
 
 Every outgoing segment that consumes TCP sequence space -- the SYN-ACK,
-and each `PSH|ACK` data segment from `makeOutgoingData` -- is registered
-in a per-connection pending queue, in the order sent, each entry owning
-its own copy of the payload bytes. Pure ACKs (generated for
-duplicate/out-of-order/overlapping data) consume no sequence space and
-are never queued or timed.
+each `PSH|ACK` data segment `makeOutgoingData` emits (one queue entry per
+MSS-bounded segment when a send is split), and a locally-initiated FIN --
+is registered in a per-connection pending queue, in the order sent, each
+entry owning its own copy of the payload bytes. Pure ACKs (generated
+whenever a segment releases no new contiguous bytes) consume no sequence
+space and are never queued or timed. This is the same queue used
+regardless of whether a send produced one segment or several -- there is
+no second retry mechanism for segmented data.
 
 ### Cumulative and partial ACK retirement
 
@@ -359,10 +475,29 @@ nc 10.0.0.2 8081
 ```
 
 Expect a `Flags [S]` from the client immediately followed by `Flags [R.]`
-from Wirestack; `nc` should report the connection refused/reset. Do not
-apply loss injection (`tc`, network namespaces, iptables rules) against a
-shared or production interface -- this procedure assumes an isolated TAP
-device with no other traffic.
+from Wirestack; `nc` should report the connection refused/reset.
+
+To exercise incoming segmentation, send a request whose header block is
+large enough to span multiple TCP segments but still under the 8192-byte
+HTTP limit, e.g. a request with an oversized (but ignored) header:
+
+```bash
+python3 -c "
+import socket
+req = b'GET / HTTP/1.0\r\nX-Pad: ' + b'a' * 3000 + b'\r\n\r\n'
+s = socket.create_connection(('10.0.0.2', 8080))
+s.sendall(req)
+print(s.recv(4096))
+"
+```
+
+Expect tcpdump to show multiple client data segments (each up to 1460
+bytes), Wirestack's cumulative ACKs advancing across them, and the exact
+`Hello from Wirestack` response once the full request has been
+reassembled. Do not apply loss injection or reordering (`tc netem`,
+network namespaces) against a shared or production interface -- only a
+dedicated, isolated TAP device with no other traffic, removing any such
+change afterward.
 
 ## Known limitations
 
@@ -371,20 +506,26 @@ device with no other traffic.
 - No fast retransmit (duplicate-ACK triggered) -- only timeout triggers
   retransmission.
 - No congestion control.
-- No dynamic receive window (fixed value only).
 - No active open (Wirestack never initiates a connection).
 - No challenge ACK; an unacceptable RST is simply dropped.
 - No TCP option negotiation or interpretation (MSS, window scale, SACK,
-  timestamps are all safely skipped, never acted on).
-- No out-of-order buffering, overlap merging, or reassembly -- duplicate,
-  out-of-order, and overlapping data are all dropped (with a duplicate
-  ACK), never combined into a receive buffer.
-- No segmentation -- one accepted input segment produces at most one
-  outgoing segment; larger transfers are not split.
+  timestamps are all safely skipped, never acted on) -- MSS is a fixed
+  local constant (1460), never negotiated with the peer.
+- No window scaling -- the advertised/peer windows are both plain 16-bit
+  values, capped at 65535.
+- No fast retransmit and no SACK -- loss recovery is timeout-only.
+- No RTT estimation or adaptive RTO -- see the fixed backoff policy above.
+- No zero-window persist timer or probe -- Wirestack waits for the peer
+  to advertise room; a rejected send must be retried by the caller.
+- No application-level send queue -- an atomic send is either fully
+  accepted or fully rejected, never partially buffered internally.
+- Overlap/duplicate handling is a deterministic first-arrival-wins policy
+  bounded to 65535 buffered bytes and 128 fragments, not general
+  attack-resistant TCP normalization.
 - Single application on port 8080 (the HTTP/1.0 demonstration, see
   [docs/http.md](http.md)); no general application registration.
 
 ## Next TCP work
 
-TCP segmentation, out-of-order receive reassembly, and bounded send/receive
-windows.
+TCP MSS and window-scale option negotiation, RTT measurement, and
+adaptive retransmission timing.
