@@ -105,3 +105,11 @@ add_test(NAME test_tcp_adaptive_rto_path COMMAND test_tcp_adaptive_rto_path)
 add_executable(test_tcp_congestion_path test_tcp_congestion_path.cpp)
 target_link_libraries(test_tcp_congestion_path PRIVATE wirestack_core)
 add_test(NAME test_tcp_congestion_path COMMAND test_tcp_congestion_path)
+
+add_executable(test_tcp_send_queue_path test_tcp_send_queue_path.cpp)
+target_link_libraries(test_tcp_send_queue_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_send_queue_path COMMAND test_tcp_send_queue_path)
+
+add_executable(test_tcp_persist_path test_tcp_persist_path.cpp)
+target_link_libraries(test_tcp_persist_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_persist_path COMMAND test_tcp_persist_path)
