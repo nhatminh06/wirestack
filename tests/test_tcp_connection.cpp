@@ -5868,5 +5868,77 @@ int main() {
         CHECK(!table.stateOf(key).has_value());
     }
 
+    // ================= PR #8 review fix: a NewReno partial ACK landing
+    // inside a recovery-retransmitted entry must retransmit the retained
+    // (still-unacknowledged) suffix, not skip it or select a later entry.
+    {
+        TcpConnectionTable table(8080);
+        TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
+        establishWithWindow(table, key, 1000, 65535, t0);
+
+        std::vector<TcpSegment> sent_segments;
+        for (int i = 0; i < 3; ++i) {
+            auto sent = table.makeOutgoingData(key, makeFilledPayload(1460), t0);
+            if (sent.segments.size() == 1) sent_segments.push_back(sent.segments.front());
+        }
+        CHECK(sent_segments.size() == 3);
+        if (sent_segments.size() != 3) return wirestack::test::failureCount() == 0 ? 0 : 1;
+        std::uint32_t seg2_seq = sent_segments[1].sequence_number;
+
+        // First ACK (ack=seg2_seq) genuinely advances snd_una, retiring
+        // segment 1. Three further identical ACKs are duplicates; the
+        // third triggers fast retransmission of segment 2, the oldest
+        // still-outstanding entry.
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        auto dup3 = table.handle(key, makeAck(8080, 54321, 1001, seg2_seq), t0);
+        CHECK(dup3.fast_retransmit.has_value());
+        if (dup3.fast_retransmit) CHECK(dup3.fast_retransmit->sequence_number == seg2_seq);
+
+        auto recovering = table.snapshotOf(key);
+        CHECK(recovering.has_value());
+        std::uint32_t recovery_point_before = recovering ? recovering->recovery_point : 0;
+        TcpClock::duration rto_before = recovering ? recovering->current_rto : TcpClock::duration{};
+        TcpClock::duration srtt_before = recovering ? recovering->srtt : TcpClock::duration{};
+
+        // Partial cumulative ACK lands inside segment 2 (the entry just
+        // retransmitted on duplicate ACK 3), acknowledging its first 600
+        // bytes and leaving an 860-byte suffix unacknowledged.
+        std::uint32_t partial_ack = seg2_seq + 600;
+        auto partial = table.handle(key, makeAck(8080, 54321, 1001, partial_ack), t0);
+
+        CHECK(partial.fast_retransmit.has_value());
+        if (partial.fast_retransmit) {
+            CHECK(partial.fast_retransmit->sequence_number == partial_ack);
+            CHECK(partial.fast_retransmit->payload.size() == 860);
+            CHECK(partial.fast_retransmit->payload == makeFilledPayload(860));
+        }
+
+        auto after_partial = table.snapshotOf(key);
+        CHECK(after_partial.has_value());
+        if (after_partial && recovering) {
+            CHECK(after_partial->in_fast_recovery);
+            CHECK(after_partial->snd_una == partial_ack);
+            CHECK(after_partial->pending_count == 2); // segment 2's suffix + segment 3, not duplicated
+            CHECK(after_partial->recovery_point == recovery_point_before);
+            // Karn's rule: the retransmitted entry itself never samples
+            // RTT, so srtt/current_rto are unchanged from before this ACK
+            // (an earlier, unrelated data ACK may already have taken a
+            // sample -- has_rtt_sample can legitimately already be true).
+            CHECK(after_partial->current_rto == rto_before); // no RTO backoff
+            CHECK(after_partial->srtt == srtt_before);
+        }
+
+        // A later full ACK reaching recovery_point exits recovery normally.
+        table.handle(key, makeAck(8080, 54321, 1001, recovery_point_before), t0);
+        auto after_exit = table.snapshotOf(key);
+        CHECK(after_exit.has_value());
+        if (after_exit) {
+            CHECK(!after_exit->in_fast_recovery);
+            CHECK(after_exit->pending_count == 0);
+        }
+    }
+
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }

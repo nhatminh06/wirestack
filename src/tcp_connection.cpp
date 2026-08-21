@@ -630,6 +630,12 @@ TcpConnectionTable::TcpAckRetirementResult TcpConnectionTable::retireAcknowledge
             entry.payload.erase(entry.payload.begin(),
                                  entry.payload.begin() + trimmed);
             entry.sequence_start = ack;
+            // The retained suffix is a still-unacknowledged range that has
+            // not itself been retransmitted -- re-eligible for
+            // selectRecoveryRetransmission. was_retransmitted (Karn
+            // ambiguity) is untouched: the bytes it now covers were, in
+            // part, actually sent by that earlier retransmission.
+            entry.retransmitted_in_recovery = false;
         }
         break; // TCP is send-ordered: no later entry can be (partially) acked yet
     }
