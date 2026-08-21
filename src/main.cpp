@@ -298,13 +298,18 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
 // Parses the TCP segment, runs it through `connections`, and dispatches
 // the result: an immediate reply (SYN-ACK / pure ACK / closed-port RST) is
 // sent as-is; newly accepted application payload and an accepted peer FIN
-// both feed the HTTP layer (`http_sessions`), which owns request
-// buffering/parsing/response-selection entirely on its own -- TCP protocol
-// logic knows nothing about HTTP, and `connections.handle`/
-// `makeOutgoingData`/`beginClose` know nothing about it either.
+// feed the HTTP server layer (`http_sessions`) only for connections not
+// owned by the active-open runtime path (`active_open_key`) -- a
+// connection Wirestack itself dialed out is a client of whatever is on
+// the other end, not an inbound HTTP request, and must never be handed
+// to the passive server's request parser/response policy merely because
+// it produced payload or a peer FIN. TCP protocol logic knows nothing
+// about HTTP either way; `connections.handle`/`makeOutgoingData`/
+// `beginClose` know nothing about this distinction.
 void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                wirestack::MacAddress local_mac, wirestack::TcpConnectionTable& connections,
                std::map<wirestack::TcpConnectionKey, wirestack::HttpConnectionState>& http_sessions,
+               const std::optional<wirestack::TcpConnectionKey>& active_open_key,
                const wirestack::Ipv4Packet& ip_packet, const wirestack::EthernetFrame& eth_frame) {
     auto parsed = wirestack::parseTcpSegment(ip_packet.payload, ip_packet.source,
                                               ip_packet.destination);
@@ -377,7 +382,8 @@ void handleTcp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                     static_cast<unsigned int>(segment.source_port));
     }
 
-    if (!result.accepted_payload.empty() || result.peer_closed) {
+    if ((!result.accepted_payload.empty() || result.peer_closed) &&
+        key != active_open_key) {
         auto& session = http_sessions[key];
         if (!session.responded) {
             if (!result.accepted_payload.empty()) {
@@ -468,6 +474,7 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                  wirestack::TcpConnectionTable& tcp_connections,
                  std::map<wirestack::TcpConnectionKey, wirestack::HttpConnectionState>&
                      http_sessions,
+                 const std::optional<wirestack::TcpConnectionKey>& active_open_key,
                  const wirestack::EthernetFrame& frame) {
     auto parsed = wirestack::parseIpv4Packet(frame.payload);
     if (!std::holds_alternative<wirestack::Ipv4Packet>(parsed)) {
@@ -500,7 +507,8 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     if (packet.protocol == kProtocolIcmp) {
         handleIcmp(tap, local_ip, local_mac, packet, frame);
     } else if (packet.protocol == kProtocolTcp) {
-        handleTcp(tap, local_ip, local_mac, tcp_connections, http_sessions, packet, frame);
+        handleTcp(tap, local_ip, local_mac, tcp_connections, http_sessions, active_open_key,
+                  packet, frame);
     } else if (packet.protocol == kProtocolUdp) {
         handleUdp(tap, local_ip, local_mac, endpoints, packet, frame);
     }
@@ -672,7 +680,7 @@ int main(int argc, char** argv) {
                 handleArp(tap, arp_cache, *local_ip, *local_mac, *frame);
             } else if (ether_type == wirestack::EtherType::Ipv4) {
                 handleIpv4(tap, *local_ip, *local_mac, arp_cache, udp_endpoints, tcp_connections,
-                           http_sessions, *frame);
+                           http_sessions, active_open_key, *frame);
             }
         }
 
