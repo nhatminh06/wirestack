@@ -93,3 +93,11 @@ add_test(NAME test_tcp_segmentation_path COMMAND test_tcp_segmentation_path)
 add_executable(test_tcp_reassembly_path test_tcp_reassembly_path.cpp)
 target_link_libraries(test_tcp_reassembly_path PRIVATE wirestack_core)
 add_test(NAME test_tcp_reassembly_path COMMAND test_tcp_reassembly_path)
+
+add_executable(test_tcp_negotiation_path test_tcp_negotiation_path.cpp)
+target_link_libraries(test_tcp_negotiation_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_negotiation_path COMMAND test_tcp_negotiation_path)
+
+add_executable(test_tcp_adaptive_rto_path test_tcp_adaptive_rto_path.cpp)
+target_link_libraries(test_tcp_adaptive_rto_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_adaptive_rto_path COMMAND test_tcp_adaptive_rto_path)
