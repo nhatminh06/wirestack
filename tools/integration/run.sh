@@ -33,13 +33,21 @@ ws_make_evidence_dir
 WS_CLEANED_UP=0
 ws_on_exit() {
     local status=$?
+    # Disarm before doing anything else: cleanup below can itself trigger
+    # an EXIT (e.g. via a failing command under `set -e` in a sourced
+    # function), and a still-armed trap would re-enter this handler.
+    trap - EXIT
     if [ "${WS_CLEANED_UP}" != "1" ]; then
         WS_CLEANED_UP=1
-        ws_cleanup
+        if ! ws_cleanup; then
+            ws_log "cleanup could not remove all harness-owned resources"
+            [ "${status}" = "0" ] && status=1
+        fi
     fi
     if [ "${status}" != "0" ] || [ "${WS_TEST_FAILURES}" != "0" ]; then
         ws_log "evidence preserved at: ${WS_EVIDENCE_DIR}"
     fi
+    exit "${status}"
 }
 trap ws_on_exit EXIT
 
@@ -463,6 +471,8 @@ ws_test_synack_loss() {
     ws_capture_start synack_loss_tap "${WS_TAP}"
     ws_capture_start synack_loss_host "${WS_HOST_VETH}"
 
+    local loss_start
+    loss_start="$(date +%s.%N)"
     tc qdisc add dev "${WS_HOST_VETH}" root netem loss 100% || return 1
 
     ws_in_client python3 - "${WS_SERVER_IP}" "${WS_TCP_PORT}" \
@@ -482,6 +492,8 @@ PYEOF
     # Span at least two of wirestack's own 1-second RTO ticks (kInitialRto
     # in include/wirestack/tcp_connection.hpp) while the drop is active.
     sleep 2.5
+    local loss_end
+    loss_end="$(date +%s.%N)"
     tc qdisc del dev "${WS_HOST_VETH}" root
     wait "${client_pid}"
     local client_rc=$?
@@ -492,22 +504,25 @@ PYEOF
     [ "${client_rc}" = "0" ] || { ws_log "syn-ack loss probe failed, see ${WS_EVIDENCE_DIR}/synack_loss_client.log"; return 1; }
     grep -q "^OK connected" "${WS_EVIDENCE_DIR}/synack_loss_client.log" || return 1
 
-    local synack_seqs syn_count
-    synack_seqs="$(grep "${WS_SERVER_IP}\.${WS_TCP_PORT} > .*Flags \[S\.\]" "${WS_EVIDENCE_DIR}/synack_loss_tap.abs.txt" | grep -oE 'seq [0-9]+' | awk '{print $2}')"
-    local synack_count distinct_synack
-    synack_count="$(echo "${synack_seqs}" | grep -c . || true)"
-    distinct_synack="$(echo "${synack_seqs}" | sort -u | grep -c . || true)"
-    [ "${synack_count}" -ge 2 ] || { ws_log "expected >=2 SYN-ACKs on ${WS_TAP}, got ${synack_count}"; return 1; }
-    [ "${distinct_synack}" = "1" ] || { ws_log "SYN-ACK retransmission changed sequence number: ${synack_seqs}"; return 1; }
+    # One-line-per-packet traces (no -v/-vv, which wraps a packet across
+    # multiple lines and would break the per-line timestamp/flags
+    # parsing analyze_synack.py relies on).
+    tcpdump -r "${WS_EVIDENCE_DIR}/synack_loss_tap.pcap" -n -tttt -S \
+        >"${WS_EVIDENCE_DIR}/synack_loss_tap.oneline.txt" 2>/dev/null || true
+    tcpdump -r "${WS_EVIDENCE_DIR}/synack_loss_host.pcap" -n -tttt -S \
+        >"${WS_EVIDENCE_DIR}/synack_loss_host.oneline.txt" 2>/dev/null || true
 
-    syn_count="$(grep -c "> ${WS_SERVER_IP}\.${WS_TCP_PORT}: Flags \[S\]" "${WS_EVIDENCE_DIR}/synack_loss_tap.abs.txt" || true)"
-    if [ "${syn_count}" -ge 2 ]; then
-        ws_log "recovery path: client-driven duplicate-SYN retry observed (${syn_count} SYNs) alongside wirestack's own retransmission"
-    else
-        ws_log "recovery path: wirestack's own RTO-driven SYN-ACK retransmission (single client SYN, ${synack_count} SYN-ACKs)"
+    local analysis
+    if ! analysis="$(python3 "${WS_SCRIPT_DIR}/analyze_synack.py" \
+            "${WS_EVIDENCE_DIR}/synack_loss_tap.oneline.txt" \
+            "${WS_EVIDENCE_DIR}/synack_loss_host.oneline.txt" \
+            "${WS_SERVER_IP}" "${WS_TCP_PORT}" "${loss_start}" "${loss_end}" 2>&1)"; then
+        ws_log "synack RTO/duplicate-SYN analysis failed:"
+        ws_log "${analysis}"
+        return 1
     fi
+    while IFS= read -r line; do ws_log "${line}"; done <<<"${analysis}"
 
-    grep -q "options \[mss 1460,sackOK,nop,wscale" "${WS_EVIDENCE_DIR}/synack_loss_tap.abs.txt" || return 1
     grep -q "${WS_CLIENT_IP}.*> ${WS_SERVER_IP}\.${WS_TCP_PORT}: Flags \[\.\]" "${WS_EVIDENCE_DIR}/synack_loss_host.txt" || return 1
     return 0
 }
@@ -563,23 +578,21 @@ PYEOF
     [ "${client_rc}" = "0" ] || { ws_log "reorder probe failed, see ${WS_EVIDENCE_DIR}/reorder_client.log"; return 1; }
     grep -q "^OK single response" "${WS_EVIDENCE_DIR}/reorder_client.log" || return 1
 
-    # Relative-sequence trace: the client's data segments toward wirestack
-    # show byte offsets directly. Confirm a later range (offset > 0)
-    # appears in the capture before the very first byte (offset 0) does.
-    local data_lines
-    data_lines="$(grep -n "${WS_CLIENT_IP}.*> ${WS_SERVER_IP}\.${WS_TCP_PORT}: Flags \[P\.\], .*seq [0-9]*:" "${WS_EVIDENCE_DIR}/reorder_tap.txt" || true)"
-    [ -n "${data_lines}" ] || { ws_log "no client data segments found in ${WS_TAP} capture"; return 1; }
+    # One-line-per-packet, relative-sequence trace (no -v/-vv, no -S):
+    # byte offsets read directly from ISN, and each packet's fields stay
+    # on a single line for straightforward parsing.
+    tcpdump -r "${WS_EVIDENCE_DIR}/reorder_tap.pcap" -n -tttt \
+        >"${WS_EVIDENCE_DIR}/reorder_tap.oneline.txt" 2>/dev/null || true
 
-    local first_data_line first_seq
-    first_data_line="$(echo "${data_lines}" | head -1)"
-    first_seq="$(echo "${first_data_line}" | grep -oE 'seq [0-9]+:' | head -1 | grep -oE '[0-9]+')"
-    [ "${first_seq}" != "1" ] || { ws_log "no reordering observed: first client data segment on the wire already starts at offset 1 (seq ${first_seq})"; return 1; }
-    ws_log "reordering confirmed: first client data segment on the wire begins at relative offset ${first_seq} (not 1)"
-
-    # Wirestack must generate a SACK option for the retained out-of-order
-    # range while cumulative ACK stays at rcv_nxt (still 1, the gap not
-    # yet filled).
-    grep -qi "sack" "${WS_EVIDENCE_DIR}/reorder_tap.txt" || { ws_log "no SACK option observed in wirestack's ACKs"; return 1; }
+    local analysis
+    if ! analysis="$(python3 "${WS_SCRIPT_DIR}/analyze_reorder.py" \
+            "${WS_EVIDENCE_DIR}/reorder_tap.oneline.txt" \
+            "${WS_CLIENT_IP}" "${WS_SERVER_IP}" "${WS_TCP_PORT}" 2>&1)"; then
+        ws_log "reorder/SACK analysis failed:"
+        ws_log "${analysis}"
+        return 1
+    fi
+    while IFS= read -r line; do ws_log "${line}"; done <<<"${analysis}"
 
     return 0
 }
