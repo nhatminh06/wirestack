@@ -63,6 +63,15 @@ struct TcpConnectionSnapshot {
     TcpClock::duration srtt;
     TcpClock::duration rttvar;
     TcpClock::duration current_rto;
+
+    // Reno-style congestion control (see docs/tcp.md). Byte units except
+    // recovery_point, which is a sequence number.
+    std::uint32_t cwnd;
+    std::uint32_t ssthresh;
+    int duplicate_ack_count;
+    bool in_fast_recovery;
+    std::uint32_t recovery_point;
+    std::uint32_t congestion_avoidance_acked_bytes;
 };
 
 struct TcpReceiveResult {
@@ -118,6 +127,18 @@ inline constexpr int kMaxRetransmits = 5;
 // measured MSL.
 inline constexpr std::chrono::seconds kTimeWaitDuration{60};
 
+// Reno-style congestion control (see docs/tcp.md). A deterministic
+// project policy, not a claim about every production TCP's defaults:
+// the initial threshold is a fixed 65535 bytes rather than derived from
+// the peer's initial window, and the maximum window is a fixed bound
+// well under half the 32-bit sequence space so cwnd arithmetic can never
+// wrap.
+inline constexpr std::uint32_t kInitialSsthresh = 65535;
+inline constexpr std::uint32_t kMaxCongestionWindow = 1u << 30;
+// RFC 5681-style initial window floor, expressed in bytes rather than a
+// segment count so it composes with the min(10*SMSS, ...) formula below.
+inline constexpr std::uint32_t kInitialCongestionWindowFloor = 14600;
+
 // Wirestack never emits IPv4 options, and only ever emits TCP options on
 // a SYN-ACK (MSS, and Window Scale when negotiated -- see
 // buildSynAckOptions), so path-MTU math still treats both headers as a
@@ -164,9 +185,10 @@ inline constexpr std::uint8_t kMaxWindowScaleShift = 14;
 enum class TcpSendError {
     NotSendable,       // connection unknown or not Established/CloseWait
     EmptyPayload,
-    TooLarge,           // exceeds kMaxApplicationSendSize
-    WindowTooSmall,     // exceeds the currently available peer send window
-    ConstructionFailed, // a chunk failed to serialize-size correctly
+    TooLarge,                   // exceeds kMaxApplicationSendSize
+    WindowTooSmall,             // exceeds the currently available peer send window
+    CongestionWindowTooSmall,   // exceeds the currently available congestion window
+    ConstructionFailed,         // a chunk failed to serialize-size correctly
 };
 
 struct TcpSendResult {
@@ -203,12 +225,13 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 // with no table entry is either unbound or not yet SYN'd) including MSS
 // and Window Scale option negotiation, MSS-bounded outgoing segmentation
 // within the peer's advertised (and, once negotiated, scaled) send
-// window, bounded out-of-order receive reassembly with duplicate/overlap
-// trimming, cumulative ACK processing, RTT-adaptive timeout-based
-// retransmission of sequence-consuming segments (SYN-ACK, application
-// data, FIN -- never pure ACKs), passive/active/simultaneous close,
-// deterministic TIME_WAIT, and acceptable inbound RST. No congestion
-// control, no fast retransmit, no SACK, no TCP timestamps, no active
+// window and a Reno-style congestion window, bounded out-of-order
+// receive reassembly with duplicate/overlap trimming, cumulative ACK
+// processing with Slow Start/Congestion Avoidance growth, RTT-adaptive
+// timeout-based retransmission of sequence-consuming segments (SYN-ACK,
+// application data, FIN -- never pure ACKs), passive/active/simultaneous
+// close, deterministic TIME_WAIT, and acceptable inbound RST. No fast
+// retransmit, no fast recovery, no SACK, no TCP timestamps, no active
 // open.
 class TcpConnectionTable {
 public:
@@ -230,11 +253,15 @@ public:
     // registers each for retransmission, and advances snd_nxt once by
     // the total length. The send is atomic: on any rejection (unknown
     // connection, connection not Established/CloseWait, empty payload,
-    // payload exceeding kMaxApplicationSendSize, or payload exceeding the
-    // currently available peer send window) no bytes are accepted, no
-    // segment is queued, and snd_nxt is unchanged. Callers must retry a
-    // rejected send later, after the peer's advertised window changes --
-    // there is no internal send queue or automatic retry.
+    // payload exceeding kMaxApplicationSendSize, or payload exceeding
+    // min(peer send window, congestion window) -- reported as
+    // WindowTooSmall or CongestionWindowTooSmall respectively, whichever
+    // is the smaller/binding limit) no bytes are accepted, no segment is
+    // queued, and snd_nxt is unchanged. Callers must retry a rejected
+    // send later, after the peer's advertised window or the congestion
+    // window changes -- there is no internal send queue or automatic
+    // retry. A timeout retransmission is not new data and does not
+    // consume additional congestion-window allowance.
     TcpSendResult makeOutgoingData(const TcpConnectionKey& key, std::vector<std::byte> payload,
                                     TcpClock::time_point now);
 
@@ -297,6 +324,16 @@ private:
         }
     };
 
+    // Narrow result of retiring a valid advancing ACK, used by congestion
+    // control to size Slow Start/Congestion Avoidance growth without
+    // recomputing per-entry accounting a second time.
+    struct TcpAckRetirementResult {
+        std::uint32_t newly_acked_sequence_space = 0; // total bytes ack advanced snd_una by
+        std::uint32_t newly_acked_data_bytes = 0;      // subset that was application payload
+        bool ack_advanced = false;                     // false for a duplicate/stale ACK
+        bool rtt_sample_taken = false;
+    };
+
     struct Connection {
         TcpState state;
         std::uint32_t remote_isn;
@@ -340,6 +377,16 @@ private:
         TcpClock::duration srtt{};
         TcpClock::duration rttvar{};
         TcpClock::duration current_rto = kInitialRto; // starting timeout_interval for new sends
+
+        // Reno-style congestion control (see docs/tcp.md). cwnd starts at
+        // 0 and is set once, right after effective_send_mss is fixed
+        // above; ssthresh needs no MSS knowledge so it defaults here.
+        std::uint32_t cwnd = 0;
+        std::uint32_t ssthresh = kInitialSsthresh;
+        int duplicate_ack_count = 0;
+        bool in_fast_recovery = false;
+        std::uint32_t recovery_point = 0; // snd_nxt when fast recovery began; diagnostic only
+        std::uint32_t congestion_avoidance_acked_bytes = 0;
     };
 
     // Not a secure or RFC 6528-style initial sequence number generator --
@@ -357,24 +404,57 @@ private:
     static std::vector<std::byte> buildSynAckOptions(const Connection& connection);
 
     // Advances snd_una to `ack` and drains/trims the pending queue to
-    // match, if `ack` is ahead of the current snd_una. A no-op for a
-    // duplicate or stale ACK. Precondition: `ack` already validated by
-    // the caller as not beyond snd_nxt. SYN and FIN both occupy a
-    // 1-wide sequence range, so no ack value can land strictly inside
-    // one -- the partial-trim branch below only ever trims data. Also
-    // takes an RTT sample (see recordRttSample) from the newest
-    // fully-or-partially-retired entry that was never retransmitted and
-    // has not already contributed a sample, if any -- Karn's rule falls
-    // out for free, since a retransmitted entry is simply never an
-    // eligible candidate, and rtt_sample_taken prevents a still-partially-
-    // outstanding entry from being sampled a second time by a later ACK.
-    static void retireAcknowledged(Connection& connection, std::uint32_t ack,
-                                    TcpClock::time_point now);
+    // match, if `ack` is ahead of the current snd_una. A no-op (all-zero,
+    // ack_advanced=false result) for a duplicate or stale ACK.
+    // Precondition: `ack` already validated by the caller as not beyond
+    // snd_nxt. SYN and FIN both occupy a 1-wide sequence range, so no ack
+    // value can land strictly inside one -- the partial-trim branch below
+    // only ever trims data, so newly_acked_data_bytes never counts a
+    // SYN/FIN's own control byte. Also takes an RTT sample (see
+    // recordRttSample) from the newest fully-or-partially-retired entry
+    // that was never retransmitted and has not already contributed a
+    // sample, if any -- Karn's rule falls out for free, since a
+    // retransmitted entry is simply never an eligible candidate, and
+    // rtt_sample_taken prevents a still-partially-outstanding entry from
+    // being sampled a second time by a later ACK.
+    static TcpAckRetirementResult retireAcknowledged(Connection& connection, std::uint32_t ack,
+                                                       TcpClock::time_point now);
 
     // Applies the first-sample or subsequent-sample RFC 6298-style
     // update (SRTT/RTTVAR/RTO) for one measured round-trip time `r`, then
     // clamps current_rto to [kMinRto, kMaxRto].
     static void recordRttSample(Connection& connection, TcpClock::duration r);
+
+    // Clamps a congestion-window-sized byte count to kMaxCongestionWindow,
+    // computed in a wider type so the addition producing `value` cannot
+    // itself overflow uint32_t before the clamp is applied.
+    static std::uint32_t clampCwnd(std::uint64_t value);
+
+    // min(10*SMSS, max(2*SMSS, kInitialCongestionWindowFloor)) -- see
+    // docs/tcp.md. Computed only once, right after effective_send_mss is
+    // fixed for a connection.
+    static std::uint32_t initialCongestionWindow(std::uint16_t smss);
+
+    // cwnd - flight_size (snd_nxt - snd_una), or 0 if the congestion
+    // window is already fully consumed by outstanding (unacknowledged)
+    // bytes. The new-data send limit is min(availableSendWindow,
+    // availableCongestionWindow) -- see makeOutgoingData.
+    static std::uint32_t availableCongestionWindow(const Connection& connection);
+
+    // Applies Slow Start (cwnd < ssthresh: increase by min(data_bytes,
+    // SMSS)) or Congestion Avoidance (cwnd >= ssthresh: accumulate
+    // data_bytes and add one SMSS each time the accumulator reaches the
+    // current cwnd, repeating for a cumulative ACK that crosses more than
+    // one window) for one advancing ACK's newly acknowledged application
+    // data. A no-op for data_bytes == 0 (SYN/FIN/pure-ACK acknowledgment).
+    static void applyCongestionGrowth(Connection& connection, std::uint32_t data_bytes);
+
+    // Applies the timeout congestion-collapse response (halve flight
+    // into ssthresh with a 2*SMSS floor, cwnd = SMSS, clear recovery/
+    // duplicate-ACK/accumulator state) for one RTO expiry of an
+    // application-data entry. Never called for a SYN-ACK or FIN timeout
+    // -- see pollRetransmissions.
+    static void applyTimeoutCongestionCollapse(Connection& connection);
 
     // Moves `connection` into TimeWait, arming its expiration deadline
     // and dropping any (already-acknowledged) pending entries.
