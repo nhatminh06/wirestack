@@ -3916,8 +3916,9 @@ int main() {
         }
     }
 
-    // classic-Reno limitation: an advancing ACK below recovery_point still
-    // exits recovery immediately (no NewReno partial-ACK behavior)
+    // NewReno partial-ACK recovery: an advancing ACK below recovery_point
+    // remains in fast recovery, deflates cwnd, and retransmits one further
+    // eligible entry rather than exiting immediately (see docs/tcp.md).
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
@@ -3941,15 +3942,36 @@ int main() {
         auto recovering = table.snapshotOf(key);
         CHECK(recovering.has_value());
         if (recovering) CHECK(recovering->recovery_point > seg3_seq); // recovery_point == snd_nxt
+        std::uint32_t cwnd_before_partial = recovering ? recovering->cwnd : 0;
 
         // Only acknowledges segment 2 (retransmitted), leaving segment 3
-        // still outstanding and below recovery_point.
-        table.handle(key, makeAck(8080, 54321, 1001, seg3_seq), t0);
+        // still outstanding and below recovery_point: a NewReno partial
+        // ACK, not a full one.
+        auto partial = table.handle(key, makeAck(8080, 54321, 1001, seg3_seq), t0);
+        CHECK(partial.fast_retransmit.has_value()); // retransmits segment 3
+        if (partial.fast_retransmit) {
+            CHECK(partial.fast_retransmit->sequence_number == seg3_seq);
+        }
         auto after_partial = table.snapshotOf(key);
         CHECK(after_partial.has_value());
         if (after_partial) {
-            CHECK(!after_partial->in_fast_recovery); // exits despite seg3 < recovery_point
+            CHECK(after_partial->in_fast_recovery); // remains in recovery, below recovery_point
+            CHECK(after_partial->duplicate_ack_count == 0);
             CHECK(after_partial->pending_count == 1); // segment 3 remains queued
+            std::uint32_t newly_acked = seg3_seq - seg2_seq; // 1460
+            std::uint32_t expected =
+                std::max<std::uint32_t>(cwnd_before_partial - newly_acked, 1460) + 1460;
+            CHECK(after_partial->cwnd == expected);
+        }
+
+        // Cumulative ACK reaches recovery_point: full ACK, exit recovery.
+        auto final_ack = table.handle(
+            key, makeAck(8080, 54321, 1001, recovering ? recovering->recovery_point : 0), t0);
+        auto after_exit = table.snapshotOf(key);
+        CHECK(after_exit.has_value());
+        if (after_exit) {
+            CHECK(!after_exit->in_fast_recovery);
+            CHECK(after_exit->pending_count == 0);
         }
     }
 
