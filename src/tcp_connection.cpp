@@ -1112,6 +1112,16 @@ TcpReceiveResult TcpConnectionTable::handleSynSent(const TcpConnectionKey& key,
                                                     Connection& connection,
                                                     const TcpSegment& segment,
                                                     TcpClock::time_point now) {
+    // Malformed options are rejected before any state mutation --
+    // including an otherwise-acceptable RST (same rule preserved from
+    // handleSynchronized: no reset, no ACK processing, no option-state
+    // mutation, no sequence-state mutation).
+    auto parsed_options_result = parseTcpOptions(segment.options);
+    if (std::holds_alternative<TcpOptionParseError>(parsed_options_result)) {
+        return {};
+    }
+    const TcpParsedOptions& parsed_options = std::get<TcpParsedOptions>(parsed_options_result);
+
     if (segment.flags.rst) {
         // Accepted only if it acknowledges the outstanding SYN -- a valid
         // Linux-style closed-port refusal (RST|ACK, ack=local ISN+1).
@@ -1149,14 +1159,6 @@ TcpReceiveResult TcpConnectionTable::handleSynSent(const TcpConnectionKey& key,
         // high, or equal to local ISN rather than local ISN+1).
         return {};
     }
-
-    // Malformed options are rejected before any state, sequence, or RST
-    // mutation -- same rule as handleSynchronized.
-    auto parsed_options_result = parseTcpOptions(segment.options);
-    if (std::holds_alternative<TcpOptionParseError>(parsed_options_result)) {
-        return {};
-    }
-    const TcpParsedOptions& parsed_options = std::get<TcpParsedOptions>(parsed_options_result);
 
     connection.remote_isn = segment.sequence_number;
     connection.remote_isn_known = true;

@@ -121,3 +121,7 @@ add_test(NAME test_tcp_newreno_path COMMAND test_tcp_newreno_path)
 add_executable(test_tcp_sack_path test_tcp_sack_path.cpp)
 target_link_libraries(test_tcp_sack_path PRIVATE wirestack_core)
 add_test(NAME test_tcp_sack_path COMMAND test_tcp_sack_path)
+
+add_executable(test_tcp_active_open_path test_tcp_active_open_path.cpp)
+target_link_libraries(test_tcp_active_open_path PRIVATE wirestack_core)
+add_test(NAME test_tcp_active_open_path COMMAND test_tcp_active_open_path)
