@@ -5553,7 +5553,6 @@ int main() {
         }
         CHECK(sent_segments.size() == 7);
         if (sent_segments.size() != 7) return wirestack::test::failureCount() == 0 ? 0 : 1;
-        std::uint32_t seq1 = sent_segments[0].sequence_number;
         std::uint32_t seq2 = sent_segments[1].sequence_number;
         std::uint32_t seq3 = sent_segments[2].sequence_number;
         std::uint32_t seq4 = sent_segments[3].sequence_number;
