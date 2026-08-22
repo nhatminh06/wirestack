@@ -345,7 +345,22 @@ void handleHttpClient(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip
         }
     }
 
-    if (!session.response_complete && !session.failed) {
+    if (session.response_complete) {
+        // A completed response is not proof the peer has nothing more to
+        // say: pipelined bytes, a second response, or a broken/hostile
+        // peer can all still deliver more application data on this
+        // connection. Completion is a one-shot fact about the bytes seen
+        // so far, not a promise nothing else will arrive -- so it must
+        // never be treated as license to silently ignore whatever comes
+        // next.
+        if (!result.accepted_payload.empty()) {
+            session.failed = true;
+            std::printf("http-client: response rejected dst=%s:%u\n",
+                        session.remote_ip.toString().c_str(),
+                        static_cast<unsigned int>(session.remote_port));
+            std::fflush(stdout);
+        }
+    } else if (!session.failed) {
         if (!result.accepted_payload.empty()) {
             wirestack::appendHttpClientBytes(session, result.accepted_payload);
         }
