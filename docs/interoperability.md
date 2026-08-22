@@ -200,6 +200,31 @@ rather than being left open) and fails if either a PSH-carrying segment
 or a listener-side RST appears after the close -- confirmed to fail
 against the pre-fix binary and pass against the fixed one.
 
+## Outbound HTTP client (`http_get.sh`)
+
+`tools/integration/http_get.sh` exercises Wirestack's outbound HTTP/1.0
+client (`--http-get`/`--source-port`/`--target`) against a real Python
+HTTP/1.0 server in the client namespace -- same one-shot-connection
+restart pattern as `active_open.sh`:
+
+```bash
+unshare --user --net --map-root-user -- bash tools/integration/http_get.sh
+```
+
+| # | Scenario | Mechanism |
+|---|----------|-----------|
+| 1 | Content-Length-delimited response | real server sends `Content-Length: 29` and the exact body `Hello from Linux HTTP server\n`; verifies the server received the byte-exact expected GET request and that exactly one request/response segment crossed the wire |
+| 2 | Close-delimited response | real server sends a response with no `Content-Length`, then closes; verifies the same request-exactness and segment-count checks, plus that both the server's and Wirestack's own FIN appear |
+
+The exact request bytes are verified at the application layer by the
+real Python server (`REQUEST_EXACT_MATCH`), which is authoritative;
+tcpdump's own HTTP dissector only recognizes a handful of built-in
+"well-known" ports (it decodes `run.sh`'s port-8080 passive-server
+traffic but not this scenario's ports), so the wire-level checks here
+instead confirm exactly one PSH-carrying segment crossed in each
+direction -- proving one logical request and one logical response, not
+zero and not a duplicate/retransmission-as-new-data.
+
 ## Troubleshooting
 
 - `conflicting pre-existing interface`: a previous run's resources were
@@ -228,9 +253,13 @@ against the pre-fix binary and pass against the fixed one.
   Receiver-side SACK generation (advertising SACK blocks for retained
   out-of-order data) *is* live-qualified -- see scenario 10.
 - TCP active open's handshake (SYN sent, established, and refused) is
-  exercised by `active_open.sh` (see above); data transfer over an
-  actively-opened connection is not, since Wirestack's active-open path
-  currently only completes the handshake. Keep-alive, HTTP/1.1, and TLS
+  exercised by `active_open.sh`; data transfer over an actively-opened
+  connection is now also live-qualified by the outbound HTTP client
+  (`http_get.sh`, see above) for both Content-Length- and
+  close-delimited responses. Live request loss/retransmission and
+  multi-segment response evidence for the outbound client were not
+  performed (see `docs/http.md`); those paths remain proven only by
+  `tests/test_http_client_path.cpp`. Keep-alive, HTTP/1.1, DNS, and TLS
   remain out of scope for this milestone and are not exercised here (see
   `README.md`).
 - The harness proves behavior inside its own isolated topology; it does
