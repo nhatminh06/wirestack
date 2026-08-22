@@ -157,13 +157,15 @@ now that active connections can legitimately carry an HTTP role.
 `--http-get`, `--source-port`, and `--target` must all be given
 together; `--http-get`/`--active-open` are mutually exclusive (both
 configure the same one-shot active-open slot), in either argument
-order. `--http-get` takes a literal IPv4 address and port -- no
-hostnames, no DNS. `--target` must begin with `/` and contain no
-space, CR, LF, or other control byte; validated before any TCP
-connection is created. As with `--active-open`, the peer's MAC must
-already be in the ARP cache (Wirestack sends no ARP requests of its
-own) and the request fires exactly once, as soon as the handshake
-completes.
+order. `--http-get` takes either a literal IPv4 address and port, or
+(as of Milestone 18) a hostname and port resolved through Wirestack's
+own bounded DNS client -- see [docs/dns.md](dns.md) for the `--dns-server`
+option, hostname rules, and exact resolution/retry/failure behavior.
+`--target` must begin with `/` and contain no space, CR, LF, or other
+control byte; validated before any TCP connection is created. As with
+`--active-open`, the peer's MAC must already be in the ARP cache
+(Wirestack sends no ARP requests of its own) and the request fires
+exactly once, as soon as the handshake completes.
 
 All runtime-mode options (`--active-open`/`--http-get`/
 `--source-port`/`--target`) are parsed and validated by
@@ -190,12 +192,20 @@ regenerates the request itself on a delayed ACK. Exact bytes:
 
 ```text
 GET <target> HTTP/1.0\r\n
-Host: <remote-ip>:<remote-port>\r\n
+Host: <host-header>\r\n
 Connection: close\r\n
 \r\n
 ```
 
-No `User-Agent`, `Accept-Encoding`, request body, `Content-Length`, or
+`buildHttpGetRequest` takes the exact `Host` header text as a plain
+string, not an IPv4 address -- it has no notion of "the destination"
+literal or resolved. For a literal IPv4 destination, `<host-header>` is
+`<remote-ip>:<remote-port>`, unchanged from Milestone 17. For a hostname
+destination resolved via DNS (Milestone 18, see
+[docs/dns.md](dns.md)), `<host-header>` is the original
+`<hostname>:<port>` -- the resolved IPv4 address is used only to open
+the TCP connection and never appears in the request. No `User-Agent`,
+`Accept-Encoding`, request body, `Content-Length`, or
 `Transfer-Encoding`. `request_enqueued` guards against enqueuing a
 second time on a duplicate establishment signal.
 
@@ -323,8 +333,10 @@ that. For a reproducible version with packet-capture evidence, see
 
 - No HTTP/1.1, no keep-alive, no pipelining, no redirects.
 - No request bodies, no chunked transfer encoding, no compression.
-- No TLS, no DNS/hostnames -- the outbound client's destination must be
-  a literal IPv4 address.
+- No TLS. The outbound client's destination is either a literal IPv4
+  address or a hostname resolved through Wirestack's own bounded DNS
+  A-record client (see [docs/dns.md](dns.md) for its scope and limits --
+  it is not a general resolver).
 - No filesystem-backed serving -- exactly one route (`/`) is recognized.
 - The outbound client sends exactly one GET request per connection and
   does not implement any other method, a general HTTP client library,

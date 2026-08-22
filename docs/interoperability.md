@@ -5,7 +5,7 @@ Wirestack's ARP/ICMP/UDP/TCP/HTTP paths work end to end -- including
 timeout retransmission, SYN-ACK loss recovery, and out-of-order TCP
 segment delivery, all captured on the wire. This complements the
 per-protocol docs (`docs/arp.md`, `docs/icmp.md`, `docs/udp.md`,
-`docs/tcp.md`, `docs/http.md`), which describe manual single-command
+`docs/tcp.md`, `docs/http.md`, `docs/dns.md`), which describe manual single-command
 checks; this document describes the automated harness under
 `tools/integration/`.
 
@@ -231,6 +231,38 @@ above. Wirestack's own flushed `response complete ...` stdout line
 (see `docs/http.md`) is the evidence for that; both scenarios also
 assert no `response rejected` line appears.
 
+## DNS-resolved outbound HTTP client (`dns_http_get.sh`)
+
+`tools/integration/dns_http_get.sh` exercises Wirestack's bounded DNS
+A-record client (`--http-get`/`--dns-server`/`--source-port`/`--target`,
+see `docs/dns.md`) against a real Python UDP DNS server and a real
+Python HTTP/1.0 server, both in the client namespace -- same
+one-shot-connection restart pattern as `http_get.sh`/`active_open.sh`:
+
+```bash
+unshare --user --net --map-root-user -- bash tools/integration/dns_http_get.sh
+```
+
+| # | Scenario | Mechanism |
+|---|----------|-----------|
+| 1 | Success | DNS server answers the first query with a compressed `example.test A 10.0.0.1` record; verifies the exact question crossed the wire, transaction IDs match, Wirestack logs `dns-client: resolved wirestack.test -> 10.0.0.1`, the TCP SYN appears strictly after the DNS response on the wire, the HTTP server receives the byte-exact GET with `Host: wirestack.test:9094`, and Wirestack logs exactly one HTTP completion |
+| 2 | Dropped first query | DNS server silently drops query 1 and answers query 2; verifies exactly 2 queries with matching transaction IDs and byte-identical payloads, no SYN before the reply, exactly one TCP SYN on the wire, and one HTTP completion |
+| 3 | NXDOMAIN | DNS server answers the one query it receives with RCODE=3; verifies exactly one query (no retries after a terminal failure), Wirestack logs exactly one `dns-client: resolution failed host=wirestack.test reason=NXDOMAIN`, no TCP SYN ever appears on the wire, and Wirestack never attempts an HTTP request |
+
+Each scenario restarts Wirestack against a distinct HTTP/TCP-source port
+pair (`9094`/`49300`, `9095`/`49301`, `9096`/`49302`) -- reusing one
+four-tuple back-to-back across restarted Wirestack processes leaves
+stale kernel socket state in the client namespace from the previous
+scenario (observed directly while developing this script: the second
+scenario's SYN was met with a bare ACK carrying a stale sequence number
+instead of a SYN-ACK), the same reason `http_get.sh` varies its own
+ports between scenarios.
+
+Live-run against both `build/wirestack` and `build-asan/wirestack`
+(`WS_BINARY=.../build-asan/wirestack unshare ... dns_http_get.sh`); all
+3 scenarios pass against both, twice in a row against the normal build
+to rule out flakiness.
+
 ## Troubleshooting
 
 - `conflicting pre-existing interface`: a previous run's resources were
@@ -265,9 +297,10 @@ assert no `response rejected` line appears.
   close-delimited responses. Live request loss/retransmission and
   multi-segment response evidence for the outbound client were not
   performed (see `docs/http.md`); those paths remain proven only by
-  `tests/test_http_client_path.cpp`. Keep-alive, HTTP/1.1, DNS, and TLS
-  remain out of scope for this milestone and are not exercised here (see
-  `README.md`).
+  `tests/test_http_client_path.cpp`. Keep-alive, HTTP/1.1, and TLS remain
+  out of scope for this milestone and are not exercised here (see
+  `README.md`). DNS A-record resolution is now live-qualified -- see
+  "DNS-resolved outbound HTTP client" above and `docs/dns.md`.
 - The harness proves behavior inside its own isolated topology; it does
   not substitute for testing against a real physical NIC or a real
   routed network.

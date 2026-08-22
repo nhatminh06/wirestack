@@ -6,11 +6,13 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <random>
 #include <string>
 #include <variant>
 
 #include "wirestack/arp.hpp"
 #include "wirestack/arp_cache.hpp"
+#include "wirestack/dns.hpp"
 #include "wirestack/ethernet.hpp"
 #include "wirestack/http.hpp"
 #include "wirestack/http_client.hpp"
@@ -158,6 +160,132 @@ void handleIcmp(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                 static_cast<unsigned int>(message.sequence), message.payload.size());
 
     sendEchoReply(tap, local_ip, local_mac, ip_packet, eth_frame, message);
+}
+
+// Runtime state for the one-shot bounded DNS A-record client (Milestone
+// 18, see docs/dns.md). Owned by main() alongside the rest of the
+// runtime-mode state; exists only when --http-get was given a hostname
+// destination.
+struct DnsRuntimeState {
+    wirestack::DnsClientSession session;
+    std::uint16_t transaction_id = 0;
+    bool query_started = false;
+    // The eventual TCP/HTTP session's own fixed configuration, carried
+    // here only because it isn't known until resolution completes.
+    std::uint16_t tcp_source_port = 0;
+    std::uint16_t http_port = 0;
+    std::string host_header; // "<hostname>:<port>", independent of the resolved address
+};
+
+const char* describeDnsFailure(wirestack::DnsResponseOutcome outcome) {
+    switch (outcome) {
+        case wirestack::DnsResponseOutcome::NoAnswer:
+            return "NoAnswer";
+        case wirestack::DnsResponseOutcome::NxDomain:
+            return "NXDOMAIN";
+        case wirestack::DnsResponseOutcome::ServerFailure:
+            return "SERVFAIL";
+        case wirestack::DnsResponseOutcome::Refused:
+            return "REFUSED";
+        case wirestack::DnsResponseOutcome::Resolved:
+        case wirestack::DnsResponseOutcome::Malformed:
+        case wirestack::DnsResponseOutcome::Truncated:
+        case wirestack::DnsResponseOutcome::WrongTransaction:
+        case wirestack::DnsResponseOutcome::WrongQuestion:
+            break; // never stored as a terminal failure_reason (see handleDnsResponse)
+    }
+    return "Malformed";
+}
+
+// Serializes `payload` as a UDP/IPv4/Ethernet datagram addressed exactly
+// from (local_ip, local_port) to (remote_ip, remote_port) and writes it
+// through `tap`. Shared by the DNS client's initial query and its
+// byte-identical retries -- unlike sendTcpSegment's TCP-specific
+// counterpart, this has no connection state of its own.
+void sendUdpPacket(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
+                    wirestack::MacAddress local_mac, wirestack::Ipv4Address remote_ip,
+                    wirestack::MacAddress remote_mac, std::uint16_t local_port,
+                    std::uint16_t remote_port, std::vector<std::byte> payload) {
+    constexpr std::uint8_t kProtocolUdp = 17;
+
+    wirestack::UdpDatagram datagram;
+    datagram.source_port = local_port;
+    datagram.destination_port = remote_port;
+    datagram.payload = std::move(payload);
+    auto serialized_udp = wirestack::serializeUdpDatagram(datagram, local_ip, remote_ip);
+    if (std::holds_alternative<wirestack::UdpSerializeError>(serialized_udp)) {
+        std::printf("udp: dropped outgoing datagram: payload too large\n");
+        return;
+    }
+
+    wirestack::Ipv4Packet packet;
+    packet.ttl = 64;
+    packet.protocol = kProtocolUdp;
+    packet.source = local_ip;
+    packet.destination = remote_ip;
+    packet.payload = std::get<std::vector<std::byte>>(serialized_udp);
+    auto serialized_ipv4 = wirestack::serializeIpv4Packet(packet);
+    if (std::holds_alternative<wirestack::Ipv4SerializeError>(serialized_ipv4)) {
+        std::printf("ipv4: dropped outgoing packet: payload too large\n");
+        return;
+    }
+
+    wirestack::EthernetFrame frame;
+    frame.destination = remote_mac;
+    frame.source = local_mac;
+    frame.ether_type = static_cast<std::uint16_t>(wirestack::EtherType::Ipv4);
+    frame.payload = std::get<std::vector<std::byte>>(serialized_ipv4);
+
+    auto serialized = wirestack::serializeEthernetFrame(frame);
+    auto write_result = tap.write(serialized);
+    if (auto* error = std::get_if<std::string>(&write_result)) {
+        std::fprintf(stderr, "wirestack: udp write failed: %s\n", error->c_str());
+    }
+}
+
+// Intercepts an incoming UDP datagram addressed to the DNS client's fixed
+// local port (see DnsClientSession::local_port), validating and parsing
+// it as a candidate DNS response and, on resolution, arming `dial_target_ip`/
+// `active_open_key` for the ordinary active-open dial loop in main() to
+// pick up on its next iteration -- exactly the same "wait for peer MAC"
+// pattern already used for a literal-IPv4 destination, since receiving
+// this datagram has already opportunistically taught the ARP cache the
+// resolved peer's MAC address (see handleIpv4). Returns false for any
+// datagram not addressed to this port, in which case the caller must
+// fall through to the ordinary UDP endpoint dispatch (handleUdp) --
+// a DNS response must never reach the UDP echo endpoint, and no other
+// datagram may be treated as a DNS response.
+bool handleDnsClientUdp(DnsRuntimeState& state,
+                         wirestack::Ipv4Address local_ip, std::uint16_t tcp_local_port,
+                         std::optional<wirestack::Ipv4Address>& dial_target_ip,
+                         std::optional<wirestack::TcpConnectionKey>& active_open_key,
+                         const wirestack::Ipv4Packet& ip_packet) {
+    auto parsed = wirestack::parseUdpDatagram(ip_packet.payload, ip_packet.source,
+                                               ip_packet.destination);
+    auto* datagram = std::get_if<wirestack::UdpDatagram>(&parsed);
+    if (!datagram || datagram->destination_port != state.session.local_port) {
+        return false;
+    }
+
+    bool changed = wirestack::handleDnsResponse(state.session, ip_packet.source,
+                                                  datagram->source_port,
+                                                  datagram->destination_port, datagram->payload);
+    if (changed) {
+        if (state.session.state == wirestack::DnsClientState::Resolved) {
+            std::printf("dns-client: resolved %s -> %s\n", state.session.hostname.c_str(),
+                        state.session.resolved_address->toString().c_str());
+            std::fflush(stdout);
+            dial_target_ip = state.session.resolved_address;
+            active_open_key = wirestack::TcpConnectionKey{local_ip, tcp_local_port,
+                                                             *dial_target_ip, state.http_port};
+        } else {
+            std::printf("dns-client: resolution failed host=%s reason=%s\n",
+                        state.session.hostname.c_str(),
+                        describeDnsFailure(*state.session.failure_reason));
+            std::fflush(stdout);
+        }
+    }
+    return true;
 }
 
 // Parses the UDP datagram, looks it up in `endpoints`, and (if bound)
@@ -322,8 +450,7 @@ void handleHttpClient(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip
     auto& session = it->second;
 
     if (result.connection_established && !session.request_enqueued) {
-        auto request =
-            wirestack::buildHttpGetRequest(session.remote_ip, session.remote_port, session.target);
+        auto request = wirestack::buildHttpGetRequest(session.host_header, session.target);
         if (request) {
             auto sent = connections.makeOutgoingData(key, *request, now);
             if (!sent.error) {
@@ -607,7 +734,9 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
                  std::map<wirestack::TcpConnectionKey, wirestack::HttpClientSession>&
                      http_client_sessions,
                  const std::optional<wirestack::TcpConnectionKey>& active_open_key,
-                 const wirestack::EthernetFrame& frame) {
+                 DnsRuntimeState* dns_state, std::optional<wirestack::Ipv4Address>& dial_target_ip,
+                 std::optional<wirestack::TcpConnectionKey>& dial_active_open_key,
+                 std::uint16_t dial_tcp_source_port, const wirestack::EthernetFrame& frame) {
     auto parsed = wirestack::parseIpv4Packet(frame.payload);
     if (!std::holds_alternative<wirestack::Ipv4Packet>(parsed)) {
         std::printf("ipv4: dropped malformed packet\n");
@@ -642,7 +771,12 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
         handleTcp(tap, local_ip, local_mac, tcp_connections, http_sessions, http_client_sessions,
                   active_open_key, packet, frame);
     } else if (packet.protocol == kProtocolUdp) {
-        handleUdp(tap, local_ip, local_mac, endpoints, packet, frame);
+        bool consumed_by_dns = dns_state != nullptr &&
+                                handleDnsClientUdp(*dns_state, local_ip, dial_tcp_source_port,
+                                                     dial_target_ip, dial_active_open_key, packet);
+        if (!consumed_by_dns) {
+            handleUdp(tap, local_ip, local_mac, endpoints, packet, frame);
+        }
     }
 }
 
@@ -714,11 +848,17 @@ int main(int argc, char** argv) {
 
     // ActiveOpen and HttpGet share the same active-open slot and are
     // mutually exclusive (enforced by parseRuntimeOptions) -- at most one
-    // connection is configured, started exactly once as soon as the peer's
-    // MAC is known through the existing ARP cache. Passive by default.
+    // connection is configured, started exactly once as soon as both the
+    // dial target address is known (immediately for a literal IPv4
+    // destination; only after DNS resolution completes for a hostname
+    // destination -- see docs/dns.md) and the peer's MAC is known through
+    // the existing ARP cache. Passive by default.
     bool active_open_started = false;
     std::optional<wirestack::TcpConnectionKey> active_open_key;
+    std::optional<wirestack::Ipv4Address> dial_target_ip;
+    std::optional<DnsRuntimeState> dns_state;
     if (runtime_options.mode == wirestack::RuntimeMode::ActiveOpen) {
+        dial_target_ip = runtime_options.remote_ip;
         active_open_key =
             wirestack::TcpConnectionKey{*local_ip, runtime_options.source_port,
                                          runtime_options.remote_ip, runtime_options.remote_port};
@@ -727,14 +867,33 @@ int main(int argc, char** argv) {
                     static_cast<unsigned int>(runtime_options.remote_port),
                     static_cast<unsigned int>(runtime_options.source_port));
     } else if (runtime_options.mode == wirestack::RuntimeMode::HttpGet) {
-        active_open_key =
-            wirestack::TcpConnectionKey{*local_ip, runtime_options.source_port,
-                                         runtime_options.remote_ip, runtime_options.remote_port};
-        std::printf("tcp: http-get pending dst=%s:%u src_port=%u target=%s (waiting for peer MAC)\n",
-                    runtime_options.remote_ip.toString().c_str(),
-                    static_cast<unsigned int>(runtime_options.remote_port),
-                    static_cast<unsigned int>(runtime_options.source_port),
-                    runtime_options.target.c_str());
+        if (!runtime_options.destination_is_hostname) {
+            dial_target_ip = runtime_options.remote_ip;
+            active_open_key =
+                wirestack::TcpConnectionKey{*local_ip, runtime_options.source_port,
+                                             runtime_options.remote_ip, runtime_options.remote_port};
+            std::printf("tcp: http-get pending dst=%s:%u src_port=%u target=%s (waiting for peer MAC)\n",
+                        runtime_options.remote_ip.toString().c_str(),
+                        static_cast<unsigned int>(runtime_options.remote_port),
+                        static_cast<unsigned int>(runtime_options.source_port),
+                        runtime_options.target.c_str());
+        } else {
+            DnsRuntimeState state;
+            state.session.server_ip = runtime_options.dns_server_ip;
+            state.session.server_port = runtime_options.dns_server_port;
+            state.session.hostname = runtime_options.hostname;
+            std::random_device rd;
+            state.transaction_id = static_cast<std::uint16_t>(rd());
+            state.tcp_source_port = runtime_options.source_port;
+            state.http_port = runtime_options.remote_port;
+            state.host_header =
+                runtime_options.hostname + ":" + std::to_string(runtime_options.remote_port);
+            std::printf("dns-client: resolving %s via %s:%u (waiting for server MAC)\n",
+                        runtime_options.hostname.c_str(),
+                        runtime_options.dns_server_ip.toString().c_str(),
+                        static_cast<unsigned int>(runtime_options.dns_server_port));
+            dns_state = std::move(state);
+        }
     }
 
     std::array<std::byte, kReceiveBufferSize> buffer{};
@@ -748,6 +907,10 @@ int main(int argc, char** argv) {
         std::optional<wirestack::TcpClock::time_point> deadline = retransmission_deadline;
         if (persist_deadline && (!deadline || *persist_deadline < *deadline)) {
             deadline = persist_deadline;
+        }
+        if (dns_state && dns_state->session.next_deadline &&
+            (!deadline || *dns_state->session.next_deadline < *deadline)) {
+            deadline = dns_state->session.next_deadline;
         }
         if (deadline) {
             auto now = wirestack::TcpClock::now();
@@ -787,12 +950,59 @@ int main(int argc, char** argv) {
                 handleArp(tap, arp_cache, *local_ip, *local_mac, *frame);
             } else if (ether_type == wirestack::EtherType::Ipv4) {
                 handleIpv4(tap, *local_ip, *local_mac, arp_cache, udp_endpoints, tcp_connections,
-                           http_sessions, http_client_sessions, active_open_key, *frame);
+                           http_sessions, http_client_sessions, active_open_key,
+                           dns_state ? &*dns_state : nullptr, dial_target_ip, active_open_key,
+                           runtime_options.source_port, *frame);
             }
         }
 
-        if (runtime_options.mode != wirestack::RuntimeMode::Passive && !active_open_started) {
-            wirestack::Ipv4Address dial_ip = runtime_options.remote_ip;
+        // DNS: send the initial query once the server's MAC is known, and
+        // hand any due retry to the same fixed retry schedule (see
+        // docs/dns.md) -- both happen independently of the dial loop
+        // below, which only starts once dns_state->session reaches
+        // Resolved (see handleDnsClientUdp).
+        if (dns_state && dns_state->session.state == wirestack::DnsClientState::Pending) {
+            if (!dns_state->query_started) {
+                if (auto mac = arp_cache.lookup(dns_state->session.server_ip)) {
+                    wirestack::DnsQuery query;
+                    query.transaction_id = dns_state->transaction_id;
+                    query.hostname = dns_state->session.hostname;
+                    auto now = wirestack::TcpClock::now();
+                    auto bytes = wirestack::beginDnsQuery(dns_state->session, query, now);
+                    if (bytes) {
+                        dns_state->query_started = true;
+                        sendUdpPacket(tap, *local_ip, *local_mac, dns_state->session.server_ip,
+                                      *mac, dns_state->session.local_port,
+                                      dns_state->session.server_port, *bytes);
+                        std::printf("dns-client: query sent host=%s id=%u\n",
+                                    dns_state->session.hostname.c_str(),
+                                    static_cast<unsigned int>(dns_state->transaction_id));
+                    }
+                }
+            } else {
+                auto now = wirestack::TcpClock::now();
+                auto poll = wirestack::pollDnsTimeout(dns_state->session, now);
+                if (poll.retransmit) {
+                    if (auto mac = arp_cache.lookup(dns_state->session.server_ip)) {
+                        sendUdpPacket(tap, *local_ip, *local_mac, dns_state->session.server_ip,
+                                      *mac, dns_state->session.local_port,
+                                      dns_state->session.server_port, *poll.retransmit);
+                        std::printf("dns-client: retry host=%s id=%u\n",
+                                    dns_state->session.hostname.c_str(),
+                                    static_cast<unsigned int>(dns_state->transaction_id));
+                    }
+                }
+                if (poll.timed_out) {
+                    std::printf("dns-client: resolution failed host=%s reason=Timeout\n",
+                                dns_state->session.hostname.c_str());
+                    std::fflush(stdout);
+                }
+            }
+        }
+
+        if (runtime_options.mode != wirestack::RuntimeMode::Passive && !active_open_started &&
+            dial_target_ip) {
+            wirestack::Ipv4Address dial_ip = *dial_target_ip;
             std::uint16_t dial_port = runtime_options.remote_port;
             std::uint16_t dial_source_port = runtime_options.source_port;
             if (auto mac = arp_cache.lookup(dial_ip)) {
@@ -806,8 +1016,12 @@ int main(int argc, char** argv) {
                     sendTcpSegment(tap, *local_ip, *local_mac, dial_ip, *mac, *connect_result.syn);
                     if (runtime_options.mode == wirestack::RuntimeMode::HttpGet) {
                         wirestack::HttpClientSession session;
-                        session.remote_ip = runtime_options.remote_ip;
+                        session.remote_ip = dial_ip;
                         session.remote_port = runtime_options.remote_port;
+                        session.host_header = runtime_options.destination_is_hostname
+                                                   ? dns_state->host_header
+                                                   : (dial_ip.toString() + ":" +
+                                                      std::to_string(runtime_options.remote_port));
                         session.target = runtime_options.target;
                         http_client_sessions.emplace(*active_open_key, std::move(session));
                     }
