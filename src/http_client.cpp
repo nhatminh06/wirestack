@@ -318,8 +318,7 @@ std::vector<std::byte> toBytes(std::string_view text) {
 
 } // namespace
 
-std::optional<std::vector<std::byte>> buildHttpGetRequest(Ipv4Address remote_ip,
-                                                            std::uint16_t remote_port,
+std::optional<std::vector<std::byte>> buildHttpGetRequest(std::string_view host_header,
                                                             std::string_view target) {
     if (validateHttpClientTarget(target)) {
         return std::nullopt;
@@ -330,9 +329,7 @@ std::optional<std::vector<std::byte>> buildHttpGetRequest(Ipv4Address remote_ip,
     text += target;
     text += " HTTP/1.0\r\n";
     text += "Host: ";
-    text += remote_ip.toString();
-    text += ":";
-    text += std::to_string(remote_port);
+    text += host_header;
     text += "\r\n";
     text += "Connection: close\r\n";
     text += "\r\n";

@@ -155,6 +155,7 @@ struct ClientHarness {
         key.remote_port = remote_port;
         session.remote_ip = remoteIp();
         session.remote_port = remote_port;
+        session.host_header = remoteIp().toString() + ":" + std::to_string(remote_port);
         session.target = std::move(target);
     }
 
@@ -171,8 +172,7 @@ struct ClientHarness {
             out.push_back(wrap(seg, localIp(), localMac(), remoteIp(), remoteMac()));
 
         if (result.connection_established && !session.request_enqueued) {
-            auto request =
-                buildHttpGetRequest(session.remote_ip, session.remote_port, session.target);
+            auto request = buildHttpGetRequest(session.host_header, session.target);
             if (request) {
                 auto sent = table.makeOutgoingData(key, *request, now);
                 if (!sent.error) {

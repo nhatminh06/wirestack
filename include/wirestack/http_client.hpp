@@ -52,12 +52,16 @@ HttpResponseParseResult parseHttpResponse(std::span<const std::byte> buffer, boo
 // Per-connection outbound HTTP/1.0 client state, owned by main.cpp
 // (mirrors HttpConnectionState's split from TcpConnectionTable: TCP
 // knows nothing about HTTP either direction). `remote_ip`/`remote_port`
-// are the literal destination this session's exact request was built
-// for -- used only for the Host header and for logging, never as TCP
-// sequence state.
+// are the actual TCP destination (the resolved address in DNS mode) --
+// used for logging, never for the Host header. `host_header` is the
+// exact authority text the request's Host header carries: the original
+// literal "<ip>:<port>" for a literal-IPv4 destination, or the original
+// "<hostname>:<port>" when the destination was resolved via DNS -- the
+// resolved IPv4 must never leak into it (see docs/dns.md).
 struct HttpClientSession {
     Ipv4Address remote_ip;
     std::uint16_t remote_port = 0;
+    std::string host_header;
     std::string target;
 
     bool request_enqueued = false;
@@ -104,13 +108,15 @@ std::optional<HttpClientTargetError> validateHttpClientTarget(std::string_view t
 
 // Builds the exact bounded GET request:
 //   GET <target> HTTP/1.0\r\n
-//   Host: <remote_ip>:<remote_port>\r\n
+//   Host: <host_header>\r\n
 //   Connection: close\r\n
 //   \r\n
-// Returns nullopt if `target` fails validateHttpClientTarget -- the
-// serializer never emits CRLF-injected or otherwise malformed bytes.
-std::optional<std::vector<std::byte>> buildHttpGetRequest(Ipv4Address remote_ip,
-                                                            std::uint16_t remote_port,
+// `host_header` is caller-supplied verbatim (see HttpClientSession) --
+// this function has no notion of an IPv4 address or a hostname, only the
+// authority text to place in the Host header. Returns nullopt if `target`
+// fails validateHttpClientTarget -- the serializer never emits
+// CRLF-injected or otherwise malformed bytes.
+std::optional<std::vector<std::byte>> buildHttpGetRequest(std::string_view host_header,
                                                             std::string_view target);
 
 } // namespace wirestack
