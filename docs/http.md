@@ -156,13 +156,28 @@ now that active connections can legitimately carry an HTTP role.
 
 `--http-get`, `--source-port`, and `--target` must all be given
 together; `--http-get`/`--active-open` are mutually exclusive (both
-configure the same one-shot active-open slot). `--http-get` takes a
-literal IPv4 address and port -- no hostnames, no DNS. `--target` must
-begin with `/` and contain no space, CR, LF, or other control byte;
-validated before any TCP connection is created. As with
-`--active-open`, the peer's MAC must already be in the ARP cache
-(Wirestack sends no ARP requests of its own) and the request fires
-exactly once, as soon as the handshake completes.
+configure the same one-shot active-open slot), in either argument
+order. `--http-get` takes a literal IPv4 address and port -- no
+hostnames, no DNS. `--target` must begin with `/` and contain no
+space, CR, LF, or other control byte; validated before any TCP
+connection is created. As with `--active-open`, the peer's MAC must
+already be in the ARP cache (Wirestack sends no ARP requests of its
+own) and the request fires exactly once, as soon as the handshake
+completes.
+
+All runtime-mode options (`--active-open`/`--http-get`/
+`--source-port`/`--target`) are parsed and validated by
+`parseRuntimeOptions` (`runtime_options.hpp`/`.cpp`) in one pass before
+the TAP device is opened. Its result distinguishes three outcomes, not
+two: no runtime-mode options given (passive server), valid options for
+one mode, or invalid input -- an unknown option, a duplicated option, a
+missing companion option, both `--active-open` and `--http-get`, a
+destination missing its port, a malformed IPv4 address, or a port that
+fails strict complete-string decimal parsing (empty, signed, hex,
+out-of-range, or carrying leading/trailing junk or whitespace) is
+*never* silently treated as "no options given" -- it prints one
+diagnostic to stderr and exits nonzero without opening the TAP device
+or creating any connection.
 
 ### Request
 

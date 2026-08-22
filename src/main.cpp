@@ -18,6 +18,7 @@
 #include "wirestack/ipv4.hpp"
 #include "wirestack/ipv4_address.hpp"
 #include "wirestack/mac_address.hpp"
+#include "wirestack/runtime_options.hpp"
 #include "wirestack/tap_device.hpp"
 #include "wirestack/tcp.hpp"
 #include "wirestack/tcp_connection.hpp"
@@ -631,132 +632,6 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     }
 }
 
-// One opt-in active-open configuration: connect once to remote_ip:remote_port
-// from source_port, as soon as the peer's MAC is known. Parsed from
-// "--active-open <ip>:<port> --source-port <port>", both optional but
-// required together; absent by default (main.cpp owns this runtime
-// policy -- TCP protocol logic knows nothing about command-line syntax).
-struct ActiveOpenConfig {
-    wirestack::Ipv4Address remote_ip;
-    std::uint16_t remote_port;
-    std::uint16_t source_port;
-};
-
-std::optional<ActiveOpenConfig> parseActiveOpenArgs(int argc, char** argv) {
-    std::optional<std::string> active_open_arg;
-    std::optional<std::string> source_port_arg;
-    for (int i = 4; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--active-open" && i + 1 < argc) {
-            active_open_arg = argv[++i];
-        } else if (arg == "--source-port" && i + 1 < argc) {
-            source_port_arg = argv[++i];
-        } else if (arg == "--http-get") {
-            // --source-port is shared with --http-get -- its presence
-            // alone (without --active-open) means this parser has nothing
-            // to do; parseHttpGetArgs owns validation in that case.
-            return std::nullopt;
-        }
-    }
-    if (!active_open_arg && !source_port_arg) {
-        return std::nullopt;
-    }
-    if (!active_open_arg || !source_port_arg) {
-        std::fprintf(stderr,
-                     "wirestack: --active-open and --source-port must be given together\n");
-        return std::nullopt;
-    }
-
-    auto colon = active_open_arg->rfind(':');
-    if (colon == std::string::npos) {
-        std::fprintf(stderr, "wirestack: --active-open must be <ip>:<port>\n");
-        return std::nullopt;
-    }
-    auto remote_ip = wirestack::Ipv4Address::parse(active_open_arg->substr(0, colon));
-    if (!remote_ip) {
-        std::fprintf(stderr, "wirestack: invalid --active-open IPv4 address\n");
-        return std::nullopt;
-    }
-    int remote_port = std::atoi(active_open_arg->substr(colon + 1).c_str());
-    int source_port = std::atoi(source_port_arg->c_str());
-    if (remote_port <= 0 || remote_port > 0xffff || source_port <= 0 || source_port > 0xffff) {
-        std::fprintf(stderr, "wirestack: --active-open/--source-port ports must be 1-65535\n");
-        return std::nullopt;
-    }
-
-    return ActiveOpenConfig{*remote_ip, static_cast<std::uint16_t>(remote_port),
-                             static_cast<std::uint16_t>(source_port)};
-}
-
-// One opt-in outbound HTTP/1.0 client configuration: dial remote_ip:
-// remote_port from source_port (same active-open mechanism as
-// ActiveOpenConfig) and, once established, send exactly one GET for
-// `target`. Parsed from "--http-get <ip>:<port> --source-port <port>
-// --target </path>", all three required together; absent by default.
-// Mutually exclusive with --active-open (both configure the same
-// four-tuple's active-open slot -- see main()). Destination must be a
-// literal IPv4 address; no hostnames.
-struct HttpGetConfig {
-    wirestack::Ipv4Address remote_ip;
-    std::uint16_t remote_port;
-    std::uint16_t source_port;
-    std::string target;
-};
-
-std::optional<HttpGetConfig> parseHttpGetArgs(int argc, char** argv) {
-    std::optional<std::string> http_get_arg;
-    std::optional<std::string> source_port_arg;
-    std::optional<std::string> target_arg;
-    for (int i = 4; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--http-get" && i + 1 < argc) {
-            http_get_arg = argv[++i];
-        } else if (arg == "--source-port" && i + 1 < argc) {
-            source_port_arg = argv[++i];
-        } else if (arg == "--target" && i + 1 < argc) {
-            target_arg = argv[++i];
-        }
-    }
-    if (!http_get_arg && !source_port_arg && !target_arg) {
-        return std::nullopt;
-    }
-    if (!http_get_arg || !source_port_arg || !target_arg) {
-        std::fprintf(
-            stderr,
-            "wirestack: --http-get, --source-port, and --target must be given together\n");
-        return std::nullopt;
-    }
-
-    auto colon = http_get_arg->rfind(':');
-    if (colon == std::string::npos) {
-        std::fprintf(stderr, "wirestack: --http-get must be <ip>:<port>\n");
-        return std::nullopt;
-    }
-    auto remote_ip = wirestack::Ipv4Address::parse(http_get_arg->substr(0, colon));
-    if (!remote_ip) {
-        std::fprintf(stderr, "wirestack: invalid --http-get IPv4 address\n");
-        return std::nullopt;
-    }
-    int remote_port = std::atoi(http_get_arg->substr(colon + 1).c_str());
-    int source_port = std::atoi(source_port_arg->c_str());
-    if (remote_port <= 0 || remote_port > 0xffff || source_port <= 0 || source_port > 0xffff) {
-        std::fprintf(stderr, "wirestack: --http-get/--source-port ports must be 1-65535\n");
-        return std::nullopt;
-    }
-
-    if (auto target_error = wirestack::validateHttpClientTarget(*target_arg)) {
-        std::fprintf(stderr, "wirestack: invalid --target: %s\n",
-                     *target_error == wirestack::HttpClientTargetError::Empty      ? "empty"
-                     : *target_error == wirestack::HttpClientTargetError::MissingLeadingSlash
-                         ? "must begin with '/'"
-                         : "contains a space, CR, LF, or other control byte");
-        return std::nullopt;
-    }
-
-    return HttpGetConfig{*remote_ip, static_cast<std::uint16_t>(remote_port),
-                          static_cast<std::uint16_t>(source_port), *target_arg};
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -779,6 +654,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "wirestack: invalid local MAC address: %s\n", argv[3]);
         return 1;
     }
+
+    // Runtime-mode options (--active-open / --http-get / --source-port /
+    // --target) are validated before the TAP device is opened, so invalid
+    // configuration exits deterministically without touching the network
+    // and without ever falling back to passive mode -- see
+    // RuntimeOptionsParseResult's absent/valid/invalid contract.
+    auto runtime_parse = wirestack::parseRuntimeOptions(argc, argv);
+    if (runtime_parse.error) {
+        std::fprintf(stderr, "wirestack: %s\n", runtime_parse.error->message.c_str());
+        return 1;
+    }
+    const wirestack::RuntimeOptions& runtime_options = *runtime_parse.options;
 
     auto opened = wirestack::TapDevice::open(argv[1]);
     if (auto* error = std::get_if<wirestack::TapOpenError>(&opened)) {
@@ -811,37 +698,29 @@ int main(int argc, char** argv) {
     // state; a connection is never in both maps).
     std::map<wirestack::TcpConnectionKey, wirestack::HttpClientSession> http_client_sessions;
 
-    // Opt-in active open (see parseActiveOpenArgs) and opt-in outbound
-    // HTTP/1.0 GET (see parseHttpGetArgs) share the same active-open slot
-    // and are mutually exclusive -- both configure at most one connection,
-    // started exactly once as soon as the peer's MAC is known through the
-    // existing ARP cache. Absent by default.
-    auto active_open_config = parseActiveOpenArgs(argc, argv);
-    auto http_get_config = parseHttpGetArgs(argc, argv);
-    if (active_open_config && http_get_config) {
-        std::fprintf(stderr, "wirestack: --active-open and --http-get are mutually exclusive\n");
-        active_open_config.reset();
-        http_get_config.reset();
-    }
+    // ActiveOpen and HttpGet share the same active-open slot and are
+    // mutually exclusive (enforced by parseRuntimeOptions) -- at most one
+    // connection is configured, started exactly once as soon as the peer's
+    // MAC is known through the existing ARP cache. Passive by default.
     bool active_open_started = false;
     std::optional<wirestack::TcpConnectionKey> active_open_key;
-    if (active_open_config) {
-        active_open_key = wirestack::TcpConnectionKey{
-            *local_ip, active_open_config->source_port, active_open_config->remote_ip,
-            active_open_config->remote_port};
+    if (runtime_options.mode == wirestack::RuntimeMode::ActiveOpen) {
+        active_open_key =
+            wirestack::TcpConnectionKey{*local_ip, runtime_options.source_port,
+                                         runtime_options.remote_ip, runtime_options.remote_port};
         std::printf("tcp: active open pending dst=%s:%u src_port=%u (waiting for peer MAC)\n",
-                    active_open_config->remote_ip.toString().c_str(),
-                    static_cast<unsigned int>(active_open_config->remote_port),
-                    static_cast<unsigned int>(active_open_config->source_port));
-    } else if (http_get_config) {
-        active_open_key = wirestack::TcpConnectionKey{
-            *local_ip, http_get_config->source_port, http_get_config->remote_ip,
-            http_get_config->remote_port};
+                    runtime_options.remote_ip.toString().c_str(),
+                    static_cast<unsigned int>(runtime_options.remote_port),
+                    static_cast<unsigned int>(runtime_options.source_port));
+    } else if (runtime_options.mode == wirestack::RuntimeMode::HttpGet) {
+        active_open_key =
+            wirestack::TcpConnectionKey{*local_ip, runtime_options.source_port,
+                                         runtime_options.remote_ip, runtime_options.remote_port};
         std::printf("tcp: http-get pending dst=%s:%u src_port=%u target=%s (waiting for peer MAC)\n",
-                    http_get_config->remote_ip.toString().c_str(),
-                    static_cast<unsigned int>(http_get_config->remote_port),
-                    static_cast<unsigned int>(http_get_config->source_port),
-                    http_get_config->target.c_str());
+                    runtime_options.remote_ip.toString().c_str(),
+                    static_cast<unsigned int>(runtime_options.remote_port),
+                    static_cast<unsigned int>(runtime_options.source_port),
+                    runtime_options.target.c_str());
     }
 
     std::array<std::byte, kReceiveBufferSize> buffer{};
@@ -898,13 +777,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        if ((active_open_config || http_get_config) && !active_open_started) {
-            wirestack::Ipv4Address dial_ip =
-                active_open_config ? active_open_config->remote_ip : http_get_config->remote_ip;
-            std::uint16_t dial_port =
-                active_open_config ? active_open_config->remote_port : http_get_config->remote_port;
-            std::uint16_t dial_source_port = active_open_config ? active_open_config->source_port
-                                                                  : http_get_config->source_port;
+        if (runtime_options.mode != wirestack::RuntimeMode::Passive && !active_open_started) {
+            wirestack::Ipv4Address dial_ip = runtime_options.remote_ip;
+            std::uint16_t dial_port = runtime_options.remote_port;
+            std::uint16_t dial_source_port = runtime_options.source_port;
             if (auto mac = arp_cache.lookup(dial_ip)) {
                 auto now = wirestack::TcpClock::now();
                 auto connect_result = tcp_connections.beginConnect(*active_open_key, now);
@@ -914,11 +790,11 @@ int main(int argc, char** argv) {
                                 dial_ip.toString().c_str(), static_cast<unsigned int>(dial_port),
                                 static_cast<unsigned int>(dial_source_port));
                     sendTcpSegment(tap, *local_ip, *local_mac, dial_ip, *mac, *connect_result.syn);
-                    if (http_get_config) {
+                    if (runtime_options.mode == wirestack::RuntimeMode::HttpGet) {
                         wirestack::HttpClientSession session;
-                        session.remote_ip = http_get_config->remote_ip;
-                        session.remote_port = http_get_config->remote_port;
-                        session.target = http_get_config->target;
+                        session.remote_ip = runtime_options.remote_ip;
+                        session.remote_port = runtime_options.remote_port;
+                        session.target = runtime_options.target;
                         http_client_sessions.emplace(*active_open_key, std::move(session));
                     }
                 } else {
