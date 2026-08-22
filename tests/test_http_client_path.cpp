@@ -187,7 +187,13 @@ struct ClientHarness {
             }
         }
 
-        if (!session.response_complete && !session.failed) {
+        if (session.response_complete) {
+            // Completion is not proof the peer has nothing more to send
+            // -- mirrors handleHttpClient in main.cpp.
+            if (!result.accepted_payload.empty()) {
+                session.failed = true;
+            }
+        } else if (!session.failed) {
             if (!result.accepted_payload.empty()) {
                 appendHttpClientBytes(session, result.accepted_payload);
             }
@@ -456,6 +462,45 @@ void testReorderedResponseDeliveredOnce() {
     CHECK(h.session.body == toBytes(std::string("segmented")));
 }
 
+// --- Section 32: bytes received after completion, real wire path --------
+
+void testPostCompletionByteRejectedRealSegment() {
+    ClientHarness h("/");
+    auto connect_result = h.table.beginConnect(h.key, t0);
+    std::uint32_t local_isn = connect_result.syn->sequence_number;
+    constexpr std::uint32_t kPeerIsn = 9000000;
+    auto peer_syn_ack = makePeerSynAck(9090, 49200, kPeerIsn, local_isn + 1, 65535, 1460);
+    h.deliver(peer_syn_ack, t0);
+    std::string expected_request =
+        "GET / HTTP/1.0\r\nHost: 10.0.0.1:9090\r\nConnection: close\r\n\r\n";
+    std::uint32_t local_ack = local_isn + 1 + static_cast<std::uint32_t>(expected_request.size());
+
+    std::string response = "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    std::uint32_t peer_seq = kPeerIsn + 1;
+    auto response_seg = makeDataSegment(9090, 49200, peer_seq, local_ack, 65535, toBytes(response));
+    h.deliver(response_seg, t0);
+    CHECK(h.session.response_complete);
+    CHECK(!h.session.failed);
+    CHECK(h.session.body == toBytes(std::string("hello")));
+    peer_seq += static_cast<std::uint32_t>(response.size());
+
+    // Wirestack has already sequenced its own FIN (state FinWait1/
+    // FinWait2), but the peer can still legitimately send more payload
+    // before acknowledging that FIN -- a real, otherwise-acceptable
+    // in-order data segment carrying one extra byte on an
+    // already-complete response. It must be rejected, not silently
+    // absorbed as if the connection were still cleanly successful.
+    auto extra_seg = makeDataSegment(9090, 49200, peer_seq, local_ack, 65535, toBytes("X"));
+    auto wire = wrap(extra_seg, remoteIp(), remoteMac(), localIp(), localMac());
+    auto parsed_extra = parseWire(wire);
+    CHECK(parsed_extra.ok);
+    auto out = h.deliver(parsed_extra.tcp, t0);
+    (void)out;
+    CHECK(h.session.failed);
+    // The original exact body is not corrupted by the rejected byte.
+    CHECK(h.session.body == toBytes(std::string("hello")));
+}
+
 } // namespace
 
 int main() {
@@ -464,5 +509,6 @@ int main() {
     testActiveInvalidPayloadDoesNotProduceHttp400();
     testRequestRetransmittedIdenticallyOnTimeout();
     testReorderedResponseDeliveredOnce();
+    testPostCompletionByteRejectedRealSegment();
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }
