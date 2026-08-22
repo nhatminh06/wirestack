@@ -189,19 +189,21 @@ struct ClientHarness {
 
         if (!session.response_complete && !session.failed) {
             if (!result.accepted_payload.empty()) {
-                session.response_buffer.insert(session.response_buffer.end(),
-                                                result.accepted_payload.begin(),
-                                                result.accepted_payload.end());
+                appendHttpClientBytes(session, result.accepted_payload);
             }
             if (result.peer_closed) session.peer_fin_seen = true;
 
-            auto parsed = parseHttpResponse(session.response_buffer, session.peer_fin_seen);
-            if (parsed.status == HttpResponseParseStatus::Complete) {
-                session.response_complete = true;
-                session.status_code = *parsed.status_code;
-                session.body = std::move(parsed.body);
-            } else if (parsed.status != HttpResponseParseStatus::Incomplete) {
+            if (session.response_overflowed) {
                 session.failed = true;
+            } else {
+                auto parsed = parseHttpResponse(session.response_buffer, session.peer_fin_seen);
+                if (parsed.status == HttpResponseParseStatus::Complete) {
+                    session.response_complete = true;
+                    session.status_code = *parsed.status_code;
+                    session.body = std::move(parsed.body);
+                } else if (parsed.status != HttpResponseParseStatus::Incomplete) {
+                    session.failed = true;
+                }
             }
         }
 

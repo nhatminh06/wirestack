@@ -160,6 +160,27 @@ PYEOF_SERVER
     # segment came back (one response, not a second/pipelined one).
     grep -q "^REQUEST_EXACT_MATCH" "${log}" || { ws_log "server did not receive the exact expected GET request"; return 1; }
 
+    # The wire capture and the server log together prove request/response
+    # bytes crossed the network correctly, but neither proves Wirestack
+    # itself accepted and parsed the response -- a client that discarded or
+    # rejected the response and then closed could still pass every check
+    # above. wirestack's own flushed completion line is the only evidence
+    # of client-side parser completion.
+    local wirestack_log="${WS_EVIDENCE_DIR}/wirestack.out"
+    local completion_count
+    completion_count="$(grep -c "^http-client: response complete status=200 body_len=29$" "${wirestack_log}" || true)"
+    [ "${completion_count}" = "1" ] || {
+        ws_log "expected exactly 1 'response complete status=200 body_len=29' line from wirestack, got ${completion_count}"
+        ws_log "wirestack stdout/stderr: ${wirestack_log}"
+        ws_log "server log: ${log}"
+        ws_log "packet capture: ${WS_EVIDENCE_DIR}/http_get_cl.abs.txt"
+        return 1
+    }
+    grep -q "^http-client: response rejected" "${wirestack_log}" && {
+        ws_log "wirestack rejected the response -- see ${wirestack_log}"
+        return 1
+    }
+
     local get_psh_count response_psh_count
     get_psh_count="$(grep -c "${WS_SERVER_IP}\.${WS_CL_SRC_PORT} > ${WS_CLIENT_IP}\.${WS_CL_PORT}: Flags \[P" "${WS_EVIDENCE_DIR}/http_get_cl.abs.txt" || true)"
     [ "${get_psh_count}" = "1" ] || { ws_log "expected exactly 1 GET request segment on the wire, got ${get_psh_count}"; return 1; }
@@ -257,6 +278,25 @@ PYEOF_SERVER
     # wire capture instead proves exactly one PSH segment in each
     # direction.
     grep -q "^REQUEST_EXACT_MATCH" "${log}" || { ws_log "server did not receive the exact expected GET request"; return 1; }
+
+    # See the matching comment in ws_test_http_get_content_length: traffic
+    # and the server log alone do not prove wirestack's own HTTP/1.0
+    # response parser reached completion -- its flushed completion line is
+    # the authoritative evidence for that.
+    local wirestack_log="${WS_EVIDENCE_DIR}/wirestack.out"
+    local completion_count
+    completion_count="$(grep -c "^http-client: response complete status=200 body_len=21$" "${wirestack_log}" || true)"
+    [ "${completion_count}" = "1" ] || {
+        ws_log "expected exactly 1 'response complete status=200 body_len=21' line from wirestack, got ${completion_count}"
+        ws_log "wirestack stdout/stderr: ${wirestack_log}"
+        ws_log "server log: ${log}"
+        ws_log "packet capture: ${WS_EVIDENCE_DIR}/http_get_close.abs.txt"
+        return 1
+    }
+    grep -q "^http-client: response rejected" "${wirestack_log}" && {
+        ws_log "wirestack rejected the response -- see ${wirestack_log}"
+        return 1
+    }
 
     local get_psh_count response_psh_count
     get_psh_count="$(grep -c "${WS_SERVER_IP}\.${WS_CL_CLOSE_SRC_PORT} > ${WS_CLIENT_IP}\.${WS_CL_CLOSE_PORT}: Flags \[P" "${WS_EVIDENCE_DIR}/http_get_close.abs.txt" || true)"

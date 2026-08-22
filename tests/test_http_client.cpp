@@ -80,6 +80,13 @@ void testRequestRejectsLfOnly() {
     CHECK(validateHttpClientTarget("/a\nb") == HttpClientTargetError::InvalidByte);
 }
 
+void testRequestRejectsNul() {
+    std::string target = "/a";
+    target += '\0';
+    target += "b";
+    CHECK(validateHttpClientTarget(target) == HttpClientTargetError::InvalidByte);
+}
+
 // --- Section 26: status line and headers ---------------------------------
 
 HttpResponseParseResult parseWhole(std::string_view text, bool peer_closed = true) {
@@ -439,6 +446,202 @@ void testSplitBoundaries() {
     }
 }
 
+// --- Section 31: bounded session-append overflow -------------------------
+//
+// Mirrors handleHttpClient's dispatch in main.cpp (and ClientHarness::deliver
+// in test_http_client_path.cpp): appendHttpClientBytes first, then gate on
+// response_overflowed before ever calling parseHttpResponse. This is the
+// exact incremental path that used to silently truncate an oversized
+// response down to the cap -- discarding the very bytes that proved the
+// peer sent too much and letting an oversized response look complete.
+
+void deliverChunk(HttpClientSession& session, std::span<const std::byte> bytes,
+                   bool peer_closed) {
+    if (session.response_complete || session.failed) return;
+    if (!bytes.empty()) {
+        appendHttpClientBytes(session, bytes);
+    }
+    if (peer_closed) {
+        session.peer_fin_seen = true;
+    }
+    if (session.response_overflowed) {
+        session.failed = true;
+        return;
+    }
+    auto parsed = parseHttpResponse(session.response_buffer, session.peer_fin_seen);
+    if (parsed.status == HttpResponseParseStatus::Complete) {
+        session.response_complete = true;
+        session.status_code = *parsed.status_code;
+        session.body = std::move(parsed.body);
+    } else if (parsed.status != HttpResponseParseStatus::Incomplete) {
+        session.failed = true;
+    }
+}
+
+// Builds a header block (status line + headers + blank-line CRLF) of exactly
+// `total_len` bytes, declaring Content-Length: body_len.
+std::string buildHeaderBlockExact(std::size_t total_len, std::size_t body_len) {
+    std::string prefix = "HTTP/1.0 200 OK\r\nContent-Length: " + std::to_string(body_len) + "\r\n";
+    std::string pad_prefix = "X-Pad: ";
+    std::string blank_line = "\r\n";
+    std::size_t remaining = total_len - prefix.size() - blank_line.size();
+    std::size_t pad_len = remaining - pad_prefix.size() - 2; // trailing "\r\n" of the pad line
+    return prefix + pad_prefix + std::string(pad_len, 'a') + "\r\n" + blank_line;
+}
+
+void testOverflowExactMaxHeaderAndBodyAccepted() {
+    HttpClientSession session;
+    std::string head = buildHeaderBlockExact(kMaxHttpResponseHeaderBlockLength,
+                                              kMaxHttpResponseBodyLength);
+    CHECK(head.size() == kMaxHttpResponseHeaderBlockLength);
+    std::string body(kMaxHttpResponseBodyLength, 'z');
+
+    deliverChunk(session, toBytes(head), false);
+    CHECK(!session.response_overflowed);
+    deliverChunk(session, toBytes(body), false);
+
+    CHECK(!session.response_overflowed);
+    CHECK(session.response_complete);
+    CHECK(!session.failed);
+    CHECK(session.status_code == 200);
+    CHECK(session.body.size() == kMaxHttpResponseBodyLength);
+}
+
+// The critical regression test: exact maximum header + exact maximum body
+// + one extra byte, appended as a single call against a session that has
+// not yet been parsed to completion. The pre-fix append silently discarded
+// the one extra byte (truncating to the cap), so the buffer looked like an
+// exactly-complete response and this test failed against it
+// (response_complete was incorrectly true; response_overflowed did not
+// exist). See the "Response-overflow correction" section of the PR
+// description for the mechanism.
+void testOverflowMaxPlusOneRejected() {
+    HttpClientSession session;
+    std::string head = buildHeaderBlockExact(kMaxHttpResponseHeaderBlockLength,
+                                              kMaxHttpResponseBodyLength);
+    std::string body(kMaxHttpResponseBodyLength, 'z');
+    body += 'X'; // one byte over the combined header+body cap
+
+    auto full = toBytes(head + body);
+    appendHttpClientBytes(session, full);
+
+    CHECK(session.response_overflowed);
+    CHECK(session.response_buffer.size() < full.size());
+    auto parsed = parseHttpResponse(session.response_buffer, false);
+    CHECK(parsed.status != HttpResponseParseStatus::Complete);
+}
+
+void testOverflowExtraByteInFinalChunkRejected() {
+    HttpClientSession session;
+    std::string head = buildHeaderBlockExact(kMaxHttpResponseHeaderBlockLength,
+                                              kMaxHttpResponseBodyLength);
+    std::string body(kMaxHttpResponseBodyLength, 'z');
+    body += 'X'; // one byte over the cap, delivered in the same chunk as
+                 // the last valid body byte
+
+    deliverChunk(session, toBytes(head), false);
+    deliverChunk(session, toBytes(body), false);
+
+    CHECK(session.response_overflowed);
+    CHECK(session.failed);
+    CHECK(!session.response_complete);
+}
+
+void testOverflowChunkedDeliveryThenExtraByteRejected() {
+    HttpClientSession session;
+    std::string head = buildHeaderBlockExact(kMaxHttpResponseHeaderBlockLength,
+                                              kMaxHttpResponseBodyLength);
+    std::string body(kMaxHttpResponseBodyLength, 'z');
+
+    // Deliver the maximum valid response in several small chunks.
+    deliverChunk(session, toBytes(head.substr(0, 100)), false);
+    deliverChunk(session, toBytes(head.substr(100)), false);
+    std::size_t half = body.size() / 2;
+    deliverChunk(session, toBytes(body.substr(0, half)), false);
+    CHECK(!session.response_complete);
+    deliverChunk(session, toBytes(body.substr(half)), false);
+    CHECK(session.response_complete);
+
+    // A well-behaved server never sends bytes after a Connection: close
+    // response is fully sent, but a hostile/broken peer might -- prove a
+    // trailing byte after completion cannot corrupt an already-complete
+    // session (deliverChunk's early-return guard).
+    std::array<std::byte, 1> extra = {std::byte{'X'}};
+    deliverChunk(session, extra, false);
+    CHECK(session.response_complete);
+    CHECK(session.body.size() == kMaxHttpResponseBodyLength);
+}
+
+// The same scenario as testOverflowExtraByteInFinalChunkRejected, but the
+// extra byte arrives strictly before the response would otherwise be
+// recognized as complete (chunked delivery, extra byte folded into an
+// earlier chunk than the last one) -- proves overflow is detected as soon
+// as it happens, not only when it happens to land in the final chunk.
+void testOverflowMidStreamExtraByteRejected() {
+    HttpClientSession session;
+    std::string head = buildHeaderBlockExact(kMaxHttpResponseHeaderBlockLength,
+                                              kMaxHttpResponseBodyLength);
+    std::string body(kMaxHttpResponseBodyLength, 'z');
+    body += 'X';
+
+    deliverChunk(session, toBytes(head), false);
+    std::size_t half = body.size() / 2;
+    deliverChunk(session, toBytes(body.substr(0, half)), false);
+    CHECK(!session.response_complete);
+    CHECK(!session.response_overflowed);
+    deliverChunk(session, toBytes(body.substr(half)), false); // carries the extra byte
+    CHECK(session.response_overflowed);
+    CHECK(session.failed);
+    CHECK(!session.response_complete);
+}
+
+void testOverflowCloseDelimitedExactMaxAccepted() {
+    HttpClientSession session;
+    std::string head = "HTTP/1.0 200 OK\r\n\r\n";
+    std::string body(kMaxHttpResponseBodyLength, 'z');
+
+    deliverChunk(session, toBytes(head), false);
+    deliverChunk(session, toBytes(body), false);
+    CHECK(!session.response_complete); // no Content-Length: waits for FIN
+    deliverChunk(session, {}, true);   // peer FIN, no more bytes
+
+    CHECK(!session.response_overflowed);
+    CHECK(session.response_complete);
+    CHECK(session.body.size() == kMaxHttpResponseBodyLength);
+}
+
+void testOverflowCloseDelimitedOneByteOverRejected() {
+    HttpClientSession session;
+    std::string head = "HTTP/1.0 200 OK\r\n\r\n";
+    std::string body(kMaxHttpResponseBodyLength + 1, 'z');
+
+    deliverChunk(session, toBytes(head), false);
+    deliverChunk(session, toBytes(body), false);
+    deliverChunk(session, {}, true);
+
+    CHECK(!session.response_complete);
+    CHECK(session.failed);
+}
+
+void testOverflowCannotBecomeCompleteAfterFlagged() {
+    HttpClientSession session;
+    std::string head = buildHeaderBlockExact(kMaxHttpResponseHeaderBlockLength,
+                                              kMaxHttpResponseBodyLength);
+    std::string body(kMaxHttpResponseBodyLength, 'z');
+    body += 'X';
+
+    deliverChunk(session, toBytes(head), false);
+    deliverChunk(session, toBytes(body), false);
+    CHECK(session.response_overflowed);
+    CHECK(session.failed);
+
+    // Further delivery (including a peer FIN) must never flip an
+    // overflowed/failed session to complete.
+    deliverChunk(session, {}, true);
+    CHECK(!session.response_complete);
+    CHECK(session.body.empty());
+}
+
 } // namespace
 
 int main() {
@@ -450,6 +653,7 @@ int main() {
     testRequestRejectsSpace();
     testRequestRejectsCrInjection();
     testRequestRejectsLfOnly();
+    testRequestRejectsNul();
 
     testStatus200();
     testStatus204();
@@ -500,6 +704,15 @@ int main() {
     testTransferEncodingUnsupportedEvenWithoutContentLength();
 
     testSplitBoundaries();
+
+    testOverflowExactMaxHeaderAndBodyAccepted();
+    testOverflowMaxPlusOneRejected();
+    testOverflowExtraByteInFinalChunkRejected();
+    testOverflowChunkedDeliveryThenExtraByteRejected();
+    testOverflowMidStreamExtraByteRejected();
+    testOverflowCloseDelimitedExactMaxAccepted();
+    testOverflowCloseDelimitedOneByteOverRejected();
+    testOverflowCannotBecomeCompleteAfterFlagged();
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }

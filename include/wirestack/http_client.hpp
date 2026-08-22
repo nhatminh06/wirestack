@@ -63,6 +63,11 @@ struct HttpClientSession {
     bool request_enqueued = false;
     std::vector<std::byte> response_buffer;
     bool peer_fin_seen = false;
+    // Set by appendHttpClientBytes when the peer sent more bytes than fit
+    // in the combined header+body bound (see appendHttpClientBytes below).
+    // Once set, response_buffer stops growing and the response must never
+    // be treated as complete.
+    bool response_overflowed = false;
 
     bool response_complete = false;
     bool failed = false;
@@ -72,6 +77,19 @@ struct HttpClientSession {
     int status_code = 0;
     std::vector<std::byte> body;
 };
+
+// Appends `bytes` to session.response_buffer, bounded by the combined
+// header+body cap (kMaxHttpResponseHeaderBlockLength +
+// kMaxHttpResponseBodyLength) so an active connection's client state can
+// never grow unbounded regardless of what the peer sends. If `bytes` would
+// not entirely fit within the remaining room, none of it is appended and
+// session.response_overflowed is set instead: appending a truncated prefix
+// up to the cap would silently discard the evidence that the peer sent too
+// much, and a truncated prefix can itself look like a complete, valid
+// response (e.g. exact header maximum + exact body maximum, with the
+// oversized extra byte discarded). Once response_overflowed is set, further
+// calls are no-ops -- the session must never recover from overflow.
+void appendHttpClientBytes(HttpClientSession& session, std::span<const std::byte> bytes);
 
 enum class HttpClientTargetError {
     Empty,

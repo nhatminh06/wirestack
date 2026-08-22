@@ -233,6 +233,18 @@ buffer -- out-of-order and unreleased bytes stay inside TCP reassembly,
 never reach the parser. The response body is arbitrary bytes: no
 C-string or UTF-8 assumption, an embedded `0x00` does not truncate it.
 
+`appendHttpClientBytes` bounds the buffer at
+`kMaxHttpResponseHeaderBlockLength + kMaxHttpResponseBodyLength`. If an
+incoming chunk of accepted bytes would not entirely fit in the
+remaining room, none of it is appended -- the session is marked
+`response_overflowed` instead. This is deliberate: appending a
+truncated prefix up to the cap would discard the very bytes proving
+the peer sent too much, and a truncated prefix can itself look like an
+exactly-complete response (header at its maximum plus body at its
+maximum, with the oversized extra byte silently dropped). An
+overflowed session is always treated as failed and is never handed to
+`parseHttpResponse` again.
+
 On `Malformed`/`TooLarge`/`UnsupportedVersion`/
 `UnsupportedTransferEncoding`/`Truncated`, the session is marked
 `failed` -- no successful response is exposed, no bytes reach the
@@ -294,8 +306,16 @@ sudo ./build/wirestack wire0 10.0.0.2 02:00:00:00:00:02 \
 Expected: tcpdump shows Wirestack's SYN, the peer's SYN-ACK, Wirestack's
 ACK, then Wirestack's GET, the peer's response, its FIN, and Wirestack's
 own close; Wirestack's stdout prints the response status and body
-length once (`http-client: response complete status=... body_len=...`).
-For a reproducible version with packet-capture evidence, see
+length once (`http-client: response complete status=... body_len=...`),
+or `http-client: response rejected ...` on failure. Both lines are
+followed by an explicit `fflush(stdout)` -- Wirestack never exits on
+its own, so without an explicit flush a redirected, non-interactive
+stdout (as `tools/integration/http_get.sh` uses) can leave these lines
+sitting in libc's buffer indefinitely, invisible to anything reading
+the log file while Wirestack keeps running. Packet capture alone proves
+request/response bytes crossed the wire; it does not prove Wirestack's
+own parser reached completion -- this flushed line is the evidence for
+that. For a reproducible version with packet-capture evidence, see
 `tools/integration/http_get.sh` and
 [docs/interoperability.md](interoperability.md).
 

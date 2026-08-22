@@ -276,6 +276,19 @@ HttpResponseParseResult parseHttpResponse(std::span<const std::byte> buffer, boo
     return result;
 }
 
+void appendHttpClientBytes(HttpClientSession& session, std::span<const std::byte> bytes) {
+    if (session.response_overflowed) {
+        return;
+    }
+    constexpr std::size_t kCap = kMaxHttpResponseHeaderBlockLength + kMaxHttpResponseBodyLength;
+    std::size_t room = kCap - session.response_buffer.size();
+    if (bytes.size() > room) {
+        session.response_overflowed = true;
+        return;
+    }
+    session.response_buffer.insert(session.response_buffer.end(), bytes.begin(), bytes.end());
+}
+
 std::optional<HttpClientTargetError> validateHttpClientTarget(std::string_view target) {
     if (target.empty()) {
         return HttpClientTargetError::Empty;

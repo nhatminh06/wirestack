@@ -297,22 +297,6 @@ void sendTcpReply(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
     sendTcpSegment(tap, local_ip, local_mac, ip_packet.source, eth_frame.source, segment);
 }
 
-// Bounded append, mirroring appendHttpBytes (http.hpp) for the response
-// side: caps at the combined header+body bound so an active connection's
-// client state can never grow unbounded regardless of what the peer sends.
-void appendHttpClientBytes(wirestack::HttpClientSession& session,
-                            std::span<const std::byte> bytes) {
-    constexpr std::size_t kCap =
-        wirestack::kMaxHttpResponseHeaderBlockLength + wirestack::kMaxHttpResponseBodyLength;
-    if (session.response_buffer.size() >= kCap) {
-        return;
-    }
-    std::size_t room = kCap - session.response_buffer.size();
-    std::size_t take = std::min(room, bytes.size());
-    session.response_buffer.insert(session.response_buffer.end(), bytes.begin(),
-                                    bytes.begin() + static_cast<std::ptrdiff_t>(take));
-}
-
 // Drives the active-open HTTP client role for `key`, if `http_client_sessions`
 // owns it: enqueues the exact GET request exactly once, on the call whose
 // `result.connection_established` reports the handshake just completed;
@@ -363,33 +347,48 @@ void handleHttpClient(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip
 
     if (!session.response_complete && !session.failed) {
         if (!result.accepted_payload.empty()) {
-            appendHttpClientBytes(session, result.accepted_payload);
+            wirestack::appendHttpClientBytes(session, result.accepted_payload);
         }
         if (result.peer_closed) {
             session.peer_fin_seen = true;
         }
 
-        auto parsed = wirestack::parseHttpResponse(session.response_buffer, session.peer_fin_seen);
-        switch (parsed.status) {
-            case wirestack::HttpResponseParseStatus::Incomplete:
-                break;
-            case wirestack::HttpResponseParseStatus::Complete:
-                session.response_complete = true;
-                session.status_code = *parsed.status_code;
-                session.body = std::move(parsed.body);
-                std::printf("http-client: response complete status=%d body_len=%zu\n",
-                            session.status_code, session.body.size());
-                break;
-            case wirestack::HttpResponseParseStatus::Malformed:
-            case wirestack::HttpResponseParseStatus::TooLarge:
-            case wirestack::HttpResponseParseStatus::UnsupportedVersion:
-            case wirestack::HttpResponseParseStatus::UnsupportedTransferEncoding:
-            case wirestack::HttpResponseParseStatus::Truncated:
-                session.failed = true;
-                std::printf("http-client: response rejected dst=%s:%u\n",
-                            session.remote_ip.toString().c_str(),
-                            static_cast<unsigned int>(session.remote_port));
-                break;
+        // An overflowed session must never reach the parser again: a
+        // truncated prefix stopped exactly at the cap can itself look like
+        // a complete response (see appendHttpClientBytes), so overflow is
+        // rejected directly instead of being handed to parseHttpResponse.
+        if (session.response_overflowed) {
+            session.failed = true;
+            std::printf("http-client: response rejected dst=%s:%u\n",
+                        session.remote_ip.toString().c_str(),
+                        static_cast<unsigned int>(session.remote_port));
+            std::fflush(stdout);
+        } else {
+            auto parsed =
+                wirestack::parseHttpResponse(session.response_buffer, session.peer_fin_seen);
+            switch (parsed.status) {
+                case wirestack::HttpResponseParseStatus::Incomplete:
+                    break;
+                case wirestack::HttpResponseParseStatus::Complete:
+                    session.response_complete = true;
+                    session.status_code = *parsed.status_code;
+                    session.body = std::move(parsed.body);
+                    std::printf("http-client: response complete status=%d body_len=%zu\n",
+                                session.status_code, session.body.size());
+                    std::fflush(stdout);
+                    break;
+                case wirestack::HttpResponseParseStatus::Malformed:
+                case wirestack::HttpResponseParseStatus::TooLarge:
+                case wirestack::HttpResponseParseStatus::UnsupportedVersion:
+                case wirestack::HttpResponseParseStatus::UnsupportedTransferEncoding:
+                case wirestack::HttpResponseParseStatus::Truncated:
+                    session.failed = true;
+                    std::printf("http-client: response rejected dst=%s:%u\n",
+                                session.remote_ip.toString().c_str(),
+                                static_cast<unsigned int>(session.remote_port));
+                    std::fflush(stdout);
+                    break;
+            }
         }
     }
 

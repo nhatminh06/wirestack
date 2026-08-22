@@ -213,8 +213,8 @@ unshare --user --net --map-root-user -- bash tools/integration/http_get.sh
 
 | # | Scenario | Mechanism |
 |---|----------|-----------|
-| 1 | Content-Length-delimited response | real server sends `Content-Length: 29` and the exact body `Hello from Linux HTTP server\n`; verifies the server received the byte-exact expected GET request and that exactly one request/response segment crossed the wire |
-| 2 | Close-delimited response | real server sends a response with no `Content-Length`, then closes; verifies the same request-exactness and segment-count checks, plus that both the server's and Wirestack's own FIN appear |
+| 1 | Content-Length-delimited response | real server sends `Content-Length: 29` and the exact body `Hello from Linux HTTP server\n`; verifies the server received the byte-exact expected GET request, that exactly one request/response segment crossed the wire, and that Wirestack itself logged exactly one `response complete status=200 body_len=29` |
+| 2 | Close-delimited response | real server sends a response with no `Content-Length`, then closes; verifies the same request-exactness and segment-count checks, that both the server's and Wirestack's own FIN appear, and that Wirestack itself logged exactly one `response complete status=200 body_len=21` |
 
 The exact request bytes are verified at the application layer by the
 real Python server (`REQUEST_EXACT_MATCH`), which is authoritative;
@@ -223,7 +223,13 @@ tcpdump's own HTTP dissector only recognizes a handful of built-in
 traffic but not this scenario's ports), so the wire-level checks here
 instead confirm exactly one PSH-carrying segment crossed in each
 direction -- proving one logical request and one logical response, not
-zero and not a duplicate/retransmission-as-new-data.
+zero and not a duplicate/retransmission-as-new-data. Neither the
+server log nor the wire capture proves Wirestack's own HTTP/1.0
+response parser reached completion -- a client that discarded or
+rejected the response and then closed could still pass every check
+above. Wirestack's own flushed `response complete ...` stdout line
+(see `docs/http.md`) is the evidence for that; both scenarios also
+assert no `response rejected` line appears.
 
 ## Troubleshooting
 
