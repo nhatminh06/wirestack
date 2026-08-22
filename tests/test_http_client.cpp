@@ -457,7 +457,17 @@ void testSplitBoundaries() {
 
 void deliverChunk(HttpClientSession& session, std::span<const std::byte> bytes,
                    bool peer_closed) {
-    if (session.response_complete || session.failed) return;
+    if (session.response_complete) {
+        // Completion is not proof the peer sends nothing further --
+        // pipelined bytes, a second response, or a hostile peer must be
+        // rejected, never silently ignored (mirrors handleHttpClient in
+        // main.cpp).
+        if (!bytes.empty()) {
+            session.failed = true;
+        }
+        return;
+    }
+    if (session.failed) return;
     if (!bytes.empty()) {
         appendHttpClientBytes(session, bytes);
     }
@@ -561,15 +571,15 @@ void testOverflowChunkedDeliveryThenExtraByteRejected() {
     CHECK(!session.response_complete);
     deliverChunk(session, toBytes(body.substr(half)), false);
     CHECK(session.response_complete);
+    CHECK(session.body.size() == kMaxHttpResponseBodyLength);
 
     // A well-behaved server never sends bytes after a Connection: close
-    // response is fully sent, but a hostile/broken peer might -- prove a
-    // trailing byte after completion cannot corrupt an already-complete
-    // session (deliverChunk's early-return guard).
+    // response is fully sent, but a hostile/broken peer might -- one
+    // extra byte after completion must be rejected, not silently
+    // tolerated (see Section 32 below for dedicated coverage).
     std::array<std::byte, 1> extra = {std::byte{'X'}};
     deliverChunk(session, extra, false);
-    CHECK(session.response_complete);
-    CHECK(session.body.size() == kMaxHttpResponseBodyLength);
+    CHECK(session.failed);
 }
 
 // The same scenario as testOverflowExtraByteInFinalChunkRejected, but the
@@ -640,6 +650,75 @@ void testOverflowCannotBecomeCompleteAfterFlagged() {
     deliverChunk(session, {}, true);
     CHECK(!session.response_complete);
     CHECK(session.body.empty());
+}
+
+// --- Section 32: bytes received after completion --------------------------
+//
+// A completed response is a fact about the bytes seen so far, not a
+// promise the peer has nothing more to send. Pipelined bytes, a second
+// response, or a broken/hostile peer delivering more application data on
+// an already-complete connection must be rejected -- never silently
+// ignored, which would let the connection close as if nothing unusual
+// happened while genuinely-unaccounted-for bytes went unexamined.
+
+void testPostCompletionByteRejectedContentLength() {
+    HttpClientSession session;
+    std::string response = "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    deliverChunk(session, toBytes(response), false);
+    CHECK(session.response_complete);
+    CHECK(!session.failed);
+    CHECK(session.body == toBytes("hello"));
+
+    deliverChunk(session, toBytes("X"), false);
+    CHECK(session.failed);
+    // The already-observed completion is not retroactively erased --
+    // the original exact body remains what it was -- but the session as
+    // a whole is no longer a clean success.
+    CHECK(session.body == toBytes("hello"));
+}
+
+void testPostCompletionBytesRejectedCloseDelimited() {
+    HttpClientSession session;
+    std::string response = "HTTP/1.0 200 OK\r\n\r\nhello";
+    deliverChunk(session, toBytes(response), true); // peer FIN completes it
+    CHECK(session.response_complete);
+    CHECK(!session.failed);
+
+    // A single extra byte after the FIN that already completed the
+    // response (a still-open connection somehow producing more data, or
+    // a test/harness bug re-delivering) must be rejected.
+    deliverChunk(session, toBytes("X"), false);
+    CHECK(session.failed);
+}
+
+void testPostCompletionSecondResponseRejected() {
+    HttpClientSession session;
+    std::string response = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    deliverChunk(session, toBytes(response), false);
+    CHECK(session.response_complete);
+
+    // A full second pipelined response must not be parsed as a second
+    // logical response -- it is rejected outright.
+    std::string second = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    deliverChunk(session, toBytes(second), false);
+    CHECK(session.failed);
+    CHECK(session.status_code == 200); // the one real response is untouched
+    CHECK(session.body == toBytes("hi"));
+}
+
+void testPostCompletionEmptyDeliveryIsHarmless() {
+    // A call carrying no new payload bytes (an ordinary ACK-only
+    // TCP event, or a duplicate peer FIN already reflected in
+    // peer_fin_seen) must not be treated as a violation merely because
+    // it arrives after completion.
+    HttpClientSession session;
+    std::string response = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+    deliverChunk(session, toBytes(response), false);
+    CHECK(session.response_complete);
+
+    deliverChunk(session, {}, true);
+    CHECK(session.response_complete);
+    CHECK(!session.failed);
 }
 
 } // namespace
@@ -713,6 +792,11 @@ int main() {
     testOverflowCloseDelimitedExactMaxAccepted();
     testOverflowCloseDelimitedOneByteOverRejected();
     testOverflowCannotBecomeCompleteAfterFlagged();
+
+    testPostCompletionByteRejectedContentLength();
+    testPostCompletionBytesRejectedCloseDelimited();
+    testPostCompletionSecondResponseRejected();
+    testPostCompletionEmptyDeliveryIsHarmless();
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }
