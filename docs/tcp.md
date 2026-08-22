@@ -1567,5 +1567,9 @@ connection refused" line, with no further SYN retransmission afterward.
 
 ## Next TCP work
 
-Minimal outbound HTTP/1.0 client over TCP active open using a literal
-IPv4 address.
+Bounded DNS A-record resolution over UDP and hostname-based outbound
+HTTP -- data transfer over an actively-opened connection is now proven
+by the outbound HTTP/1.0 client (see `docs/http.md`) reusing the
+existing send buffer, segmentation, congestion control, retransmission,
+receive reassembly, and close machinery with no active-open-specific
+data path.

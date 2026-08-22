@@ -130,6 +130,139 @@ expiration, or the passive-close path's silent final-ACK removal (the
 last of these required one small additive signal on `TcpReceiveResult`,
 `connection_closed`, since Milestone 8 had no existing way to report it).
 
+## Outbound HTTP/1.0 client
+
+A minimal client (`http_client.hpp`/`http_client.cpp`) drives one
+outbound GET over a TCP connection opened with active open (see
+"TCP active open" in `docs/tcp.md`). Same layering discipline as the
+server: `HttpClientSession` is owned entirely by `main.cpp`, keyed by
+the exact `TcpConnectionKey`, and stored in a map separate from the
+server's `http_sessions` -- a connection is never present in both.
+`handleTcp`/`handleIpv4` route a connection to at most one of the
+server request parser or the client response parser, by explicit map
+membership; a connection present in neither map (e.g. a plain
+`--active-open` connection with no HTTP role) gets no automatic HTTP
+behavior at all regardless of what its `accepted_payload`/`peer_closed`
+looks like. This is the same discipline that fixed the cross-layer
+defect described in `docs/tcp.md`'s "TCP active open" section, applied
+now that active connections can legitimately carry an HTTP role.
+
+### Runtime configuration
+
+```bash
+./build/wirestack wire0 10.0.0.2 02:00:00:00:00:02 \
+  --http-get 10.0.0.1:9090 --source-port 49200 --target /
+```
+
+`--http-get`, `--source-port`, and `--target` must all be given
+together; `--http-get`/`--active-open` are mutually exclusive (both
+configure the same one-shot active-open slot), in either argument
+order. `--http-get` takes a literal IPv4 address and port -- no
+hostnames, no DNS. `--target` must begin with `/` and contain no
+space, CR, LF, or other control byte; validated before any TCP
+connection is created. As with `--active-open`, the peer's MAC must
+already be in the ARP cache (Wirestack sends no ARP requests of its
+own) and the request fires exactly once, as soon as the handshake
+completes.
+
+All runtime-mode options (`--active-open`/`--http-get`/
+`--source-port`/`--target`) are parsed and validated by
+`parseRuntimeOptions` (`runtime_options.hpp`/`.cpp`) in one pass before
+the TAP device is opened. Its result distinguishes three outcomes, not
+two: no runtime-mode options given (passive server), valid options for
+one mode, or invalid input -- an unknown option, a duplicated option, a
+missing companion option, both `--active-open` and `--http-get`, a
+destination missing its port, a malformed IPv4 address, or a port that
+fails strict complete-string decimal parsing (empty, signed, hex,
+out-of-range, or carrying leading/trailing junk or whitespace) is
+*never* silently treated as "no options given" -- it prints one
+diagnostic to stderr and exits nonzero without opening the TAP device
+or creating any connection.
+
+### Request
+
+Sent once `beginConnect`'s handshake reaches `Established`
+(`TcpReceiveResult::connection_established`), through the same
+`TcpConnectionTable::makeOutgoingData` bounded send buffer as any other
+application data -- ordinary MSS segmentation, window/congestion
+gating, and retransmission apply unchanged, and the HTTP layer never
+regenerates the request itself on a delayed ACK. Exact bytes:
+
+```text
+GET <target> HTTP/1.0\r\n
+Host: <remote-ip>:<remote-port>\r\n
+Connection: close\r\n
+\r\n
+```
+
+No `User-Agent`, `Accept-Encoding`, request body, `Content-Length`, or
+`Transfer-Encoding`. `request_enqueued` guards against enqueuing a
+second time on a duplicate establishment signal.
+
+### Response parsing
+
+`parseHttpResponse` is a bounded incremental parser mirroring
+`parseHttpRequest`'s stateless re-scan-the-whole-buffer approach.
+Limits: `kMaxHttpResponseStatusLineLength` (2048 bytes incl. CRLF),
+`kMaxHttpResponseHeaderBlockLength` (8192 bytes incl. the final blank
+line), `kMaxHttpResponseBodyLength` (262144 bytes).
+
+Status line: exactly `HTTP/1.0 <3-digit-status> <reason>\r\n`; any
+other version (including `HTTP/1.1`) is `UnsupportedVersion`; status
+must be 200-599 (1xx is rejected, not merely unsupported-as-informational).
+Headers: same token/OWS/case-insensitive rules as the request parser;
+folded continuations and NUL are rejected. `Content-Length` must be a
+single valid unsigned decimal value (no sign, comma, hex, leading
+overflow, or duplicate header even with matching values) not exceeding
+the body cap. `Transfer-Encoding` (any value, alone or alongside
+`Content-Length`) is `UnsupportedTransferEncoding` -- chunked decoding
+is not implemented.
+
+Completion:
+- `Content-Length` present: complete once exactly that many body bytes
+  have arrived; fewer bytes followed by peer FIN is `Truncated`; more
+  than declared is `Malformed`. Does not require FIN.
+- `Content-Length` absent: close-delimited -- body is whatever arrived
+  before the peer's FIN, complete only once that FIN is accepted
+  (`TcpReceiveResult::peer_closed`), and an empty close-delimited body
+  is valid.
+
+Only `TcpReceiveResult::accepted_payload` (already-reassembled,
+in-order, duplicate-free bytes) is ever appended to a client session's
+buffer -- out-of-order and unreleased bytes stay inside TCP reassembly,
+never reach the parser. The response body is arbitrary bytes: no
+C-string or UTF-8 assumption, an embedded `0x00` does not truncate it.
+
+`appendHttpClientBytes` bounds the buffer at
+`kMaxHttpResponseHeaderBlockLength + kMaxHttpResponseBodyLength`. If an
+incoming chunk of accepted bytes would not entirely fit in the
+remaining room, none of it is appended -- the session is marked
+`response_overflowed` instead. This is deliberate: appending a
+truncated prefix up to the cap would discard the very bytes proving
+the peer sent too much, and a truncated prefix can itself look like an
+exactly-complete response (header at its maximum plus body at its
+maximum, with the oversized extra byte silently dropped). An
+overflowed session is always treated as failed and is never handed to
+`parseHttpResponse` again.
+
+On `Malformed`/`TooLarge`/`UnsupportedVersion`/
+`UnsupportedTransferEncoding`/`Truncated`, the session is marked
+`failed` -- no successful response is exposed, no bytes reach the
+server's request parser, and no `HTTP/1.0 400 Bad Request` (or any
+other reply) is sent to the peer; Wirestack simply initiates its own
+close through the existing TCP machinery, same as on a successful
+completion.
+
+### Close and cleanup
+
+Once a response completes (or the session fails), Wirestack initiates
+its own close via `TcpConnectionTable::beginClose` -- it does not wait
+for a `Connection: close` FIN it already asked for. `HttpClientSession`
+is erased whenever its connection disappears: normal close completion,
+RST/refusal, SYN or data retransmission exhaustion, or TIME_WAIT
+expiry, mirroring exactly how `http_sessions` (the server's state) is
+already erased on those same events.
+
 ## Manual verification procedure
 
 For a reproducible, automated version of this check with packet-capture
@@ -159,12 +292,43 @@ returns `505 HTTP Version Not Supported`. tcpdump should show the
 handshake, the GET request bytes, the response bytes, and the FIN
 exchange, in that order.
 
+To exercise the outbound client against a plain listener instead:
+
+```bash
+# terminal 2, in place of curl above
+python3 -m http.server -b 10.0.0.1 9090
+
+# terminal 1
+sudo ./build/wirestack wire0 10.0.0.2 02:00:00:00:00:02 \
+  --http-get 10.0.0.1:9090 --source-port 49200 --target /
+```
+
+Expected: tcpdump shows Wirestack's SYN, the peer's SYN-ACK, Wirestack's
+ACK, then Wirestack's GET, the peer's response, its FIN, and Wirestack's
+own close; Wirestack's stdout prints the response status and body
+length once (`http-client: response complete status=... body_len=...`),
+or `http-client: response rejected ...` on failure. Both lines are
+followed by an explicit `fflush(stdout)` -- Wirestack never exits on
+its own, so without an explicit flush a redirected, non-interactive
+stdout (as `tools/integration/http_get.sh` uses) can leave these lines
+sitting in libc's buffer indefinitely, invisible to anything reading
+the log file while Wirestack keeps running. Packet capture alone proves
+request/response bytes crossed the wire; it does not prove Wirestack's
+own parser reached completion -- this flushed line is the evidence for
+that. For a reproducible version with packet-capture evidence, see
+`tools/integration/http_get.sh` and
+[docs/interoperability.md](interoperability.md).
+
 ## Limitations
 
-- No HTTP/1.1, no keep-alive, no pipelining.
-- No request bodies, no chunked transfer encoding.
-- No TLS.
+- No HTTP/1.1, no keep-alive, no pipelining, no redirects.
+- No request bodies, no chunked transfer encoding, no compression.
+- No TLS, no DNS/hostnames -- the outbound client's destination must be
+  a literal IPv4 address.
 - No filesystem-backed serving -- exactly one route (`/`) is recognized.
+- The outbound client sends exactly one GET request per connection and
+  does not implement any other method, a general HTTP client library,
+  or a POSIX socket API.
 - No query-string, header-map, or cookie handling beyond what's needed to
   reject `Transfer-Encoding` and validate `Content-Length`.
 - No URL decoding or path normalization.

@@ -26,6 +26,8 @@ add_library(wirestack_core STATIC
     src/tcp.cpp
     src/tcp_connection.cpp
     src/http.cpp
+    src/http_client.cpp
+    src/runtime_options.cpp
 )
 
 target_include_directories(wirestack_core PUBLIC include)
