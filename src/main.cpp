@@ -784,11 +784,17 @@ void handleIpv4(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(stderr,
-                     "usage: %s <tap-interface-name> <local-ipv4> <local-mac> "
-                     "[--active-open <ip>:<port> --source-port <port>] "
-                     "[--http-get <ip>:<port> --source-port <port> --target </path>]\n",
-                     argv[0]);
+        std::fprintf(
+            stderr,
+            "usage: %s <tap-interface-name> <local-ipv4> <local-mac>\n"
+            "       %s <tap-interface-name> <local-ipv4> <local-mac> \\\n"
+            "         --active-open <ip>:<port> --source-port <port>\n"
+            "       %s <tap-interface-name> <local-ipv4> <local-mac> \\\n"
+            "         --http-get <ip>:<port> --source-port <port> --target </path>\n"
+            "       %s <tap-interface-name> <local-ipv4> <local-mac> \\\n"
+            "         --http-get <hostname>:<port> --dns-server <ip>:<port> \\\n"
+            "         --source-port <port> --target </path>\n",
+            argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
