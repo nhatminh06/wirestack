@@ -102,6 +102,104 @@ void testRequestRejectsNul() {
     CHECK(validateHttpClientTarget(target) == HttpClientTargetError::InvalidByte);
 }
 
+// --- Section: Host header validation --------------------------------------
+//
+// buildHttpGetRequest's `host_header` is a public parameter, not
+// necessarily a value the CLI's own validated construction already
+// vetted -- the serializer must fail closed on its own regardless of
+// what a caller passes, rather than trusting the current one caller in
+// main.cpp to have validated it first.
+
+void testHostAcceptsLiteralIpv4() {
+    auto request = buildHttpGetRequest("10.0.0.1:80", "/");
+    CHECK(request.has_value());
+    if (!request) return;
+    std::string expected = "GET / HTTP/1.0\r\nHost: 10.0.0.1:80\r\nConnection: close\r\n\r\n";
+    CHECK(*request == toBytes(expected));
+}
+
+void testHostAcceptsLiteralIpv4NonDefaultPort() {
+    auto request = buildHttpGetRequest("10.0.0.1:9094", "/");
+    CHECK(request.has_value());
+    if (!request) return;
+    std::string expected = "GET / HTTP/1.0\r\nHost: 10.0.0.1:9094\r\nConnection: close\r\n\r\n";
+    CHECK(*request == toBytes(expected));
+}
+
+void testHostAcceptsHostname() {
+    auto request = buildHttpGetRequest("wirestack.test:9094", "/");
+    CHECK(request.has_value());
+    if (!request) return;
+    std::string expected =
+        "GET / HTTP/1.0\r\nHost: wirestack.test:9094\r\nConnection: close\r\n\r\n";
+    CHECK(*request == toBytes(expected));
+}
+
+void testHostRejectsEmpty() {
+    CHECK(validateHttpClientHost("") == HttpClientHostError::Empty);
+    CHECK(!buildHttpGetRequest("", "/").has_value());
+}
+
+void testHostRejectsLeadingSpace() {
+    CHECK(validateHttpClientHost(" 10.0.0.1:80") == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest(" 10.0.0.1:80", "/").has_value());
+}
+
+void testHostRejectsTrailingSpace() {
+    CHECK(validateHttpClientHost("10.0.0.1:80 ") == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest("10.0.0.1:80 ", "/").has_value());
+}
+
+void testHostRejectsTab() {
+    std::string host = "10.0.0.1:80";
+    host += '\t';
+    CHECK(validateHttpClientHost(host) == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest(host, "/").has_value());
+}
+
+void testHostRejectsCr() {
+    std::string host = "10.0.0.1:80\r";
+    CHECK(validateHttpClientHost(host) == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest(host, "/").has_value());
+}
+
+void testHostRejectsLf() {
+    std::string host = "10.0.0.1:80\n";
+    CHECK(validateHttpClientHost(host) == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest(host, "/").has_value());
+}
+
+void testHostRejectsCrLfInjection() {
+    // A header-injection attempt: if this were emitted verbatim, the
+    // request would gain an attacker-controlled extra header line.
+    std::string host = "wirestack.test:9094\r\nX-Injected: value";
+    CHECK(validateHttpClientHost(host) == HttpClientHostError::InvalidByte);
+    auto request = buildHttpGetRequest(host, "/");
+    CHECK(!request.has_value());
+}
+
+void testHostRejectsEmbeddedNul() {
+    std::string host = "10.0.0.1:80";
+    host += '\0';
+    host += "evil";
+    CHECK(validateHttpClientHost(host) == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest(host, "/").has_value());
+}
+
+void testHostRejectsDel() {
+    std::string host = "10.0.0.1:80";
+    host += '\x7f';
+    CHECK(validateHttpClientHost(host) == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest(host, "/").has_value());
+}
+
+void testHostRejectsOtherControlByte() {
+    std::string host = "10.0.0.1:80";
+    host += '\x01';
+    CHECK(validateHttpClientHost(host) == HttpClientHostError::InvalidByte);
+    CHECK(!buildHttpGetRequest(host, "/").has_value());
+}
+
 // --- Section 26: status line and headers ---------------------------------
 
 HttpResponseParseResult parseWhole(std::string_view text, bool peer_closed = true) {
@@ -749,6 +847,20 @@ int main() {
     testRequestRejectsCrInjection();
     testRequestRejectsLfOnly();
     testRequestRejectsNul();
+
+    testHostAcceptsLiteralIpv4();
+    testHostAcceptsLiteralIpv4NonDefaultPort();
+    testHostAcceptsHostname();
+    testHostRejectsEmpty();
+    testHostRejectsLeadingSpace();
+    testHostRejectsTrailingSpace();
+    testHostRejectsTab();
+    testHostRejectsCr();
+    testHostRejectsLf();
+    testHostRejectsCrLfInjection();
+    testHostRejectsEmbeddedNul();
+    testHostRejectsDel();
+    testHostRejectsOtherControlByte();
 
     testStatus200();
     testStatus204();

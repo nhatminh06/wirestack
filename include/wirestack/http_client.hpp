@@ -106,16 +106,31 @@ enum class HttpClientTargetError {
 // or ports -- that's ordinary IPv4/port parsing at the CLI layer.
 std::optional<HttpClientTargetError> validateHttpClientTarget(std::string_view target);
 
+enum class HttpClientHostError {
+    Empty,
+    InvalidByte, // space, CR, LF, NUL, DEL, or another control byte
+};
+
+// Validates a Host header value in isolation. `host_header` is the exact
+// authority text this project supports -- "ip:port" or "hostname:port"
+// (see docs/dns.md) -- not a general URI authority; this rejects the
+// bytes that would let it corrupt the request's field structure if
+// emitted verbatim (CRLF injection, an embedded NUL, or any other
+// control byte), not full RFC 3986/7230 authority syntax.
+std::optional<HttpClientHostError> validateHttpClientHost(std::string_view host_header);
+
 // Builds the exact bounded GET request:
 //   GET <target> HTTP/1.0\r\n
 //   Host: <host_header>\r\n
 //   Connection: close\r\n
 //   \r\n
-// `host_header` is caller-supplied verbatim (see HttpClientSession) --
-// this function has no notion of an IPv4 address or a hostname, only the
-// authority text to place in the Host header. Returns nullopt if `target`
-// fails validateHttpClientTarget -- the serializer never emits
-// CRLF-injected or otherwise malformed bytes.
+// `host_header` is the authority text to place in the Host header (an
+// IPv4 literal or hostname, plus ":<port>" -- see HttpClientSession);
+// this function has no notion of an IPv4 address or a hostname beyond
+// that text. Returns nullopt, emitting no bytes at all, if `target`
+// fails validateHttpClientTarget or `host_header` fails
+// validateHttpClientHost -- the serializer never emits CRLF-injected or
+// otherwise malformed bytes regardless of what the caller passes in.
 std::optional<std::vector<std::byte>> buildHttpGetRequest(std::string_view host_header,
                                                             std::string_view target);
 

@@ -318,9 +318,22 @@ std::vector<std::byte> toBytes(std::string_view text) {
 
 } // namespace
 
+std::optional<HttpClientHostError> validateHttpClientHost(std::string_view host_header) {
+    if (host_header.empty()) {
+        return HttpClientHostError::Empty;
+    }
+    for (char c : host_header) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (c == ' ' || isControlByte(uc)) {
+            return HttpClientHostError::InvalidByte;
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<std::vector<std::byte>> buildHttpGetRequest(std::string_view host_header,
                                                             std::string_view target) {
-    if (validateHttpClientTarget(target)) {
+    if (validateHttpClientTarget(target) || validateHttpClientHost(host_header)) {
         return std::nullopt;
     }
 
