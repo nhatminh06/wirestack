@@ -475,52 +475,114 @@ void testPointerLoopRejected() {
     CHECK(result.outcome == DnsResponseOutcome::Malformed);
 }
 
-void testExcessivePointerChainRejected() {
-    // A chain of 20 one-byte-backward pointers, each below the bound of
-    // the hop count but exceeding kMaxDnsPointerHops together, terminated
-    // by a real root label.
+void pushU16(std::vector<std::byte>& bytes, std::uint16_t v) {
+    bytes.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+    bytes.push_back(static_cast<std::byte>(v & 0xFF));
+}
+
+void pushPointer(std::vector<std::byte>& bytes, std::size_t target) {
+    pushU16(bytes, static_cast<std::uint16_t>(0xC000 | (target & 0x3FFF)));
+}
+
+// Builds a response with a genuine strictly-backward compression-pointer
+// chain of exactly `total_hops` hops, terminating in the real labels
+// "example.test", used as the owner name of the actual A answer.
+//
+// Layout: header, an ordinary uncompressed question, then an EARLIER
+// "unknown" resource record (TYPE=16/TXT, ignored by A-selection) whose
+// opaque RDATA holds the real label bytes followed by a chain of
+// (total_hops - 1) two-byte pointers, each one referencing the
+// immediately preceding, strictly earlier chain element (or the labels
+// themselves for the first one) -- never a later resource-record parser
+// interprets this RDATA as anything but opaque bytes, so it can safely
+// carry pointer bytes without those bytes ever being independently
+// decoded as a name in their own record's owner-name position. The
+// LATER record -- the real answer -- has an owner name that is a single
+// pointer aimed at the last (highest-offset) chain element, making the
+// full traversal from that owner name exactly `total_hops` pointer
+// hops: the owner's own pointer, plus each of the (total_hops - 1)
+// chain elements, before finally reading the real labels.
+std::vector<std::byte> buildPointerChainResponse(int total_hops) {
+    CHECK(total_hops >= 1);
+    int chain_count = total_hops - 1; // pointers stored inside the RDATA
+
     std::vector<std::byte> bytes = toBytes({
-        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
     });
-    // Chain of pointers, each two bytes, each pointing to the previous
-    // pointer's offset (strictly decreasing), the final one is at the
-    // question position and points to a real terminator.
-    std::size_t root_offset = bytes.size();
-    bytes.push_back(std::byte{0x00}); // root label at root_offset
-    std::size_t prev_offset = root_offset;
-    std::vector<std::size_t> pointer_offsets;
-    for (int i = 0; i < 20; ++i) {
-        pointer_offsets.push_back(bytes.size());
-        bytes.push_back(std::byte{0xc0}); // filled below
-        bytes.push_back(std::byte{0x00});
-        prev_offset = pointer_offsets.back();
-    }
-    (void)prev_offset;
-    // Wire pointer i (except the first, which points to root) to point to
-    // pointer i-1's offset; the question name itself starts at the LAST
-    // pointer pushed (highest offset), chaining backward to root.
-    for (std::size_t i = 0; i < pointer_offsets.size(); ++i) {
-        std::size_t target = (i == 0) ? root_offset : pointer_offsets[i - 1];
-        auto hi = static_cast<std::uint8_t>(0xc0 | ((target >> 8) & 0x3F));
-        auto lo = static_cast<std::uint8_t>(target & 0xFF);
-        bytes[pointer_offsets[i]] = static_cast<std::byte>(hi);
-        bytes[pointer_offsets[i] + 1] = static_cast<std::byte>(lo);
-    }
-    bytes.push_back(std::byte{0x00}); // QTYPE
-    bytes.push_back(std::byte{0x01});
-    bytes.push_back(std::byte{0x00}); // QCLASS
-    bytes.push_back(std::byte{0x01});
+    // Question at offset 12: example.test A IN (18 bytes, ends at 30).
+    bytes.push_back(std::byte{0x07});
+    for (char c : std::string("example")) bytes.push_back(static_cast<std::byte>(c));
+    bytes.push_back(std::byte{0x04});
+    for (char c : std::string("test")) bytes.push_back(static_cast<std::byte>(c));
+    bytes.push_back(std::byte{0x00});
+    pushU16(bytes, 1); // QTYPE = A
+    pushU16(bytes, 1); // QCLASS = IN
+    CHECK(bytes.size() == 30);
 
-    // The question name field is the LAST pointer written (deepest chain).
-    // Header QDCOUNT already claims one question starting right after the
-    // 12-byte header; move that question's pointer to right after the
-    // header by writing it there instead of relying on position 12 -- for
-    // this test, place the deep pointer AT offset 12 directly.
-    std::size_t deepest = pointer_offsets.back();
-    bytes[12] = bytes[deepest];
-    bytes[13] = bytes[deepest + 1];
+    // Earlier record: owner = root, TYPE=16 (TXT, unrelated/ignored),
+    // CLASS=IN, TTL=0, RDLENGTH=computed, RDATA = labels + chain.
+    bytes.push_back(std::byte{0x00}); // owner: root
+    pushU16(bytes, 16); // TYPE = TXT
+    pushU16(bytes, 1); // CLASS = IN
+    for (int i = 0; i < 4; ++i) bytes.push_back(std::byte{0x00}); // TTL
+    std::size_t rdlength_offset = bytes.size();
+    pushU16(bytes, 0); // RDLENGTH placeholder, patched below
 
+    std::size_t rdata_offset = bytes.size();
+    std::size_t labels_offset = bytes.size();
+    bytes.push_back(std::byte{0x07});
+    for (char c : std::string("example")) bytes.push_back(static_cast<std::byte>(c));
+    bytes.push_back(std::byte{0x04});
+    for (char c : std::string("test")) bytes.push_back(static_cast<std::byte>(c));
+    bytes.push_back(std::byte{0x00});
+
+    std::vector<std::size_t> chain_offsets;
+    std::size_t prev_target = labels_offset;
+    for (int i = 0; i < chain_count; ++i) {
+        chain_offsets.push_back(bytes.size());
+        pushPointer(bytes, prev_target); // strictly earlier than this entry
+        prev_target = chain_offsets.back();
+    }
+    std::uint16_t rdlength = static_cast<std::uint16_t>(bytes.size() - rdata_offset);
+    bytes[rdlength_offset] = static_cast<std::byte>((rdlength >> 8) & 0xFF);
+    bytes[rdlength_offset + 1] = static_cast<std::byte>(rdlength & 0xFF);
+
+    // Later record: the real answer. Owner name is a single pointer to
+    // the last (deepest/highest-offset) chain element -- or straight to
+    // the labels if there is no chain at all (total_hops == 1).
+    std::size_t owner_target = chain_offsets.empty() ? labels_offset : chain_offsets.back();
+    pushPointer(bytes, owner_target);
+    pushU16(bytes, 1); // TYPE = A
+    pushU16(bytes, 1); // CLASS = IN
+    pushU16(bytes, 0); // TTL hi
+    pushU16(bytes, 60); // TTL lo
+    pushU16(bytes, 4); // RDLENGTH
+    bytes.push_back(std::byte{10});
+    bytes.push_back(std::byte{0});
+    bytes.push_back(std::byte{0});
+    bytes.push_back(std::byte{1});
+
+    return bytes;
+}
+
+void testPointerChainExactlyAtHopLimitResolves() {
+    auto bytes = buildPointerChainResponse(kMaxDnsPointerHops);
     auto result = parseDnsResponse(bytes, 0x1234, "example.test");
+    // Exactly at the bound: traversal succeeds and the response resolves
+    // normally -- the chain depth alone must not be treated as malformed.
+    CHECK(result.outcome == DnsResponseOutcome::Resolved);
+    CHECK(result.address.has_value());
+    if (result.address) CHECK(*result.address == *Ipv4Address::parse("10.0.0.1"));
+}
+
+void testPointerChainOneOverHopLimitRejected() {
+    auto bytes = buildPointerChainResponse(kMaxDnsPointerHops + 1);
+    auto result = parseDnsResponse(bytes, 0x1234, "example.test");
+    // One hop beyond the bound: the same otherwise-valid chain must now
+    // be rejected specifically for exceeding kMaxDnsPointerHops, not for
+    // any of the other malformed-input reasons this file covers
+    // separately (forward pointer, self-pointer, truncation, bad
+    // RDLENGTH, excessive record count, or decoded-name length).
     CHECK(result.outcome == DnsResponseOutcome::Malformed);
 }
 
@@ -648,7 +710,8 @@ int main() {
     testPointerOutOfRangeRejected();
     testSelfPointerRejected();
     testPointerLoopRejected();
-    testExcessivePointerChainRejected();
+    testPointerChainExactlyAtHopLimitResolves();
+    testPointerChainOneOverHopLimitRejected();
     testDecodedNameOver253Rejected();
     testRdlengthBeyondPacketRejected();
     testARdlengthNotFourIgnored();
