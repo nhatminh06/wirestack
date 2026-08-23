@@ -4,6 +4,8 @@
 
 #include "wirestack/runtime_options.hpp"
 
+#include "wirestack/ipv4_address.hpp"
+
 #include "test_util.hpp"
 
 #include <string>
@@ -295,6 +297,93 @@ void testTargetContainsLf() {
 // rejection of NUL (and other control bytes) is exercised directly on a
 // std::string in tests/test_http_client.cpp.
 
+// --- DNS/hostname destination (Milestone 18) ------------------------------
+
+void testHostnameHttpGetRequiresDnsServer() {
+    auto r = parse({"--http-get", "wirestack.test:9094", "--source-port", "49300", "--target",
+                     "/"});
+    CHECK(isInvalid(r));
+}
+
+void testHostnameHttpGetWithDnsServerValid() {
+    auto r = parse({"--http-get", "wirestack.test:9094", "--dns-server", "10.0.0.1:5353",
+                     "--source-port", "49300", "--target", "/"});
+    CHECK(isValid(r));
+    if (!isValid(r)) return;
+    CHECK(r.options->mode == RuntimeMode::HttpGet);
+    CHECK(r.options->destination_is_hostname);
+    CHECK(r.options->hostname == "wirestack.test");
+    CHECK(r.options->remote_port == 9094);
+    CHECK(r.options->dns_server_ip == *Ipv4Address::parse("10.0.0.1"));
+    CHECK(r.options->dns_server_port == 5353);
+}
+
+void testHostnameNormalizedToLowercase() {
+    auto r = parse({"--http-get", "Wirestack.TEST:9094", "--dns-server", "10.0.0.1:5353",
+                     "--source-port", "49300", "--target", "/"});
+    CHECK(isValid(r));
+    if (isValid(r)) CHECK(r.options->hostname == "wirestack.test");
+}
+
+void testLiteralIpv4WithDnsServerRejected() {
+    auto r = parse({"--http-get", "10.0.0.1:9094", "--dns-server", "10.0.0.1:5353",
+                     "--source-port", "49300", "--target", "/"});
+    CHECK(isInvalid(r));
+}
+
+void testDnsServerInPassiveModeRejected() {
+    auto r = parse({"--dns-server", "10.0.0.1:5353"});
+    CHECK(isInvalid(r));
+}
+
+void testDnsServerWithActiveOpenRejected() {
+    auto r = parse({"--active-open", "10.0.0.1:9090", "--dns-server", "10.0.0.1:5353",
+                     "--source-port", "49200"});
+    CHECK(isInvalid(r));
+}
+
+void testDuplicateDnsServerRejected() {
+    auto r = parse({"--http-get", "wirestack.test:9094", "--dns-server", "10.0.0.1:5353",
+                     "--dns-server", "10.0.0.1:5353", "--source-port", "49300", "--target", "/"});
+    CHECK(isInvalid(r));
+}
+
+void testDnsServerMissingValueRejected() {
+    auto r = parse({"--http-get", "wirestack.test:9094", "--dns-server"});
+    CHECK(isInvalid(r));
+}
+
+void testMalformedDnsServerIpRejected() {
+    auto r = parse({"--http-get", "wirestack.test:9094", "--dns-server", "999.0.0.1:5353",
+                     "--source-port", "49300", "--target", "/"});
+    CHECK(isInvalid(r));
+}
+
+void testMalformedDnsServerPortRejected() {
+    auto r = parse({"--http-get", "wirestack.test:9094", "--dns-server", "10.0.0.1:0",
+                     "--source-port", "49300", "--target", "/"});
+    CHECK(isInvalid(r));
+}
+
+void testInvalidHostnameDestinationRejected() {
+    auto r = parse({"--http-get", "-bad.test:9094", "--dns-server", "10.0.0.1:5353",
+                     "--source-port", "49300", "--target", "/"});
+    CHECK(isInvalid(r));
+}
+
+void testActiveOpenHostnameDestinationRejected() {
+    // --active-open never accepts a hostname destination, DNS server or
+    // not -- only --http-get supports DNS resolution (see docs/dns.md).
+    auto r = parse({"--active-open", "wirestack.test:9090", "--source-port", "49200"});
+    CHECK(isInvalid(r));
+}
+
+// Invalid DNS input must exit before the TAP device is opened and must
+// never fall back to passive mode -- this is guaranteed structurally by
+// RuntimeOptionsParseResult's contract (see runtime_options.hpp): every
+// isInvalid() case above sets `error` and leaves `options` unset, which
+// main.cpp checks before calling TapDevice::open at all.
+
 } // namespace
 
 int main() {
@@ -349,6 +438,19 @@ int main() {
     testTargetContainsSpace();
     testTargetContainsCr();
     testTargetContainsLf();
+
+    testHostnameHttpGetRequiresDnsServer();
+    testHostnameHttpGetWithDnsServerValid();
+    testHostnameNormalizedToLowercase();
+    testLiteralIpv4WithDnsServerRejected();
+    testDnsServerInPassiveModeRejected();
+    testDnsServerWithActiveOpenRejected();
+    testDuplicateDnsServerRejected();
+    testDnsServerMissingValueRejected();
+    testMalformedDnsServerIpRejected();
+    testMalformedDnsServerPortRejected();
+    testInvalidHostnameDestinationRejected();
+    testActiveOpenHostnameDestinationRejected();
 
     return wirestack::test::failureCount() == 0 ? 0 : 1;
 }

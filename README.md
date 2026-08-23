@@ -19,7 +19,8 @@ partial-ACK recovery and a bounded segment-granular SACK scoreboard):
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
 | TCP         | passive handshake, and active open (`beginConnect`/SynSent, an opt-in `--active-open` runtime path, RST refusal, timeout retransmission -- see docs/tcp.md) with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented, deterministically tested, and live-qualified against a real Linux client (see docs/interoperability.md) for the passive handshake, timeout retransmission, SYN-ACK loss recovery, and receiver-side SACK -- sender-side multi-segment SACK recovery remains deterministic-test-only; active open's handshake (established and refused) is also live-qualified against a real Linux listener (see `tools/integration/active_open.sh`), and data transfer over an actively-opened connection is now proven by the outbound HTTP/1.0 client below (live-qualified against a real Python HTTP server, see `tools/integration/http_get.sh`), reusing the same send/segmentation/congestion/retransmission/reassembly/close machinery with no active-open-specific data path |
-| HTTP        | minimal HTTP/1.0 GET server (`/` -> 200, other paths -> 404, one request per connection) implemented, deterministically tested, and live-qualified with a real `curl --http1.0` request (see docs/interoperability.md); plus a minimal outbound HTTP/1.0 client (`--http-get <ip>:<port> --source-port <port> --target </path>`, literal IPv4 only, one GET request, Content-Length- or close-delimited response bodies, `Transfer-Encoding` rejected) implemented, deterministically tested, and live-qualified against a real Linux HTTP server (see docs/http.md) |
+| HTTP        | minimal HTTP/1.0 GET server (`/` -> 200, other paths -> 404, one request per connection) implemented, deterministically tested, and live-qualified with a real `curl --http1.0` request (see docs/interoperability.md); plus a minimal outbound HTTP/1.0 client (`--http-get <ip-or-hostname>:<port> --source-port <port> --target </path>`, one GET request, Content-Length- or close-delimited response bodies, `Transfer-Encoding` rejected) implemented, deterministically tested, and live-qualified against a real Linux HTTP server (see docs/http.md) |
+| DNS         | bounded A-record resolution for a hostname `--http-get` destination (`--dns-server <ip>:<port>`, UDP, bounded compression-pointer decoding, fixed retry/timeout schedule) implemented and deterministically tested; see docs/dns.md for exact scope and limits |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
 - Ethernet II frame parsing and serialization
@@ -100,9 +101,11 @@ Limited Transmit/CUBIC/BBR/ECN/timestamps (persist is implemented, but
 only for the narrow no-outstanding-data case; SACK coverage is
 segment-granular, not sub-range, and reneging recovery beyond clearing
 the scoreboard on RTO is not implemented -- see docs/tcp.md),
-HTTP/1.1/keep-alive/pipelining/request bodies/chunked encoding/TLS,
-DNS/hostname resolution (the outbound HTTP client takes a literal IPv4
-address only), IPv4 options, fragmentation, routing.
+HTTP/1.1/keep-alive/pipelining/request bodies/chunked encoding/TLS, a
+general-purpose or RFC-complete DNS resolver (see docs/dns.md: A/IN over
+UDP only, one configured server, one question, no CNAME following, no
+AAAA, no caching, no EDNS, no DNSSEC, no DNS over TCP), IPv4 options,
+fragmentation, routing.
 
 ## Structure
 

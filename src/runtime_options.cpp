@@ -2,6 +2,7 @@
 
 #include <charconv>
 
+#include "wirestack/dns.hpp"
 #include "wirestack/http_client.hpp"
 
 namespace wirestack {
@@ -56,6 +57,7 @@ RuntimeOptionsParseResult parseRuntimeOptions(int argc, char** argv) {
     std::optional<std::string> http_get_arg;
     std::optional<std::string> source_port_arg;
     std::optional<std::string> target_arg;
+    std::optional<std::string> dns_server_arg;
 
     for (int i = 4; i < argc; ++i) {
         std::string arg = argv[i];
@@ -75,6 +77,10 @@ RuntimeOptionsParseResult parseRuntimeOptions(int argc, char** argv) {
             if (target_arg) return makeError("--target given more than once");
             if (i + 1 >= argc) return makeError("--target requires a value");
             target_arg = argv[++i];
+        } else if (arg == "--dns-server") {
+            if (dns_server_arg) return makeError("--dns-server given more than once");
+            if (i + 1 >= argc) return makeError("--dns-server requires a value");
+            dns_server_arg = argv[++i];
         } else {
             return makeError("unknown option: " + arg);
         }
@@ -86,10 +92,16 @@ RuntimeOptionsParseResult parseRuntimeOptions(int argc, char** argv) {
     if (target_arg && !http_get_arg) {
         return makeError("--target requires --http-get");
     }
+    if (dns_server_arg && active_open_arg) {
+        return makeError("--dns-server is not supported with --active-open");
+    }
 
     if (!active_open_arg && !http_get_arg) {
         if (source_port_arg) {
             return makeError("--source-port requires --active-open or --http-get");
+        }
+        if (dns_server_arg) {
+            return makeError("--dns-server requires --http-get with a hostname destination");
         }
         return makeOptions(RuntimeOptions{});
     }
@@ -105,27 +117,28 @@ RuntimeOptionsParseResult parseRuntimeOptions(int argc, char** argv) {
     const std::string& destination = active_open_arg ? *active_open_arg : *http_get_arg;
     auto colon = destination.rfind(':');
     if (colon == std::string::npos) {
-        return makeError("destination must be <ip>:<port>");
+        return makeError("destination must be <ip-or-hostname>:<port>");
     }
-    auto remote_ip = Ipv4Address::parse(destination.substr(0, colon));
-    if (!remote_ip) {
-        return makeError("invalid destination IPv4 address");
-    }
+    std::string host_part = destination.substr(0, colon);
     auto remote_port = parseStrictPort(destination.substr(colon + 1));
     if (!remote_port) {
         return makeError("invalid destination port");
     }
+
     auto source_port = parseStrictPort(*source_port_arg);
     if (!source_port) {
         return makeError("invalid --source-port");
     }
 
-    RuntimeOptions options;
-    options.remote_ip = *remote_ip;
-    options.remote_port = *remote_port;
-    options.source_port = *source_port;
-
     if (active_open_arg) {
+        auto remote_ip = Ipv4Address::parse(host_part);
+        if (!remote_ip) {
+            return makeError("invalid destination IPv4 address");
+        }
+        RuntimeOptions options;
+        options.remote_ip = *remote_ip;
+        options.remote_port = *remote_port;
+        options.source_port = *source_port;
         options.mode = RuntimeMode::ActiveOpen;
         return makeOptions(std::move(options));
     }
@@ -133,8 +146,48 @@ RuntimeOptionsParseResult parseRuntimeOptions(int argc, char** argv) {
     if (auto target_error = validateHttpClientTarget(*target_arg)) {
         return makeError(std::string("invalid --target: ") + describeTargetError(*target_error));
     }
+
+    RuntimeOptions options;
+    options.remote_port = *remote_port;
+    options.source_port = *source_port;
     options.mode = RuntimeMode::HttpGet;
     options.target = *target_arg;
+
+    auto remote_ip = Ipv4Address::parse(host_part);
+    if (remote_ip) {
+        if (dns_server_arg) {
+            return makeError("--dns-server requires a hostname destination, not a literal IPv4 address");
+        }
+        options.destination_is_hostname = false;
+        options.remote_ip = *remote_ip;
+        return makeOptions(std::move(options));
+    }
+
+    auto normalized_hostname = normalizeHostname(host_part);
+    if (!normalized_hostname.normalized) {
+        return makeError("invalid destination: not a valid IPv4 address or hostname");
+    }
+    if (!dns_server_arg) {
+        return makeError("hostname destination requires --dns-server");
+    }
+
+    auto dns_colon = dns_server_arg->rfind(':');
+    if (dns_colon == std::string::npos) {
+        return makeError("--dns-server must be <ip>:<port>");
+    }
+    auto dns_server_ip = Ipv4Address::parse(dns_server_arg->substr(0, dns_colon));
+    if (!dns_server_ip) {
+        return makeError("invalid --dns-server IPv4 address");
+    }
+    auto dns_server_port = parseStrictPort(dns_server_arg->substr(dns_colon + 1));
+    if (!dns_server_port) {
+        return makeError("invalid --dns-server port");
+    }
+
+    options.destination_is_hostname = true;
+    options.hostname = *normalized_hostname.normalized;
+    options.dns_server_ip = *dns_server_ip;
+    options.dns_server_port = *dns_server_port;
     return makeOptions(std::move(options));
 }
 

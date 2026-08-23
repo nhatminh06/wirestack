@@ -137,3 +137,11 @@ add_test(NAME test_http_client_path COMMAND test_http_client_path)
 add_executable(test_runtime_options test_runtime_options.cpp)
 target_link_libraries(test_runtime_options PRIVATE wirestack_core)
 add_test(NAME test_runtime_options COMMAND test_runtime_options)
+
+add_executable(test_dns test_dns.cpp)
+target_link_libraries(test_dns PRIVATE wirestack_core)
+add_test(NAME test_dns COMMAND test_dns)
+
+add_executable(test_dns_path test_dns_path.cpp)
+target_link_libraries(test_dns_path PRIVATE wirestack_core)
+add_test(NAME test_dns_path COMMAND test_dns_path)

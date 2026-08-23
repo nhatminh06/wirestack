@@ -52,12 +52,16 @@ HttpResponseParseResult parseHttpResponse(std::span<const std::byte> buffer, boo
 // Per-connection outbound HTTP/1.0 client state, owned by main.cpp
 // (mirrors HttpConnectionState's split from TcpConnectionTable: TCP
 // knows nothing about HTTP either direction). `remote_ip`/`remote_port`
-// are the literal destination this session's exact request was built
-// for -- used only for the Host header and for logging, never as TCP
-// sequence state.
+// are the actual TCP destination (the resolved address in DNS mode) --
+// used for logging, never for the Host header. `host_header` is the
+// exact authority text the request's Host header carries: the original
+// literal "<ip>:<port>" for a literal-IPv4 destination, or the original
+// "<hostname>:<port>" when the destination was resolved via DNS -- the
+// resolved IPv4 must never leak into it (see docs/dns.md).
 struct HttpClientSession {
     Ipv4Address remote_ip;
     std::uint16_t remote_port = 0;
+    std::string host_header;
     std::string target;
 
     bool request_enqueued = false;
@@ -102,15 +106,32 @@ enum class HttpClientTargetError {
 // or ports -- that's ordinary IPv4/port parsing at the CLI layer.
 std::optional<HttpClientTargetError> validateHttpClientTarget(std::string_view target);
 
+enum class HttpClientHostError {
+    Empty,
+    InvalidByte, // space, CR, LF, NUL, DEL, or another control byte
+};
+
+// Validates a Host header value in isolation. `host_header` is the exact
+// authority text this project supports -- "ip:port" or "hostname:port"
+// (see docs/dns.md) -- not a general URI authority; this rejects the
+// bytes that would let it corrupt the request's field structure if
+// emitted verbatim (CRLF injection, an embedded NUL, or any other
+// control byte), not full RFC 3986/7230 authority syntax.
+std::optional<HttpClientHostError> validateHttpClientHost(std::string_view host_header);
+
 // Builds the exact bounded GET request:
 //   GET <target> HTTP/1.0\r\n
-//   Host: <remote_ip>:<remote_port>\r\n
+//   Host: <host_header>\r\n
 //   Connection: close\r\n
 //   \r\n
-// Returns nullopt if `target` fails validateHttpClientTarget -- the
-// serializer never emits CRLF-injected or otherwise malformed bytes.
-std::optional<std::vector<std::byte>> buildHttpGetRequest(Ipv4Address remote_ip,
-                                                            std::uint16_t remote_port,
+// `host_header` is the authority text to place in the Host header (an
+// IPv4 literal or hostname, plus ":<port>" -- see HttpClientSession);
+// this function has no notion of an IPv4 address or a hostname beyond
+// that text. Returns nullopt, emitting no bytes at all, if `target`
+// fails validateHttpClientTarget or `host_header` fails
+// validateHttpClientHost -- the serializer never emits CRLF-injected or
+// otherwise malformed bytes regardless of what the caller passes in.
+std::optional<std::vector<std::byte>> buildHttpGetRequest(std::string_view host_header,
                                                             std::string_view target);
 
 } // namespace wirestack
