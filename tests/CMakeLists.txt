@@ -145,3 +145,7 @@ add_test(NAME test_dns COMMAND test_dns)
 add_executable(test_dns_path test_dns_path.cpp)
 target_link_libraries(test_dns_path PRIVATE wirestack_core)
 add_test(NAME test_dns_path COMMAND test_dns_path)
+
+add_executable(test_event_loop_timers test_event_loop_timers.cpp)
+target_link_libraries(test_event_loop_timers PRIVATE wirestack_core)
+add_test(NAME test_event_loop_timers COMMAND test_event_loop_timers)
