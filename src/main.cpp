@@ -57,10 +57,34 @@ void printFrame(const wirestack::EthernetFrame& frame, std::size_t total_bytes) 
     }
 }
 
-// Parses the ARP payload, learns the sender mapping into `cache`, and (for
-// requests targeting `local_ip`) writes an Ethernet-wrapped ARP reply back
-// through `tap`. Returns nothing; failures are reported to stdout/stderr
-// directly, matching the rest of the receive loop.
+void sendArpRequest(wirestack::TapDevice& tap, wirestack::Ipv4Address local_ip,
+                    wirestack::MacAddress local_mac, wirestack::Ipv4Address target_ip) {
+    wirestack::EthernetFrame frame;
+    frame.destination = wirestack::MacAddress::kBroadcast;
+    frame.source = local_mac;
+    frame.ether_type = static_cast<std::uint16_t>(wirestack::EtherType::Arp);
+    frame.payload = wirestack::serializeArpPacket(
+        wirestack::makeArpRequest(local_ip, local_mac, target_ip));
+
+    auto result = tap.write(wirestack::serializeEthernetFrame(frame));
+    if (auto* error = std::get_if<std::string>(&result)) {
+        std::fprintf(stderr, "wirestack: arp request write failed: %s\n", error->c_str());
+        return;
+    }
+    std::printf("arp request target=%s\n", target_ip.toString().c_str());
+}
+
+std::optional<wirestack::MacAddress>
+resolveNeighbor(wirestack::TapDevice& tap, wirestack::ArpCache& cache,
+                wirestack::Ipv4Address local_ip, wirestack::MacAddress local_mac,
+                wirestack::Ipv4Address target_ip, wirestack::ArpClock::time_point now) {
+    if (auto mac = cache.lookup(target_ip, now)) return mac;
+    if (cache.beginResolution(target_ip, now)) sendArpRequest(tap, local_ip, local_mac, target_ip);
+    return std::nullopt;
+}
+
+// Parses the ARP payload, accepts replies for pending local resolutions,
+// and answers requests targeting `local_ip`.
 void handleArp(wirestack::TapDevice& tap, wirestack::ArpCache& cache,
                wirestack::Ipv4Address local_ip, wirestack::MacAddress local_mac,
                const wirestack::EthernetFrame& frame) {
@@ -71,9 +95,20 @@ void handleArp(wirestack::TapDevice& tap, wirestack::ArpCache& cache,
     }
 
     const auto& request = std::get<wirestack::ArpPacket>(parsed);
-    cache.insert(request.sender_ip, request.sender_mac);
+    if (frame.source != request.sender_mac || request.sender_mac == wirestack::MacAddress{} ||
+        request.sender_mac.isBroadcast()) {
+        std::printf("arp: dropped packet with invalid sender\n");
+        return;
+    }
 
-    if (request.operation != wirestack::ArpOperation::Request) {
+    if (request.operation == wirestack::ArpOperation::Reply) {
+        if (frame.destination != local_mac ||
+            !wirestack::isArpReplyFor(request, local_ip, local_mac) ||
+            cache.stateOf(request.sender_ip) != wirestack::ArpNeighborState::Incomplete) {
+            std::printf("arp: ignored unsolicited or mistargeted reply\n");
+            return;
+        }
+        cache.insert(request.sender_ip, request.sender_mac);
         return;
     }
 
@@ -83,6 +118,10 @@ void handleArp(wirestack::TapDevice& tap, wirestack::ArpCache& cache,
     auto reply = wirestack::maybeReply(request, local_ip, local_mac);
     if (!reply) {
         return;
+    }
+
+    if (request.sender_ip != wirestack::Ipv4Address{}) {
+        cache.insert(request.sender_ip, request.sender_mac);
     }
 
     wirestack::EthernetFrame reply_frame;
@@ -902,6 +941,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    auto initial_neighbor = dns_state
+                                ? std::optional{dns_state->session.server_ip}
+                                : (runtime_options.mode != wirestack::RuntimeMode::Passive
+                                       ? dial_target_ip
+                                       : std::nullopt);
+    if (initial_neighbor) {
+        resolveNeighbor(tap, arp_cache, *local_ip, *local_mac, *initial_neighbor,
+                        wirestack::ArpClock::now());
+    }
+
     std::array<std::byte, kReceiveBufferSize> buffer{};
     for (;;) {
         // Size the poll timeout to the earliest pending TCP retransmission
@@ -917,6 +966,10 @@ int main(int argc, char** argv) {
         if (dns_state && dns_state->session.next_deadline &&
             (!deadline || *dns_state->session.next_deadline < *deadline)) {
             deadline = dns_state->session.next_deadline;
+        }
+        auto arp_deadline = arp_cache.nextDeadline();
+        if (arp_deadline && (!deadline || *arp_deadline < *deadline)) {
+            deadline = arp_deadline;
         }
         if (deadline) {
             auto now = wirestack::TcpClock::now();
@@ -961,6 +1014,25 @@ int main(int argc, char** argv) {
             }
         }
 
+        auto arp_now = wirestack::ArpClock::now();
+        auto arp_due = arp_cache.poll(arp_now);
+        for (auto ip : arp_due.requests) {
+            sendArpRequest(tap, *local_ip, *local_mac, ip);
+        }
+        for (auto ip : arp_due.failed) {
+            if (dns_state && !dns_state->query_started && dns_state->session.server_ip == ip) {
+                dns_state->session.state = wirestack::DnsClientState::Failed;
+                dns_state->session.next_deadline.reset();
+                std::printf("dns-client: resolution failed host=%s reason=NeighborUnreachable\n",
+                            dns_state->session.hostname.c_str());
+            }
+            if (!active_open_started && dial_target_ip && *dial_target_ip == ip) {
+                active_open_started = true;
+                std::printf("tcp: active open failed dst=%s reason=NeighborUnreachable\n",
+                            ip.toString().c_str());
+            }
+        }
+
         // DNS: send the initial query once the server's MAC is known, and
         // hand any due retry to the same fixed retry schedule (see
         // docs/dns.md) -- both happen independently of the dial loop
@@ -968,11 +1040,12 @@ int main(int argc, char** argv) {
         // Resolved (see handleDnsClientUdp).
         if (dns_state && dns_state->session.state == wirestack::DnsClientState::Pending) {
             if (!dns_state->query_started) {
-                if (auto mac = arp_cache.lookup(dns_state->session.server_ip)) {
+                auto now = wirestack::ArpClock::now();
+                if (auto mac = resolveNeighbor(tap, arp_cache, *local_ip, *local_mac,
+                                               dns_state->session.server_ip, now)) {
                     wirestack::DnsQuery query;
                     query.transaction_id = dns_state->transaction_id;
                     query.hostname = dns_state->session.hostname;
-                    auto now = wirestack::TcpClock::now();
                     auto bytes = wirestack::beginDnsQuery(dns_state->session, query, now);
                     if (bytes) {
                         dns_state->query_started = true;
@@ -1010,8 +1083,9 @@ int main(int argc, char** argv) {
             wirestack::Ipv4Address dial_ip = *dial_target_ip;
             std::uint16_t dial_port = runtime_options.remote_port;
             std::uint16_t dial_source_port = runtime_options.source_port;
-            if (auto mac = arp_cache.lookup(dial_ip)) {
-                auto now = wirestack::TcpClock::now();
+            auto now = wirestack::ArpClock::now();
+            if (auto mac =
+                    resolveNeighbor(tap, arp_cache, *local_ip, *local_mac, dial_ip, now)) {
                 auto connect_result = tcp_connections.beginConnect(*active_open_key, now);
                 active_open_started = true; // one attempt only, regardless of outcome
                 if (connect_result.accepted && connect_result.syn) {
@@ -1041,7 +1115,8 @@ int main(int argc, char** argv) {
         auto now = wirestack::TcpClock::now();
         auto due = tcp_connections.pollRetransmissions(now);
         for (const auto& retransmission : due.retransmissions) {
-            auto mac = arp_cache.lookup(retransmission.key.remote_ip);
+            auto mac = resolveNeighbor(tap, arp_cache, *local_ip, *local_mac,
+                                       retransmission.key.remote_ip, now);
             if (!mac) {
                 std::printf("tcp: cannot retransmit to %s:%u: no known MAC address\n",
                             retransmission.key.remote_ip.toString().c_str(),
@@ -1053,7 +1128,8 @@ int main(int argc, char** argv) {
         }
         auto persist_due = tcp_connections.pollPersistProbes(now);
         for (const auto& probe : persist_due.probes) {
-            auto mac = arp_cache.lookup(probe.key.remote_ip);
+            auto mac = resolveNeighbor(tap, arp_cache, *local_ip, *local_mac,
+                                       probe.key.remote_ip, now);
             if (!mac) {
                 std::printf("tcp: cannot send persist probe to %s:%u: no known MAC address\n",
                             probe.key.remote_ip.toString().c_str(),
