@@ -14,11 +14,7 @@
 #
 # Reuses the same topology (tools/integration/setup.sh) and the same
 # process-identity-verified cleanup (tools/integration/cleanup.sh) as
-# run.sh. Wirestack never sends an ARP request of its own (see
-# docs/tcp.md); each scenario primes Wirestack's ARP cache first with a
-# single ping from the client to Wirestack, which Wirestack learns the
-# sender's MAC from opportunistically (any inbound IPv4 packet, not just
-# ARP -- see arp_cache.insert in handleIpv4, src/main.cpp).
+# run.sh. Each fresh Wirestack process starts with a cold ARP cache.
 
 set -euo pipefail
 
@@ -75,11 +71,6 @@ ws_restart_wirestack_active_open() {
     ws_start_wirestack --active-open "${remote_ip}:${remote_port}" --source-port "${source_port}"
 }
 
-ws_prime_arp() {
-    ws_in_client ping -c 1 -W 2 -I "${WS_CLIENT_VETH}" "${WS_SERVER_IP}" \
-        >"${WS_EVIDENCE_DIR}/active_open_arp_prime.log" 2>&1 || true
-}
-
 # Extracts an unsigned decimal field (seq/ack) that immediately follows
 # `field` in a tcpdump -vv -S line, e.g. "seq 12345," -> 12345.
 ws_extract_field() {
@@ -92,8 +83,6 @@ ws_extract_field() {
 #    initiated by Wirestack, accepted by a real accept() call.
 # ---------------------------------------------------------------------------
 ws_test_active_open_established() {
-    ws_restart_wirestack_active_open "${WS_CLIENT_IP}" "${WS_LISTEN_PORT}" "${WS_ACTIVE_SRC_PORT}"
-
     local pidfile="${WS_EVIDENCE_DIR}/active_open_listener.pid"
     local log="${WS_EVIDENCE_DIR}/active_open_listener.log"
     # Closes the accepted connection immediately, with no bytes exchanged:
@@ -136,7 +125,7 @@ PYEOF
     done
 
     ws_capture_start active_open "${WS_HOST_VETH}"
-    ws_prime_arp
+    ws_restart_wirestack_active_open "${WS_CLIENT_IP}" "${WS_LISTEN_PORT}" "${WS_ACTIVE_SRC_PORT}"
 
     local wirestack_pid
     wirestack_pid="$(cat "${WS_EVIDENCE_DIR}/${WS_WIRESTACK_PIDFILE_NAME}")"
@@ -223,10 +212,8 @@ PYEOF
 #    generates RST|ACK, no listener process involved.
 # ---------------------------------------------------------------------------
 ws_test_active_open_refused() {
-    ws_restart_wirestack_active_open "${WS_CLIENT_IP}" "${WS_REFUSED_PORT}" "${WS_REFUSED_SRC_PORT}"
-
     ws_capture_start active_open_refused "${WS_HOST_VETH}"
-    ws_prime_arp
+    ws_restart_wirestack_active_open "${WS_CLIENT_IP}" "${WS_REFUSED_PORT}" "${WS_REFUSED_SRC_PORT}"
 
     local wirestack_pid
     wirestack_pid="$(cat "${WS_EVIDENCE_DIR}/${WS_WIRESTACK_PIDFILE_NAME}")"

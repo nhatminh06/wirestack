@@ -76,11 +76,6 @@ ws_restart_wirestack_dns() {
         --dns-server "${WS_CLIENT_IP}:${WS_DNS_PORT}" --source-port "${src_port}" --target "/"
 }
 
-ws_prime_arp() {
-    ws_in_client ping -c 1 -W 2 -I "${WS_CLIENT_VETH}" "${WS_SERVER_IP}" \
-        >"${WS_EVIDENCE_DIR}/dns_http_get_arp_prime.log" 2>&1 || true
-}
-
 # `mode`: "success" answers the first query; "drop_then_answer" drops the
 # first query and answers the second (byte-identical retry); "nxdomain"
 # answers the first query with RCODE=3. The response's transaction ID and
@@ -213,8 +208,6 @@ ws_start_http_server() {
 #    and completes exactly one HTTP GET.
 # ---------------------------------------------------------------------------
 ws_test_dns_success() {
-    ws_restart_wirestack_dns "${WS_SUCCESS_HTTP_PORT}" "${WS_SUCCESS_SRC_PORT}"
-
     local dns_log="${WS_EVIDENCE_DIR}/dns_success_server.log"
     local dns_pidfile="${WS_EVIDENCE_DIR}/dns_success_server.pid"
     ws_start_dns_server success "${dns_log}" "${dns_pidfile}" >/dev/null || return 1
@@ -225,7 +218,7 @@ ws_test_dns_success() {
         "${http_log}" "${http_pidfile}" || return 1
 
     ws_capture_start dns_success "${WS_HOST_VETH}"
-    ws_prime_arp
+    ws_restart_wirestack_dns "${WS_SUCCESS_HTTP_PORT}" "${WS_SUCCESS_SRC_PORT}"
 
     local waited=0
     while ! grep -q "^CLOSED" "${http_log}" 2>/dev/null; do
@@ -273,8 +266,6 @@ ws_test_dns_success() {
 #    byte-identical retry, no SYN before the reply, exactly one connection.
 # ---------------------------------------------------------------------------
 ws_test_dns_retry() {
-    ws_restart_wirestack_dns "${WS_RETRY_HTTP_PORT}" "${WS_RETRY_SRC_PORT}"
-
     local dns_log="${WS_EVIDENCE_DIR}/dns_retry_server.log"
     local dns_pidfile="${WS_EVIDENCE_DIR}/dns_retry_server.pid"
     ws_start_dns_server drop_then_answer "${dns_log}" "${dns_pidfile}" >/dev/null || return 1
@@ -285,7 +276,7 @@ ws_test_dns_retry() {
         "${http_log}" "${http_pidfile}" || return 1
 
     ws_capture_start dns_retry "${WS_HOST_VETH}"
-    ws_prime_arp
+    ws_restart_wirestack_dns "${WS_RETRY_HTTP_PORT}" "${WS_RETRY_SRC_PORT}"
 
     # The retry fires at t=1s (kDnsInitialInterval, docs/dns.md); allow
     # generous wall-clock slack for a loaded scheduler.
@@ -329,14 +320,12 @@ ws_test_dns_retry() {
 #    retries, no TCP SYN, no HTTP request.
 # ---------------------------------------------------------------------------
 ws_test_dns_nxdomain() {
-    ws_restart_wirestack_dns "${WS_NXDOMAIN_HTTP_PORT}" "${WS_NXDOMAIN_SRC_PORT}"
-
     local dns_log="${WS_EVIDENCE_DIR}/dns_nxdomain_server.log"
     local dns_pidfile="${WS_EVIDENCE_DIR}/dns_nxdomain_server.pid"
     ws_start_dns_server nxdomain "${dns_log}" "${dns_pidfile}" >/dev/null || return 1
 
     ws_capture_start dns_nxdomain "${WS_HOST_VETH}"
-    ws_prime_arp
+    ws_restart_wirestack_dns "${WS_NXDOMAIN_HTTP_PORT}" "${WS_NXDOMAIN_SRC_PORT}"
 
     local wirestack_log="${WS_EVIDENCE_DIR}/wirestack.out"
     local waited=0
