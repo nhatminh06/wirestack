@@ -44,6 +44,10 @@ ArpParseResult parseArpPacket(std::span<const std::byte> payload);
 
 std::vector<std::byte> serializeArpPacket(const ArpPacket& packet);
 
+ArpPacket makeArpRequest(Ipv4Address local_ip, MacAddress local_mac, Ipv4Address target_ip);
+
+bool isArpReplyFor(const ArpPacket& packet, Ipv4Address local_ip, MacAddress local_mac);
+
 // Builds the reply packet for a request, using the given local IP/MAC as
 // sender. Does not check whether the request targets the local IP.
 ArpPacket makeArpReply(const ArpPacket& request, Ipv4Address local_ip, MacAddress local_mac);

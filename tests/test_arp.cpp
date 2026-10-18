@@ -8,7 +8,9 @@ using wirestack::ArpParseError;
 using wirestack::Ipv4Address;
 using wirestack::MacAddress;
 using wirestack::makeArpReply;
+using wirestack::makeArpRequest;
 using wirestack::maybeReply;
+using wirestack::isArpReplyFor;
 using wirestack::parseArpPacket;
 using wirestack::serializeArpPacket;
 
@@ -59,6 +61,15 @@ std::vector<std::byte> knownReplyBytes() {
 } // namespace
 
 int main() {
+    // outbound request construction and byte-exact encoding
+    {
+        auto local_ip = *Ipv4Address::parse("10.0.0.1");
+        auto local_mac = *MacAddress::parse("02:00:00:00:00:01");
+        auto target_ip = *Ipv4Address::parse("10.0.0.2");
+        auto request = makeArpRequest(local_ip, local_mac, target_ip);
+        CHECK(serializeArpPacket(request) == knownRequestBytes());
+    }
+
     // known-vector request decode
     {
         auto result = parseArpPacket(knownRequestBytes());
@@ -214,6 +225,21 @@ int main() {
             // maybeReply: request targets a different IP -> no reply
             auto other_ip = *Ipv4Address::parse("10.0.0.99");
             CHECK(!maybeReply(*request, other_ip, local_mac).has_value());
+        }
+    }
+
+    // only replies explicitly targeting the local endpoint are accepted
+    {
+        auto local_ip = *Ipv4Address::parse("10.0.0.1");
+        auto local_mac = *MacAddress::parse("aa:bb:cc:dd:ee:ff");
+        auto parsed = parseArpPacket(knownReplyBytes());
+        auto* reply = std::get_if<ArpPacket>(&parsed);
+        CHECK(reply != nullptr);
+        if (reply) {
+            CHECK(isArpReplyFor(*reply, local_ip, local_mac));
+            CHECK(!isArpReplyFor(*reply, *Ipv4Address::parse("10.0.0.99"), local_mac));
+            CHECK(!isArpReplyFor(*reply, local_ip,
+                                 *MacAddress::parse("00:11:22:33:44:55")));
         }
     }
 

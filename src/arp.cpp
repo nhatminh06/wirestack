@@ -111,6 +111,21 @@ std::vector<std::byte> serializeArpPacket(const ArpPacket& packet) {
     return out;
 }
 
+ArpPacket makeArpRequest(Ipv4Address local_ip, MacAddress local_mac, Ipv4Address target_ip) {
+    ArpPacket request;
+    request.operation = ArpOperation::Request;
+    request.sender_mac = local_mac;
+    request.sender_ip = local_ip;
+    request.target_mac = MacAddress{};
+    request.target_ip = target_ip;
+    return request;
+}
+
+bool isArpReplyFor(const ArpPacket& packet, Ipv4Address local_ip, MacAddress local_mac) {
+    return packet.operation == ArpOperation::Reply && packet.target_ip == local_ip &&
+           packet.target_mac == local_mac;
+}
+
 ArpPacket makeArpReply(const ArpPacket& request, Ipv4Address local_ip, MacAddress local_mac) {
     ArpPacket reply;
     reply.operation = ArpOperation::Reply;
