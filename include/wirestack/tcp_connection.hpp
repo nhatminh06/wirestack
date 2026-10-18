@@ -167,6 +167,10 @@ struct TcpReceiveResult {
     // that trick doesn't work for SynSent (a rejected/invalid segment
     // here never changes state, so there is nothing to diff against).
     bool connection_established = false;
+
+    // True only when a new passive SYN was rejected by a configured
+    // total or half-open connection limit. No state or SYN-ACK is created.
+    bool admission_rejected = false;
 };
 
 // Adaptive RTO policy (RFC 6298-style SRTT/RTTVAR estimator, expressed in
@@ -180,6 +184,9 @@ inline constexpr std::chrono::milliseconds kMinRto{1000};
 inline constexpr std::chrono::milliseconds kMaxRto{60000};
 inline constexpr std::chrono::milliseconds kRtoGranularity{1};
 inline constexpr int kMaxRetransmits = 5;
+
+inline constexpr std::size_t kDefaultMaxTcpConnections = 1024;
+inline constexpr std::size_t kDefaultMaxTcpHalfOpenConnections = 256;
 
 // Educational fixed TIME_WAIT duration -- not adaptive, not based on any
 // measured MSL.
@@ -294,6 +301,7 @@ struct TcpCloseResult {
 enum class TcpConnectError {
     InvalidPort,          // local_port == 0 or remote_port == 0
     DuplicateConnection,  // the four-tuple already has connection state
+    CapacityExhausted,    // total or half-open connection limit reached
 };
 
 struct TcpConnectResult {
@@ -355,7 +363,9 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 // TCP simultaneous open, no ephemeral-port allocation.
 class TcpConnectionTable {
 public:
-    explicit TcpConnectionTable(std::uint16_t listen_port);
+    explicit TcpConnectionTable(
+        std::uint16_t listen_port, std::size_t max_connections = kDefaultMaxTcpConnections,
+        std::size_t max_half_open_connections = kDefaultMaxTcpHalfOpenConnections);
 
     // Begins an active open: creates connection state in SynSent for the
     // exact four-tuple `key` and returns the SYN to transmit. Rejected
@@ -851,7 +861,11 @@ private:
     static TcpReceiveResult handleTimeWait(const TcpConnectionKey& key, Connection& connection,
                                             const TcpSegment& segment, TcpClock::time_point now);
 
+    std::size_t halfOpenCount() const;
+
     std::uint16_t listen_port_;
+    std::size_t max_connections_;
+    std::size_t max_half_open_connections_;
     std::uint32_t next_isn_ = 1000;
     std::map<TcpConnectionKey, Connection> connections_;
 };

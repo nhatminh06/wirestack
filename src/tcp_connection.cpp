@@ -55,7 +55,21 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming) {
     return reset;
 }
 
-TcpConnectionTable::TcpConnectionTable(std::uint16_t listen_port) : listen_port_(listen_port) {}
+TcpConnectionTable::TcpConnectionTable(std::uint16_t listen_port, std::size_t max_connections,
+                                       std::size_t max_half_open_connections)
+    : listen_port_(listen_port), max_connections_(max_connections),
+      max_half_open_connections_(max_half_open_connections) {}
+
+std::size_t TcpConnectionTable::halfOpenCount() const {
+    std::size_t count = 0;
+    for (const auto& [key, connection] : connections_) {
+        (void)key;
+        if (connection.state == TcpState::SynSent || connection.state == TcpState::SynReceived) {
+            ++count;
+        }
+    }
+    return count;
+}
 
 std::uint32_t TcpConnectionTable::nextIsn() {
     std::uint32_t isn = next_isn_;
@@ -450,6 +464,11 @@ TcpConnectResult TcpConnectionTable::beginConnect(const TcpConnectionKey& key,
     }
     if (connections_.contains(key)) {
         result.error = TcpConnectError::DuplicateConnection;
+        return result;
+    }
+    if (connections_.size() >= max_connections_ ||
+        halfOpenCount() >= max_half_open_connections_) {
+        result.error = TcpConnectError::CapacityExhausted;
         return result;
     }
 
@@ -1286,6 +1305,13 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
         // create a connection.
         if (!options.sack_blocks.empty()) {
             return {};
+        }
+
+        if (connections_.size() >= max_connections_ ||
+            halfOpenCount() >= max_half_open_connections_) {
+            TcpReceiveResult result;
+            result.admission_rejected = true;
+            return result;
         }
 
         Connection connection;
