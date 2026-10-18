@@ -946,19 +946,18 @@ int main(int argc, char** argv) {
             auto* frame = std::get_if<wirestack::EthernetFrame>(&parsed);
             if (frame == nullptr) {
                 std::printf("ethernet: dropped malformed frame: truncated header\n");
-                continue;
-            }
+            } else {
+                printFrame(*frame, n);
 
-            printFrame(*frame, n);
-
-            auto ether_type = static_cast<wirestack::EtherType>(frame->ether_type);
-            if (ether_type == wirestack::EtherType::Arp) {
-                handleArp(tap, arp_cache, *local_ip, *local_mac, *frame);
-            } else if (ether_type == wirestack::EtherType::Ipv4) {
-                handleIpv4(tap, *local_ip, *local_mac, arp_cache, udp_endpoints, tcp_connections,
-                           http_sessions, http_client_sessions, active_open_key,
-                           dns_state ? &*dns_state : nullptr, dial_target_ip, active_open_key,
-                           runtime_options.source_port, *frame);
+                auto ether_type = static_cast<wirestack::EtherType>(frame->ether_type);
+                if (ether_type == wirestack::EtherType::Arp) {
+                    handleArp(tap, arp_cache, *local_ip, *local_mac, *frame);
+                } else if (ether_type == wirestack::EtherType::Ipv4) {
+                    handleIpv4(tap, *local_ip, *local_mac, arp_cache, udp_endpoints,
+                               tcp_connections, http_sessions, http_client_sessions,
+                               active_open_key, dns_state ? &*dns_state : nullptr, dial_target_ip,
+                               active_open_key, runtime_options.source_port, *frame);
+                }
             }
         }
 
