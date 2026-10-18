@@ -348,6 +348,105 @@ int main() {
         CHECK(table.stateOf(key) == TcpState::SynReceived);
     }
 
+    // Connection limits reject only new admissions: duplicate SYNs and
+    // established traffic remain usable under total/half-open pressure.
+    {
+        TcpConnectionTable table(8080, 2, 1);
+        TcpConnectionKey established_key{localIp(), 8080, remoteIp(), 40000};
+        TcpConnectionKey half_open_key{localIp(), 8080, remoteIp(), 40001};
+        std::uint32_t server_isn = establish(table, established_key, 1000);
+
+        auto first = table.handle(half_open_key, makeSyn(8080, 40001, 2000), t0);
+        CHECK(first.reply.has_value());
+        auto duplicate = table.handle(half_open_key, makeSyn(8080, 40001, 2000), t0);
+        CHECK(duplicate.reply.has_value());
+        CHECK(!duplicate.admission_rejected);
+
+        for (std::uint16_t port = 40002; port < 40032; ++port) {
+            TcpConnectionKey excess_key{localIp(), 8080, remoteIp(), port};
+            auto excess = table.handle(excess_key, makeSyn(8080, port, 3000), t0);
+            CHECK(excess.admission_rejected);
+            CHECK(!excess.reply.has_value());
+            CHECK(!table.stateOf(excess_key).has_value());
+        }
+
+        auto data = table.handle(established_key,
+                                 makeData(8080, 40000, 1001, server_isn + 1, toBytes("ok")), t0);
+        CHECK(data.accepted_payload == toBytes("ok"));
+        CHECK(table.stateOf(established_key) == TcpState::Established);
+    }
+
+    // Half-open limits apply equally to active and passive opens.
+    {
+        TcpConnectionTable table(8080, 4, 1);
+        TcpConnectionKey active_key{localIp(), 49152, remoteIp(), 9090};
+        TcpConnectionKey passive_key{localIp(), 8080, remoteIp(), 40000};
+        CHECK(table.beginConnect(active_key, t0).accepted);
+
+        auto passive = table.handle(passive_key, makeSyn(8080, 40000, 1000), t0);
+        CHECK(passive.admission_rejected);
+        CHECK(!table.stateOf(passive_key).has_value());
+
+        TcpConnectionKey second_active{localIp(), 49153, remoteIp(), 9091};
+        auto active = table.beginConnect(second_active, t0);
+        CHECK(!active.accepted);
+        CHECK(active.error == TcpConnectError::CapacityExhausted);
+        CHECK(!active.syn.has_value());
+    }
+
+    // A total limit rejects active open without disturbing existing state.
+    {
+        TcpConnectionTable table(8080, 1, 1);
+        TcpConnectionKey existing{localIp(), 8080, remoteIp(), 40000};
+        establish(table, existing, 1000);
+        TcpConnectionKey active{localIp(), 49152, remoteIp(), 9090};
+        auto rejected = table.beginConnect(active, t0);
+        CHECK(!rejected.accepted);
+        CHECK(rejected.error == TcpConnectError::CapacityExhausted);
+        CHECK(table.stateOf(existing) == TcpState::Established);
+    }
+
+    // Half-open timeout releases both total and half-open capacity.
+    {
+        TcpConnectionTable table(8080, 1, 1);
+        TcpConnectionKey first{localIp(), 8080, remoteIp(), 40000};
+        TcpConnectionKey replacement{localIp(), 8080, remoteIp(), 40001};
+        table.handle(first, makeSyn(8080, 40000, 1000), t0);
+
+        TcpClock::time_point deadline = t0;
+        std::chrono::milliseconds interval = kInitialRto;
+        for (int retry = 0; retry < kMaxRetransmits; ++retry) {
+            deadline += interval;
+            table.pollRetransmissions(deadline);
+            interval = std::min(interval * 2, kMaxRto);
+        }
+        deadline += interval;
+        CHECK(table.pollRetransmissions(deadline).timed_out ==
+              std::vector<TcpConnectionKey>{first});
+        CHECK(table.handle(replacement, makeSyn(8080, 40001, 2000), deadline).reply.has_value());
+    }
+
+    // RST and normal LastAck completion release total capacity.
+    {
+        TcpConnectionTable table(8080, 1, 1);
+        TcpConnectionKey first{localIp(), 8080, remoteIp(), 40000};
+        TcpConnectionKey second{localIp(), 8080, remoteIp(), 40001};
+        establish(table, first, 1000);
+        CHECK(table.handle(first, makeRst(8080, 40000, 1001), t0).connection_reset);
+        std::uint32_t second_isn = establish(table, second, 2000);
+        CHECK(table.stateOf(second) == TcpState::Established);
+
+        table.handle(second, makeFin(8080, 40001, 2001, second_isn + 1), t0);
+        auto close = table.beginClose(second, t0);
+        CHECK(close.fin.has_value());
+        if (close.fin) {
+            table.handle(second,
+                         makeAck(8080, 40001, 2002, close.fin->sequence_number + 1), t0);
+        }
+        CHECK(!table.stateOf(second).has_value());
+        CHECK(table.beginConnect({localIp(), 49152, remoteIp(), 9090}, t0).accepted);
+    }
+
     // wrong ACK: remains SynReceived
     {
         TcpConnectionTable table(8080);
