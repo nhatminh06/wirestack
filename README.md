@@ -5,40 +5,36 @@ through Ethernet, ARP, IPv4, ICMP, UDP, TCP, and a minimal HTTP server. This
 is a learning project: the goal is understanding the protocols by
 implementing them, not feature completeness or performance.
 
-```text
-application: HTTP server/client, DNS client
-                    |
-             TCP / UDP / ICMP
-                    |
-                 IPv4 / ARP
-                    |
-             Ethernet II / TAP
-                    |
-               Linux network
-```
+## Architecture
+
+![Wirestack system architecture](architecture.png)
+
+Incoming frames are parsed and validated at each protocol boundary before
+dispatch. The event loop owns the ARP cache, TCP connection table, DNS state,
+and HTTP sessions; after packet handling it advances neighbor resolution, DNS,
+TCP retransmission, persist, and connection-lifecycle timers. Outbound packets
+use the same protocol serializers in the reverse direction and are written to
+the TAP device.
 
 ## Status
-
-Milestone 0 (project foundation) through Milestone 14 (NewReno
-partial-ACK recovery and a bounded segment-granular SACK scoreboard):
 
 | Protocol    | Status                                                          |
 |-------------|-------------------------------------------------------------------|
 | Ethernet II | implemented                                                       |
 | TAP I/O     | implemented                                                       |
-| ARP         | implemented                                                       |
+| ARP         | bounded cache and outbound neighbor resolution                    |
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake, and active open (`beginConnect`/SynSent, an opt-in `--active-open` runtime path, RST refusal, timeout retransmission -- see docs/tcp.md) with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented, deterministically tested, and live-qualified against a real Linux client (see docs/interoperability.md), including sender-side multi-segment SACK recovery; active open's handshake (established and refused) is also live-qualified against a real Linux listener (see `tools/integration/active_open.sh`), and data transfer over an actively-opened connection is now proven by the outbound HTTP/1.0 client below (live-qualified against a real Python HTTP server, see `tools/integration/http_get.sh`), reusing the same send/segmentation/congestion/retransmission/reassembly/close machinery with no active-open-specific data path |
-| HTTP        | minimal HTTP/1.0 GET server (`/` -> 200, `/sack-test` -> deterministic multi-segment integration payload, other paths -> 404, one request per connection) implemented, deterministically tested, and live-qualified with a real Linux client (see docs/interoperability.md); plus a minimal outbound HTTP/1.0 client (`--http-get <ip-or-hostname>:<port> --source-port <port> --target </path>`, one GET request, Content-Length- or close-delimited response bodies, `Transfer-Encoding` rejected) implemented, deterministically tested, and live-qualified against a real Linux HTTP server (see docs/http.md) |
-| DNS         | bounded A-record resolution for a hostname `--http-get` destination (`--dns-server <ip>:<port>`, UDP, bounded compression-pointer decoding, fixed retry/timeout schedule) implemented and deterministically tested; see docs/dns.md for exact scope and limits |
+| TCP         | passive and active open, bounded state, retransmission, Reno/NewReno, SACK, and orderly/reset close; see [docs/tcp.md](docs/tcp.md) |
+| HTTP        | minimal HTTP/1.0 GET server and client; see [docs/http.md](docs/http.md) |
+| DNS         | bounded UDP A-record lookup for the HTTP client; see [docs/dns.md](docs/dns.md) |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
 - Ethernet II frame parsing and serialization
 - Linux TAP device I/O (`wirestack::TapDevice`): open, read, write
-- ARP request/reply parsing and serialization, request handling, and a basic
-  in-memory `ArpCache`
+- ARP request/reply parsing and serialization, request handling, bounded cache
+  entries with expiration, and timer-driven outbound neighbor resolution
 - IPv4 header parsing/serialization/checksum, local-delivery filtering
 - ICMP Echo Request/Reply parsing, serialization, and checksum
 - UDP datagram parsing/serialization with the IPv4 pseudo-header checksum, a
@@ -131,6 +127,7 @@ tests/                unit tests (CTest, no external test framework)
 tools/                command-line utilities (tap_send)
 tools/bench/          isolated Wirestack/Linux TCP benchmark
 tools/integration/    isolated-namespace Linux interoperability harness
+fuzz/                 optional Clang/libFuzzer parser targets and seed corpora
 docs/                 protocol notes
 ```
 
@@ -148,6 +145,14 @@ With AddressSanitizer and UndefinedBehaviorSanitizer:
 cmake -S . -B build-asan -DWIRESTACK_ENABLE_SANITIZERS=ON
 cmake --build build-asan -j
 ctest --test-dir build-asan --output-on-failure
+```
+
+Optional parser fuzzers require Clang and use libFuzzer with ASan and UBSan:
+
+```bash
+cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ \
+  -DWIRESTACK_ENABLE_FUZZING=ON
+cmake --build build-fuzz -j
 ```
 
 ## Running
