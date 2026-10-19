@@ -609,6 +609,147 @@ PYEOF
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# 11-14. Linux receiver SACK against a multi-MSS Wirestack response
+# ---------------------------------------------------------------------------
+ws_test_sender_sack_case() {
+    local mode="$1" name="sender_sack_${1}"
+    ws_capture_start "${name}_tap" "${WS_TAP}"
+    ws_capture_start "${name}_host" "${WS_HOST_VETH}"
+
+    local go_file="${WS_EVIDENCE_DIR}/${name}_go"
+    rm -f "${go_file}"
+    ws_in_client python3 - "${WS_SERVER_IP}" "${WS_TCP_PORT}" "${go_file}" \
+        >"${WS_EVIDENCE_DIR}/${name}_client.log" 2>&1 <<'PYEOF' &
+import os
+import socket
+import sys
+import time
+
+server_ip, port, go_file = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+body = b"s" * 12000
+expected = (b"HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: 12000\r\nConnection: close\r\n\r\n" + body)
+s = socket.create_connection((server_ip, port), timeout=5.0)
+print("CONNECTED", flush=True)
+deadline = time.time() + 5.0
+while not os.path.exists(go_file):
+    if time.time() > deadline:
+        print("TIMEOUT waiting for loss setup")
+        sys.exit(1)
+    time.sleep(0.01)
+s.sendall(b"GET /sack-test HTTP/1.0\r\n\r\n")
+s.settimeout(8.0)
+chunks = []
+while True:
+    chunk = s.recv(16384)
+    if not chunk:
+        break
+    chunks.append(chunk)
+s.close()
+received = b"".join(chunks)
+if received != expected:
+    print("MISMATCH length=%d expected=%d" % (len(received), len(expected)))
+    sys.exit(1)
+print("OK exact response, %d bytes" % len(received))
+PYEOF
+    local client_pid=$!
+    echo "${client_pid}" >"${WS_EVIDENCE_DIR}/${name}_client.pid"
+    ws_record_identity "${client_pid}" "${WS_EVIDENCE_DIR}/${name}_client.pid" python3
+
+    local waited=0
+    while ! grep -q "^CONNECTED" "${WS_EVIDENCE_DIR}/${name}_client.log" 2>/dev/null; do
+        kill -0 "${client_pid}" 2>/dev/null || break
+        waited=$((waited + 1))
+        [ "${waited}" -gt 250 ] && break
+        sleep 0.02
+    done
+    grep -q "^CONNECTED" "${WS_EVIDENCE_DIR}/${name}_client.log" || return 1
+
+    if [ "${mode}" = "reorder" ]; then
+        tc qdisc add dev "${WS_HOST_VETH}" root netem delay 60ms reorder 100% gap 2 || return 1
+    elif [ "${mode}" != "normal" ]; then
+        local synack_seq=""
+        waited=0
+        while [ -z "${synack_seq}" ]; do
+            synack_seq="$(tcpdump -r "${WS_EVIDENCE_DIR}/${name}_tap.pcap" -n -S 2>/dev/null \
+                | grep "${WS_SERVER_IP}.${WS_TCP_PORT} > .*Flags \[S\.\]" \
+                | sed -nE 's/.*seq ([0-9]+),.*/\1/p' | head -1)"
+            waited=$((waited + 1))
+            [ "${waited}" -gt 250 ] && break
+            [ -n "${synack_seq}" ] || sleep 0.02
+        done
+        [ -n "${synack_seq}" ] || return 1
+
+        tc qdisc add dev "${WS_HOST_VETH}" root handle 1: prio bands 3 \
+            priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 || return 1
+        tc qdisc add dev "${WS_HOST_VETH}" parent 1:2 handle 20: netem loss 100% || return 1
+
+        local loss_count=1
+        [ "${mode}" = "double" ] && loss_count=2
+        local index sequence hex priority loss_indexes="1"
+        [ "${mode}" = "double" ] && loss_indexes="1 3"
+        for index in ${loss_indexes}; do
+            sequence=$(( (synack_seq + 1 + index * 1460) & 0xffffffff ))
+            printf -v hex '0x%08x' "${sequence}"
+            priority=$((index + 1))
+            tc filter add dev "${WS_HOST_VETH}" parent 1: protocol ip prio "${priority}" u32 \
+                match ip protocol 6 0xff match ip sport "${WS_TCP_PORT}" 0xffff \
+                match u32 "${hex}" 0xffffffff at 24 flowid 1:2 || return 1
+        done
+        tc filter add dev "${WS_HOST_VETH}" parent 1: protocol ip prio 100 u32 \
+            match u32 0 0 at 0 flowid 1:1 || return 1
+
+        touch "${go_file}"
+        waited=0
+        local observed_drops=0
+        while [ "${observed_drops}" -lt "${loss_count}" ]; do
+            kill -0 "${client_pid}" 2>/dev/null || break
+            waited=$((waited + 1))
+            [ "${waited}" -gt 500 ] && break
+            sleep 0.01
+            observed_drops="$(tc -s qdisc show dev "${WS_HOST_VETH}" \
+                | sed -nE 's/.*\(dropped ([0-9]+),.*/\1/p' | tail -1)"
+            observed_drops="${observed_drops:-0}"
+        done
+        [ "${observed_drops}" -ge "${loss_count}" ] || {
+            tc qdisc del dev "${WS_HOST_VETH}" root 2>/dev/null || true
+            return 1
+        }
+        tc qdisc del dev "${WS_HOST_VETH}" root
+    fi
+
+    [ "${mode}" = "single" ] || [ "${mode}" = "double" ] || touch "${go_file}"
+    wait "${client_pid}"
+    local client_rc=$?
+    [ "${mode}" = "reorder" ] && tc qdisc del dev "${WS_HOST_VETH}" root
+    ws_capture_stop "${name}_tap"
+    ws_capture_stop "${name}_host"
+
+    [ "${client_rc}" = "0" ] || return 1
+    grep -q "^OK exact response" "${WS_EVIDENCE_DIR}/${name}_client.log" || return 1
+    tcpdump -r "${WS_EVIDENCE_DIR}/${name}_tap.pcap" -n -tttt \
+        >"${WS_EVIDENCE_DIR}/${name}_tap.oneline.txt" 2>/dev/null || true
+    tcpdump -r "${WS_EVIDENCE_DIR}/${name}_host.pcap" -n -tttt \
+        >"${WS_EVIDENCE_DIR}/${name}_host.oneline.txt" 2>/dev/null || true
+
+    local analysis
+    if ! analysis="$(python3 "${WS_SCRIPT_DIR}/analyze_sender_sack.py" \
+            "${WS_EVIDENCE_DIR}/${name}_tap.oneline.txt" \
+            "${WS_EVIDENCE_DIR}/${name}_host.oneline.txt" "${mode}" \
+            "${WS_SERVER_IP}" "${WS_CLIENT_IP}" "${WS_TCP_PORT}" 2>&1)"; then
+        ws_log "sender SACK analysis failed: ${analysis}"
+        return 1
+    fi
+    ws_log "${analysis}"
+    return 0
+}
+
+ws_test_sender_sack_normal() { ws_test_sender_sack_case normal; }
+ws_test_sender_sack_single() { ws_test_sender_sack_case single; }
+ws_test_sender_sack_double() { ws_test_sender_sack_case double; }
+ws_test_sender_sack_reorder() { ws_test_sender_sack_case reorder; }
+
 ws_run_test "arp"               ws_test_arp
 ws_run_test "icmp"              ws_test_icmp
 ws_run_test "udp"               ws_test_udp
@@ -619,6 +760,10 @@ ws_run_test "bare_ack_reset"    ws_test_bare_ack_reset
 ws_run_test "http_retransmission" ws_test_http_retransmission
 ws_run_test "synack_loss"       ws_test_synack_loss
 ws_run_test "reordering"        ws_test_reordering
+ws_run_test "sender_sack_normal" ws_test_sender_sack_normal
+ws_run_test "sender_sack_single_loss" ws_test_sender_sack_single
+ws_run_test "sender_sack_double_loss" ws_test_sender_sack_double
+ws_run_test "sender_sack_reordering" ws_test_sender_sack_reorder
 
 ws_log "test failures: ${WS_TEST_FAILURES}"
 [ "${WS_TEST_FAILURES}" = "0" ]

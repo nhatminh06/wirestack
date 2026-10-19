@@ -2,8 +2,9 @@
 
 Reproducible proof, against a real Linux kernel TCP/IP client, that
 Wirestack's ARP/ICMP/UDP/TCP/HTTP paths work end to end -- including
-timeout retransmission, SYN-ACK loss recovery, and out-of-order TCP
-segment delivery, all captured on the wire. This complements the
+timeout retransmission, SYN-ACK loss recovery, out-of-order TCP segment
+delivery, and sender-side multi-segment SACK recovery, all captured on the
+wire. This complements the
 per-protocol docs (`docs/arp.md`, `docs/icmp.md`, `docs/udp.md`,
 `docs/tcp.md`, `docs/http.md`, `docs/dns.md`), which describe manual single-command
 checks; this document describes the automated harness under
@@ -120,6 +121,10 @@ only the caller's own `/tmp` retention policy removes it.
 | 8 | HTTP response timeout retransmission | `tc netem loss 100%` on `ws-host0` egress |
 | 9 | SYN-ACK loss and recovery | `tc netem loss 100%` on `ws-host0` egress, applied before the first SYN |
 | 10 | Reordering and receiver SACK | `tc netem ... reorder 100% gap 2` on `ws-client0` egress |
+| 11 | Multi-segment sender baseline | 12,103-byte HTTP response, no impairment |
+| 12 | Single-segment SACK recovery | exact second response segment sent to a `netem loss 100%` band |
+| 13 | Two-loss SACK recovery | exact second and fourth response segments sent to that loss band |
+| 14 | Sender-side reordering | `tc netem ... reorder 100% gap 2` on `ws-host0` egress |
 
 ## Packet-loss mechanism (scenarios 8 and 9)
 
@@ -156,9 +161,31 @@ must appear on the wire before the segment starting at offset zero, and
 Wirestack's ACK for it must carry a SACK option for the retained
 out-of-order range while cumulative ACK stays at `rcv_nxt`.
 
+## Sender-side SACK recovery (scenarios 11-14)
+
+`GET /sack-test` returns a deterministic 12,000-byte body (`s` repeated),
+12,103 bytes including its HTTP/1.0 header. The response spans eight full
+1460-byte segments and one final 422-byte segment; the client verifies every
+response byte.
+
+For loss cases, the harness reads the server ISN from the live TAP pcap and
+installs `tc u32` filters on `ws-host0` for the exact second segment, or the
+exact second and fourth segments. Matching packets enter a
+`netem loss 100%` band and an explicit catch-all sends other IPv4 packets to
+the pass band. The qdisc is removed as soon as its counter reports the
+requested drops, so retransmissions pass. No random loss probability is used.
+
+The analyzer compares upstream TAP and downstream host captures. It requires
+SACK-Permitted in both SYN directions, Linux SACK blocks above the cumulative
+ACK, retransmission of exactly the missing ranges (relative starts 1461, and
+1461 plus 4381 for two losses), no retransmission of fully SACKed ranges,
+cumulative ACK through 12104, exact application bytes, and FINs from both
+peers. The reorder-only case requires changed arrival order and SACK feedback
+without retransmission.
+
 ## Expected results
 
-All ten scenarios pass. See `docs/tcp.md` for the exact reset field
+All fourteen scenarios pass. See `docs/tcp.md` for the exact reset field
 construction and `docs/http.md` for the exact response bytes asserted.
 
 ## Active open (`active_open.sh`)
@@ -168,7 +195,7 @@ flag (Wirestack initiating a connection) against real Linux peers, kept
 separate from `run.sh` because `--active-open` configures a single
 one-shot connection attempt at process startup -- each scenario needs
 its own wirestack instance, restarted with different flags, rather than
-the one long-lived passive-open server instance `run.sh`'s ten scenarios
+the one long-lived passive-open server instance `run.sh`'s fourteen scenarios
 share:
 
 ```bash
@@ -282,14 +309,11 @@ to rule out flakiness.
 
 ## Coverage limitations
 
-- **Sender-side multi-segment SACK recovery is not live-qualified.** The
-  current HTTP response (`docs/http.md`) is 120 bytes, well under one
-  MSS, so the real application never gives Wirestack a multi-segment
-  send to selectively retransmit from live. Sender-side SACK-driven
-  recovery remains proven only by the deterministic wire-format tests in
-  `tests/test_tcp_sack_path.cpp` and `tests/test_tcp_newreno_path.cpp`.
-  Receiver-side SACK generation (advertising SACK blocks for retained
-  out-of-order data) *is* live-qualified -- see scenario 10.
+- Sender-side SACK recovery is live-qualified for whole-segment loss within
+  the initial congestion window. The implementation remains a bounded,
+  segment-granular scoreboard, not RFC 6675 pipe recovery; partial-segment
+  SACK coverage, reneging beyond RTO reset, DSACK, PRR, and sustained transfers
+  across many congestion-window rounds remain outside this harness.
 - TCP active open's handshake (SYN sent, established, and refused) is
   exercised by `active_open.sh`; data transfer over an actively-opened
   connection is now also live-qualified by the outbound HTTP client

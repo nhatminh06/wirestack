@@ -76,8 +76,8 @@ HttpResponse makeNotFoundResponse();
 HttpResponse makeMethodNotAllowedResponse();
 HttpResponse makeVersionNotSupportedResponse();
 
-// target == "/" -> 200, anything else -> 404. Only meaningful when the
-// request parsed as HttpParseStatus::Complete.
+// "/" and the integration workload "/sack-test" return 200; other targets
+// return 404. Only meaningful when the request parsed as Complete.
 HttpResponse selectResponse(const HttpRequest& request);
 
 std::vector<std::byte> serializeHttpResponse(const HttpResponse& response);

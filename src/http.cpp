@@ -264,6 +264,7 @@ std::vector<std::byte> toBytes(std::string_view text) {
 }
 
 constexpr std::string_view kPlainTextContentType = "text/plain; charset=utf-8";
+constexpr std::size_t kSackTestBodySize = 12000;
 
 } // namespace
 
@@ -295,6 +296,10 @@ HttpResponse makeVersionNotSupportedResponse() {
 HttpResponse selectResponse(const HttpRequest& request) {
     if (request.target == "/") {
         return makeOkResponse();
+    }
+    if (request.target == "/sack-test") {
+        return HttpResponse{HttpStatus::Ok200, std::string(kPlainTextContentType),
+                            std::vector<std::byte>(kSackTestBodySize, std::byte{'s'}), false};
     }
     return makeNotFoundResponse();
 }

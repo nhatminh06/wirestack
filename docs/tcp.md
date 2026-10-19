@@ -1473,13 +1473,21 @@ fabricate tcpdump evidence.
 A real client (Linux's own TCP) advertises `sackOK` in its SYN by
 default, so the same `curl`/`tcpdump` procedure above should show
 Wirestack's SYN-ACK echoing `sackOK` too (`tcpdump -vvv` prints the
-negotiated options). Repeating the `tc netem loss` procedure with a
-larger HTTP body (so more than one segment is outstanding at once) is
-expected to occasionally show a client ACK carrying `sack N:M` blocks
-alongside a duplicate ACK -- proof of the same selective-retransmission
-path exercised by `tests/test_tcp_sack_path.cpp`. `LIVE SACK RECOVERY:
-MANUAL VERIFICATION REQUIRED` when this has not been exercised in the
-current environment -- do not fabricate tcpdump evidence.
+negotiated options). The automated namespace harness exercises the sender
+path with `GET /sack-test`, a deterministic 12,103-byte response:
+
+```bash
+unshare --user --net --map-root-user -- bash tools/integration/run.sh
+```
+
+Its `tc u32` rules direct exact response sequence numbers to a
+`netem loss 100%` band. The single-loss case drops segment 2; the
+multi-loss case drops nonadjacent segments 2 and 4. TAP and host-side pcaps
+must show Linux SACK blocks, retransmission of exactly those missing ranges,
+no retransmission of fully SACKed ranges, a cumulative ACK covering the
+response and FIN, and clean FIN exchange. A fourth case reorders the same
+response without loss and requires SACK feedback with no retransmission.
+See `docs/interoperability.md` for the topology and evidence files.
 
 To exercise zero-window persist live, the peer must deliberately
 advertise a zero receive window with an empty socket receive buffer

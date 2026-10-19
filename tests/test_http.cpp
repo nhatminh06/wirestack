@@ -231,6 +231,12 @@ int main() {
             "HTTP Version Not Supported\n");
         CHECK(version_not_supported == expected_version_not_supported);
     }
+    {
+        wirestack::HttpRequest request{"GET", "/sack-test", "HTTP/1.0"};
+        auto response = wirestack::selectResponse(request);
+        CHECK(response.status == wirestack::HttpStatus::Ok200);
+        CHECK(response.body == std::vector<std::byte>(12000, std::byte{'s'}));
+    }
 
     // --- HTTP session tests ---
     {
