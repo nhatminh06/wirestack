@@ -1,0 +1,12 @@
+function(add_wirestack_fuzzer target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE wirestack_core)
+    target_compile_options(${target} PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    target_link_options(${target} PRIVATE -fsanitize=fuzzer,address,undefined)
+endfunction()
+
+add_wirestack_fuzzer(fuzz_ethernet fuzz_ethernet.cpp)
+add_wirestack_fuzzer(fuzz_ipv4 fuzz_ipv4.cpp)
+add_wirestack_fuzzer(fuzz_tcp fuzz_tcp.cpp)
+add_wirestack_fuzzer(fuzz_dns fuzz_dns.cpp)
+add_wirestack_fuzzer(fuzz_http fuzz_http.cpp)

@@ -10,6 +10,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(WIRESTACK_ENABLE_SANITIZERS "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(WIRESTACK_ENABLE_FUZZING "Build Clang libFuzzer parser targets" OFF)
+
+if(WIRESTACK_ENABLE_FUZZING AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "WIRESTACK_ENABLE_FUZZING requires Clang")
+endif()
 
 add_library(wirestack_core STATIC
     src/mac_address.cpp
@@ -41,7 +46,7 @@ target_compile_options(wirestack_core PUBLIC
     -Wshadow
 )
 
-if(WIRESTACK_ENABLE_SANITIZERS)
+if(WIRESTACK_ENABLE_SANITIZERS OR WIRESTACK_ENABLE_FUZZING)
     target_compile_options(wirestack_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(wirestack_core PUBLIC -fsanitize=address,undefined)
 endif()
@@ -55,3 +60,7 @@ set_target_properties(tap_send PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINAR
 
 enable_testing()
 add_subdirectory(tests)
+
+if(WIRESTACK_ENABLE_FUZZING)
+    add_subdirectory(fuzz)
+endif()
