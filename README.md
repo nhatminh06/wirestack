@@ -5,6 +5,18 @@ through Ethernet, ARP, IPv4, ICMP, UDP, TCP, and a minimal HTTP server. This
 is a learning project: the goal is understanding the protocols by
 implementing them, not feature completeness or performance.
 
+```text
+application: HTTP server/client, DNS client
+                    |
+             TCP / UDP / ICMP
+                    |
+                 IPv4 / ARP
+                    |
+             Ethernet II / TAP
+                    |
+               Linux network
+```
+
 ## Status
 
 Milestone 0 (project foundation) through Milestone 14 (NewReno
@@ -18,8 +30,8 @@ partial-ACK recovery and a bounded segment-granular SACK scoreboard):
 | IPv4        | implemented: local, unfragmented, base-header only                |
 | ICMP Echo   | implemented                                                       |
 | UDP         | implemented: basic unicast + built-in echo endpoint                |
-| TCP         | passive handshake, and active open (`beginConnect`/SynSent, an opt-in `--active-open` runtime path, RST refusal, timeout retransmission -- see docs/tcp.md) with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented, deterministically tested, and live-qualified against a real Linux client (see docs/interoperability.md) for the passive handshake, timeout retransmission, SYN-ACK loss recovery, and receiver-side SACK -- sender-side multi-segment SACK recovery remains deterministic-test-only; active open's handshake (established and refused) is also live-qualified against a real Linux listener (see `tools/integration/active_open.sh`), and data transfer over an actively-opened connection is now proven by the outbound HTTP/1.0 client below (live-qualified against a real Python HTTP server, see `tools/integration/http_get.sh`), reusing the same send/segmentation/congestion/retransmission/reassembly/close machinery with no active-open-specific data path |
-| HTTP        | minimal HTTP/1.0 GET server (`/` -> 200, other paths -> 404, one request per connection) implemented, deterministically tested, and live-qualified with a real `curl --http1.0` request (see docs/interoperability.md); plus a minimal outbound HTTP/1.0 client (`--http-get <ip-or-hostname>:<port> --source-port <port> --target </path>`, one GET request, Content-Length- or close-delimited response bodies, `Transfer-Encoding` rejected) implemented, deterministically tested, and live-qualified against a real Linux HTTP server (see docs/http.md) |
+| TCP         | passive handshake, and active open (`beginConnect`/SynSent, an opt-in `--active-open` runtime path, RST refusal, timeout retransmission -- see docs/tcp.md) with SYN-carried MSS/Window Scale/SACK-Permitted option negotiation, a bounded per-connection send buffer scheduled onto MSS-bounded segments by ACK/window updates within the peer's (possibly scaled) send and congestion window, bounded out-of-order receive reassembly (with SACK block reporting when negotiated), RTT measurement with adaptive SRTT/RTTVAR/RTO retransmission timing, Reno-style Slow Start/Congestion Avoidance/duplicate-ACK fast retransmit, NewReno-style partial-ACK recovery with a bounded segment-granular SACK scoreboard, a deterministic zero-window persist probe, and passive/active/simultaneous close (FIN deferred until all queued bytes enter sequence space) with TIME_WAIT and reset handling implemented, deterministically tested, and live-qualified against a real Linux client (see docs/interoperability.md), including sender-side multi-segment SACK recovery; active open's handshake (established and refused) is also live-qualified against a real Linux listener (see `tools/integration/active_open.sh`), and data transfer over an actively-opened connection is now proven by the outbound HTTP/1.0 client below (live-qualified against a real Python HTTP server, see `tools/integration/http_get.sh`), reusing the same send/segmentation/congestion/retransmission/reassembly/close machinery with no active-open-specific data path |
+| HTTP        | minimal HTTP/1.0 GET server (`/` -> 200, `/sack-test` -> deterministic multi-segment integration payload, other paths -> 404, one request per connection) implemented, deterministically tested, and live-qualified with a real Linux client (see docs/interoperability.md); plus a minimal outbound HTTP/1.0 client (`--http-get <ip-or-hostname>:<port> --source-port <port> --target </path>`, one GET request, Content-Length- or close-delimited response bodies, `Transfer-Encoding` rejected) implemented, deterministically tested, and live-qualified against a real Linux HTTP server (see docs/http.md) |
 | DNS         | bounded A-record resolution for a hostname `--http-get` destination (`--dns-server <ip>:<port>`, UDP, bounded compression-pointer decoding, fixed retry/timeout schedule) implemented and deterministically tested; see docs/dns.md for exact scope and limits |
 
 - `MacAddress` / `Ipv4Address`: parsing, formatting, equality
@@ -67,7 +79,8 @@ partial-ACK recovery and a bounded segment-granular SACK scoreboard):
   60-second TIME_WAIT, acceptable-inbound-RST handling, and closed-port
   RST generation
 - A bounded, stateless HTTP/1.0 request parser (`wirestack::http`) layered
-  above TCP: GET-only, `/` -> 200 with a fixed body, any other valid path
+  above TCP: GET-only, `/` -> 200 with a fixed body, `/sack-test` -> 200
+  with a deterministic 12,000-byte integration body, any other valid path
   -> 404, unsupported method -> 405, unsupported version -> 505,
   malformed/oversized/incomplete-at-EOF requests -> 400; one request per
   connection, response and close sent through the existing TCP
@@ -89,11 +102,13 @@ documents an automated, isolated-namespace harness
 ICMP echo, UDP echo, a real TCP handshake, a real `curl --http1.0`
 request, ordinary and reset connection close, HTTP response timeout
 retransmission, SYN-ACK loss recovery, and out-of-order TCP segment
-delivery with receiver-side SACK generation, all against a real Linux
-kernel client with packet-capture evidence. Sender-side multi-segment
-SACK recovery is not exercised by that harness (the current HTTP
-response is under one MSS) and remains covered only by the deterministic
-tests in `tests/test_tcp_sack_path.cpp`.
+delivery with receiver-side SACK generation and sender-side multi-segment
+SACK recovery, all against a real Linux kernel client with packet-capture
+evidence.
+
+[docs/benchmark.md](docs/benchmark.md) documents the reproducible short-transfer
+benchmark, its Linux TCP baseline, exact-loss/reordering scenarios, recorded
+results, and comparison limitations.
 
 Not implemented: TCP simultaneous open, a general ephemeral-port
 allocator, DSACK, RFC 6675 pipe-based recovery, PRR,
@@ -114,6 +129,7 @@ include/wirestack/   public headers
 src/                  implementation, wirestack executable
 tests/                unit tests (CTest, no external test framework)
 tools/                command-line utilities (tap_send)
+tools/bench/          isolated Wirestack/Linux TCP benchmark
 tools/integration/    isolated-namespace Linux interoperability harness
 docs/                 protocol notes
 ```
