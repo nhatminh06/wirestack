@@ -38,6 +38,7 @@ struct TcpSegment {
 
 enum class TcpParseError {
     TooShort,
+    TooLong,
     InvalidDataOffset,
     BadChecksum,
 };

@@ -144,7 +144,7 @@ TcpReceiveResult deliverRange(TcpConnectionTable& connections, const TcpConnecti
     client_segment.source_port = hs.syn.source_port;
     client_segment.destination_port = hs.syn.destination_port;
     client_segment.sequence_number = sequence_number;
-    client_segment.acknowledgment_number = 0; // unused by the receive path
+    client_segment.acknowledgment_number = hs.server_isn + 1;
     client_segment.flags.ack = true;
     client_segment.window_size = 65535;
     client_segment.payload = toBytes(chunk);

@@ -4,6 +4,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <vector>
@@ -171,6 +172,7 @@ struct TcpReceiveResult {
     // True only when a new passive SYN was rejected by a configured
     // total or half-open connection limit. No state or SYN-ACK is created.
     bool admission_rejected = false;
+
 };
 
 // Adaptive RTO policy (RFC 6298-style SRTT/RTTVAR estimator, expressed in
@@ -302,6 +304,7 @@ enum class TcpConnectError {
     InvalidPort,          // local_port == 0 or remote_port == 0
     DuplicateConnection,  // the four-tuple already has connection state
     CapacityExhausted,    // total or half-open connection limit reached
+    RandomnessUnavailable,
 };
 
 struct TcpConnectResult {
@@ -363,17 +366,18 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming);
 // TCP simultaneous open, no ephemeral-port allocation.
 class TcpConnectionTable {
 public:
+    using IsnGenerator = std::function<std::optional<std::uint32_t>()>;
+
     explicit TcpConnectionTable(
         std::uint16_t listen_port, std::size_t max_connections = kDefaultMaxTcpConnections,
-        std::size_t max_half_open_connections = kDefaultMaxTcpHalfOpenConnections);
+        std::size_t max_half_open_connections = kDefaultMaxTcpHalfOpenConnections,
+        IsnGenerator isn_generator = {});
 
     // Begins an active open: creates connection state in SynSent for the
     // exact four-tuple `key` and returns the SYN to transmit. Rejected
-    // atomically (no ISN consumed, no state created, no segment returned)
-    // when local_port or remote_port is 0, or when `key` already has
-    // connection state (a prior active or passive connection, in any
-    // state) -- the caller must pick a different source port or wait for
-    // the existing state to clear. Does not resolve the peer MAC or send
+    // atomically (no state created, no segment returned) for invalid ports,
+    // an existing four-tuple, exhausted capacity, or unavailable randomness.
+    // Does not resolve the peer MAC or send
     // anything itself; the caller is responsible for transmitting `syn`
     // (see docs/tcp.md for the runtime demonstration's neighbor-resolution
     // limitation).
@@ -596,10 +600,7 @@ private:
         TcpClock::duration persist_interval = kInitialPersistInterval;
     };
 
-    // Not a secure or RFC 6528-style initial sequence number generator --
-    // a small incrementing counter, isolated here so it can be replaced
-    // later without touching handshake logic.
-    std::uint32_t nextIsn();
+    std::optional<std::uint32_t> nextIsn();
 
     static TcpSegment makeSynAck(const TcpConnectionKey& key, const Connection& connection);
     // The active-open SYN: SYN only (no ACK), sequence=local_isn,
@@ -866,7 +867,8 @@ private:
     std::uint16_t listen_port_;
     std::size_t max_connections_;
     std::size_t max_half_open_connections_;
-    std::uint32_t next_isn_ = 1000;
+    IsnGenerator isn_generator_;
+    std::optional<std::uint32_t> last_isn_;
     std::map<TcpConnectionKey, Connection> connections_;
 };
 

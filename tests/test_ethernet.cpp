@@ -88,6 +88,15 @@ int main() {
         }
     }
 
+    // Oversized input is rejected before copying its attacker-controlled payload.
+    {
+        std::vector<std::byte> bytes(wirestack::kMaxEthernetFrameLength + 1);
+        auto result = parseEthernetFrame(bytes);
+        auto* error = std::get_if<EthernetParseError>(&result);
+        CHECK(error != nullptr);
+        if (error) CHECK(*error == EthernetParseError::TooLong);
+    }
+
     // unknown/unsupported ethertype value still decodes (raw value preserved)
     {
         auto bytes = toBytes({

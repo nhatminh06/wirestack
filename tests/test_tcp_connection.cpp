@@ -938,11 +938,11 @@ int main() {
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
-        establish(table, key, 1000, t0);
+        auto server_isn = establish(table, key, 1000, t0);
 
         auto client_payload = toBytes({0x00, 0x01, 0x7f, 0x80, 0xff, 0x0a});
         auto received =
-            table.handle(key, makeData(8080, 54321, 1001, 1, client_payload), t0);
+            table.handle(key, makeData(8080, 54321, 1001, server_isn + 1, client_payload), t0);
         CHECK(received.accepted_payload == client_payload);
 
         auto echo = table.makeOutgoingData(key, received.accepted_payload, t0);
@@ -1555,10 +1555,10 @@ int main() {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
         std::uint32_t server_isn = establish(table, key, 1000);
-        (void)server_isn;
 
         auto before = table.snapshotOf(key);
-        auto result = table.handle(key, makeFin(8080, 54321, 1001, 999999999, toBytes("x")), t0);
+        auto result =
+            table.handle(key, makeFin(8080, 54321, 1001, server_isn + 2, toBytes("x")), t0);
         auto after = table.snapshotOf(key);
 
         CHECK(result.accepted_payload.empty());
@@ -4645,17 +4645,19 @@ int main() {
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
-        establishWithWindow(table, key, 1000, 0, t0);
+        auto server_isn = establishWithWindow(table, key, 1000, 0, t0);
         auto sent = table.makeOutgoingData(key, toBytes("hi"), t0);
         CHECK(sent.segments.empty());
 
         // Stale: sequence number behind snd_wl1 (still 1001 from the
         // handshake) -- rejected by the existing SND.WL1/WL2 freshness
         // test, so it must not reopen sending.
-        auto stale = table.handle(key, makeWindowUpdate(8080, 54321, 1000, 1001, 65535), t0);
+        auto stale = table.handle(
+            key, makeWindowUpdate(8080, 54321, 1000, server_isn + 1, 65535), t0);
         CHECK(stale.scheduled.empty());
 
-        auto fresh = table.handle(key, makeWindowUpdate(8080, 54321, 1001, 1001, 65535), t0);
+        auto fresh = table.handle(
+            key, makeWindowUpdate(8080, 54321, 1001, server_isn + 1, 65535), t0);
         CHECK(fresh.scheduled.size() == 1);
     }
 
@@ -5000,13 +5002,13 @@ int main() {
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 8080, remoteIp(), 54321};
-        establishWithWindow(table, key, 1000, 0, t0);
+        auto server_isn = establishWithWindow(table, key, 1000, 0, t0);
         table.makeOutgoingData(key, toBytes("p"), t0);
         auto armed = table.snapshotOf(key);
         CHECK(armed.has_value());
         if (armed) CHECK(armed->persist_armed);
 
-        table.handle(key, makeWindowUpdate(8080, 54321, 1001, 1001, 65535), t0);
+        table.handle(key, makeWindowUpdate(8080, 54321, 1001, server_isn + 1, 65535), t0);
         auto reopened = table.snapshotOf(key);
         CHECK(reopened.has_value());
         if (reopened) CHECK(!reopened->persist_armed);
@@ -6142,6 +6144,57 @@ int main() {
         CHECK(table.stateOf(key_b) == TcpState::SynSent);
     }
 
+    // Injected ISNs make active and passive opens deterministic without
+    // weakening the default getrandom-backed source.
+    {
+        std::vector<std::uint32_t> values{0xfffffffeu, 0xffffffffu};
+        std::size_t index = 0;
+        TcpConnectionTable table(8080, 4, 4, [&] { return std::optional{values[index++]}; });
+
+        TcpConnectionKey active{localIp(), 49170, remoteIp(), 9090};
+        auto connect = table.beginConnect(active, t0);
+        CHECK(connect.accepted);
+        CHECK(connect.syn->sequence_number == 0xfffffffeu);
+        auto established =
+            table.handle(active, makeSynAck(49170, 9090, 7000000, 0xffffffffu), t0);
+        CHECK(established.connection_established);
+
+        TcpConnectionKey passive{localIp(), 8080, remoteIp(), 54322};
+        auto syn_ack = table.handle(passive, makeSyn(8080, 54322, 1000), t0);
+        CHECK(syn_ack.reply.has_value());
+        if (syn_ack.reply) {
+            CHECK(syn_ack.reply->sequence_number == 0xffffffffu);
+        }
+        auto final_ack = table.handle(passive, makeAck(8080, 54322, 1001, 0), t0);
+        CHECK(table.stateOf(passive) == TcpState::Established);
+        CHECK(!final_ack.reply.has_value());
+    }
+
+    // Randomness failure and a repeated successive value fail closed:
+    // no connection state or SYN/SYN-ACK is created.
+    {
+        TcpConnectionTable failed(8080, 4, 4,
+                                  [] { return std::optional<std::uint32_t>{}; });
+        TcpConnectionKey active{localIp(), 49171, remoteIp(), 9090};
+        auto connect = failed.beginConnect(active, t0);
+        CHECK(connect.error == TcpConnectError::RandomnessUnavailable);
+        CHECK(!connect.syn.has_value());
+        CHECK(!failed.stateOf(active).has_value());
+
+        TcpConnectionKey passive{localIp(), 8080, remoteIp(), 54323};
+        auto receive = failed.handle(passive, makeSyn(8080, 54323, 1000), t0);
+        CHECK(!receive.reply.has_value());
+        CHECK(!failed.stateOf(passive).has_value());
+
+        TcpConnectionTable repeated(8080, 4, 4,
+                                    [] { return std::optional<std::uint32_t>{1234}; });
+        CHECK(repeated.beginConnect(active, t0).accepted);
+        TcpConnectionKey second{localIp(), 49172, remoteIp(), 9090};
+        CHECK(repeated.beginConnect(second, t0).error ==
+              TcpConnectError::RandomnessUnavailable);
+        CHECK(!repeated.stateOf(second).has_value());
+    }
+
     // --- Invalid SYN-ACK / unsupported SynSent traffic ------------------
 
     // Wrong ACK (too low, too high, equal to local ISN rather than +1)
@@ -6365,20 +6418,7 @@ int main() {
         CHECK(!unrelated.connection_established);
     }
 
-    // --- Active-open sequence wraparound (section 5/29) ------------------
-    //
-    // Wirestack's own active-open ISN (nextIsn()) is a small incrementing
-    // counter with no caller-supplied seed, the same generator the
-    // passive path already uses for its local ISN -- consistent with
-    // that existing code, its own wraparound is not independently
-    // exercised here (there is no practical way to drive it to
-    // 0xffffffff from the public API; see docs/tcp.md). What IS fully
-    // caller-controlled, exactly like the existing passive-path
-    // "remote_isn = 0xffffffff" case above, is the PEER's ISN -- so this
-    // proves rcv_nxt wraps correctly, and that a valid/invalid ACK is
-    // still judged correctly when the local ISN (and therefore snd_nxt)
-    // is itself an ordinary small value while the peer's sequence space
-    // has wrapped.
+    // --- Active-open peer sequence wraparound (section 5/29) -------------
     {
         TcpConnectionTable table(8080);
         TcpConnectionKey key{localIp(), 49166, remoteIp(), 9090};

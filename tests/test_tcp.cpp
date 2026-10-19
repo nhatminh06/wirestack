@@ -196,6 +196,16 @@ int main() {
         }
     }
 
+    // The pseudo-header length is 16-bit; larger input must be rejected
+    // before checksum construction or payload allocation.
+    {
+        std::vector<std::byte> bytes(wirestack::kMaxTcpSegmentLength + 1);
+        auto result = parseTcpSegment(bytes, ipA(), ipB());
+        auto* error = std::get_if<TcpParseError>(&result);
+        CHECK(error != nullptr);
+        if (error) CHECK(*error == TcpParseError::TooLong);
+    }
+
     // round trip
     {
         TcpSegment original;

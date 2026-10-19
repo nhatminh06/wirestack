@@ -108,6 +108,9 @@ TcpParseResult parseTcpSegment(std::span<const std::byte> bytes, Ipv4Address sou
     if (bytes.size() < kMinHeaderSize) {
         return TcpParseError::TooShort;
     }
+    if (bytes.size() > kMaxTcpSegmentLength) {
+        return TcpParseError::TooLong;
+    }
 
     std::uint8_t data_offset_field = static_cast<std::uint8_t>(bytes[kDataOffsetOffset]) >> 4;
     std::size_t header_length = static_cast<std::size_t>(data_offset_field) * 4;

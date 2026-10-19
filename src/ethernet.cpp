@@ -36,6 +36,9 @@ EthernetParseResult parseEthernetFrame(std::span<const std::byte> data) {
     if (data.size() < kHeaderSize) {
         return EthernetParseError::TooShort;
     }
+    if (data.size() > kMaxEthernetFrameLength) {
+        return EthernetParseError::TooLong;
+    }
 
     EthernetFrame frame;
     frame.destination = readMacAddress(data, 0);

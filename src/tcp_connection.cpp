@@ -1,6 +1,9 @@
 #include "wirestack/tcp_connection.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <sys/random.h>
+#include <utility>
 
 namespace wirestack {
 
@@ -24,6 +27,23 @@ std::uint32_t sequenceMax(std::uint32_t a, std::uint32_t b) {
 
 std::uint32_t sequenceMin(std::uint32_t a, std::uint32_t b) {
     return sequenceGreater(a, b) ? b : a;
+}
+
+std::optional<std::uint32_t> systemIsn() {
+    std::uint32_t value = 0;
+    auto* bytes = reinterpret_cast<unsigned char*>(&value);
+    std::size_t received = 0;
+    while (received < sizeof(value)) {
+        ssize_t result = getrandom(bytes + received, sizeof(value) - received, 0);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return std::nullopt;
+        }
+        received += static_cast<std::size_t>(result);
+    }
+    return value;
 }
 
 } // namespace
@@ -56,9 +76,15 @@ TcpSegment makeClosedPortReset(const TcpSegment& incoming) {
 }
 
 TcpConnectionTable::TcpConnectionTable(std::uint16_t listen_port, std::size_t max_connections,
-                                       std::size_t max_half_open_connections)
+                                       std::size_t max_half_open_connections,
+                                       IsnGenerator isn_generator)
     : listen_port_(listen_port), max_connections_(max_connections),
-      max_half_open_connections_(max_half_open_connections) {}
+      max_half_open_connections_(max_half_open_connections),
+      isn_generator_(std::move(isn_generator)) {
+    if (!isn_generator_) {
+        isn_generator_ = systemIsn;
+    }
+}
 
 std::size_t TcpConnectionTable::halfOpenCount() const {
     std::size_t count = 0;
@@ -71,9 +97,12 @@ std::size_t TcpConnectionTable::halfOpenCount() const {
     return count;
 }
 
-std::uint32_t TcpConnectionTable::nextIsn() {
-    std::uint32_t isn = next_isn_;
-    next_isn_ += 1000;
+std::optional<std::uint32_t> TcpConnectionTable::nextIsn() {
+    auto isn = isn_generator_();
+    if (!isn || isn == last_isn_) {
+        return std::nullopt;
+    }
+    last_isn_ = isn;
     return isn;
 }
 
@@ -472,10 +501,16 @@ TcpConnectResult TcpConnectionTable::beginConnect(const TcpConnectionKey& key,
         return result;
     }
 
+    auto isn = nextIsn();
+    if (!isn) {
+        result.error = TcpConnectError::RandomnessUnavailable;
+        return result;
+    }
+
     Connection connection;
     connection.state = TcpState::SynSent;
     connection.remote_isn_known = false;
-    connection.local_isn = nextIsn();
+    connection.local_isn = *isn;
     connection.snd_una = connection.local_isn;
     connection.snd_nxt = connection.local_isn + 1;
 
@@ -1314,10 +1349,15 @@ TcpReceiveResult TcpConnectionTable::handle(const TcpConnectionKey& key,
             return result;
         }
 
+        auto isn = nextIsn();
+        if (!isn) {
+            return {};
+        }
+
         Connection connection;
         connection.state = TcpState::SynReceived;
         connection.remote_isn = segment.sequence_number;
-        connection.local_isn = nextIsn();
+        connection.local_isn = *isn;
 
         connection.peer_mss = options.maximum_segment_size.value_or(kDefaultPeerMss);
         connection.effective_send_mss = std::min<std::uint16_t>(

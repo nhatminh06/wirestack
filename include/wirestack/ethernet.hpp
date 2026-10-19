@@ -22,14 +22,18 @@ struct EthernetFrame {
     std::vector<std::byte> payload;
 };
 
+inline constexpr std::size_t kMaxEthernetFrameLength = 65535;
+
 enum class EthernetParseError {
     TooShort,
+    TooLong,
 };
 
 using EthernetParseResult = std::variant<EthernetFrame, EthernetParseError>;
 
 // Parses an Ethernet II frame. `data` must contain at least the 14-byte
 // header (destination + source + ethertype); everything after is payload.
+// Inputs larger than kMaxEthernetFrameLength are rejected to bound allocation.
 EthernetParseResult parseEthernetFrame(std::span<const std::byte> data);
 
 std::vector<std::byte> serializeEthernetFrame(const EthernetFrame& frame);
